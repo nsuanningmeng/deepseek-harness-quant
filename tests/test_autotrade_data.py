@@ -114,6 +114,23 @@ class DataTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 validate_day(replace(self.day, **kwargs))
 
+    def test_snapshot_cannot_mislabel_security_or_board(self):
+        original = self.day.bars["600001.SH"]
+        for symbol, board in (("510300.SH", "MAIN"), ("688001.SH", "MAIN"),
+                              ("300001.SZ", "MAIN"), ("600001.SH", "STAR")):
+            bar = replace(original, symbol=symbol, board=board)
+            with self.subTest(symbol=symbol, board=board), self.assertRaises(ValueError):
+                save_day(replace(self.day, bars={symbol: bar}), self.path)
+            self.assertFalse(self.path.exists())
+
+    def test_fractional_trade_prices_and_limits_cannot_be_sealed(self):
+        bar = self.day.bars["600001.SH"]
+        for changes in ({"close": D("10.101")}, {"limit_up": D("11.001")},
+                        {"low": D("9.901")}, {"limit_down": D("9.001")}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                save_day(replace(self.day, bars={bar.symbol: replace(bar, **changes)}), self.path)
+            self.assertFalse(self.path.exists())
+
     def test_manifest_missing_duplicate_and_invalid_numeric_rejected(self):
         save_day(self.day, self.path)
         original = json.loads(self.path.read_text())

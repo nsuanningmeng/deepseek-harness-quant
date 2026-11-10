@@ -8,10 +8,9 @@ See autotrade.rules for official exchange sources and quantity limitations.
 """
 from datetime import date
 from pathlib import Path
-import re
 
 from autotrade.models import Account, D, MarketDay, OrderIntent, money
-from autotrade.rules import board_rule, valid_price_tick, validate_quantity
+from autotrade.rules import board_for_symbol, board_rule, valid_price_tick, validate_quantity
 
 
 def _date(value: str) -> date:
@@ -22,12 +21,28 @@ def _date(value: str) -> date:
 
 
 def _valid_symbol(symbol: str, board: str) -> bool:
-    if not isinstance(symbol, str) or not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", symbol):
+    try:
+        return board_for_symbol(symbol) == board
+    except ValueError:
         return False
-    return symbol.rsplit(".", 1)[1] in {
-        "MAIN": {"SH", "SZ"}, "CHINEXT": {"SZ"},
-        "STAR": {"SH"}, "BSE": {"BJ"},
-    }.get(board, set())
+
+
+def _validate_policy(config: dict) -> None:
+    """Also validate direct broker/API callers which do not use the CLI loader."""
+    limits = config["risk"]
+    for key in ("max_symbol_weight", "max_total_weight", "max_order_weight",
+                "max_sector_weight", "max_drawdown"):
+        if not 0 < D(limits[key]) <= 1:
+            raise ValueError("invalid_risk_fraction")
+    if (type(limits["max_daily_orders"]) is not int or limits["max_daily_orders"] <= 0
+            or D(limits["max_order_notional"]) <= 0):
+        raise ValueError("invalid_risk_limit")
+    broker = config["broker"]
+    for key in ("commission_rate", "transfer_fee_rate", "stamp_tax_rate"):
+        if not 0 <= D(broker[key]) <= 1:
+            raise ValueError("invalid_fee_rate")
+    if D(broker["min_commission"]) < 0:
+        raise ValueError("invalid_minimum_commission")
 
 
 def _mark(bar, day: MarketDay, config: dict):
@@ -39,12 +54,16 @@ def _mark(bar, day: MarketDay, config: dict):
     if any(price <= 0 for price in prices):
         raise ValueError("invalid_bar_price")
     opening, high, low, close, _ = prices
+    if any(not valid_price_tick(price, bar.board, config) for price in prices[:4]):
+        raise ValueError("invalid_bar_price_tick")
     if not low <= opening <= high or not low <= close <= high:
         raise ValueError("invalid_ohlc")
     if type(bar.suspended) is not bool or type(bar.is_st) is not bool:
         raise ValueError("invalid_bar_metadata")
     if type(bar.volume) is not int or bar.volume < 0 or D(bar.turnover) < 0:
         raise ValueError("invalid_bar_volume")
+    if bar.suspended and bar.volume:
+        raise ValueError("invalid_suspension_volume")
     if _date(bar.list_date) > _date(day.date):
         raise ValueError("invalid_listing_date")
     if not isinstance(bar.sector, str) or not bar.sector.strip():
@@ -71,6 +90,7 @@ def check_order(order: OrderIntent, day: MarketDay, account: Account,
     """
     errors = []
     try:
+        _validate_policy(config)
         limits = config["risk"]
         switch = limits.get("kill_switch_file")
         if switch and Path(switch).exists():
@@ -80,7 +100,8 @@ def check_order(order: OrderIntent, day: MarketDay, account: Account,
             errors.append("session_mismatch")
         if signal_date >= trade_date or _date(day.next_session) <= trade_date:
             errors.append("signal_must_precede_execution_t1")
-        if not order.order_id or not order.plan_id:
+        if any(not isinstance(value, str) or not value.strip()
+               for value in (order.order_id, order.plan_id)):
             errors.append("missing_order_identity")
         if type(daily_order_count) is not int or daily_order_count < 0:
             errors.append("invalid_order_count")

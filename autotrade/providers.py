@@ -15,6 +15,7 @@ import urllib.request
 from .data import TushareProvider, _date, _number, load_day, save_day, validate_day
 from .models import Bar, D, MarketDay
 from .monitoring import atomic_json
+from .rules import board_for_symbol
 
 SHANGHAI = timezone(timedelta(hours=8))
 
@@ -86,19 +87,6 @@ def _dates(start, end):
 
 def _iso_compact(value):
     return datetime.strptime(str(value), "%Y%m%d").date().isoformat()
-
-
-def board_for_symbol(symbol):
-    """仅普通A股；拒绝ETF、债券、指数及无法确认的证券类型。"""
-    if re.fullmatch(r"(?:600|601|603|605)\d{3}\.SH", symbol) or re.fullmatch(r"(?:000|001|002|003)\d{3}\.SZ", symbol):
-        return "MAIN"
-    if re.fullmatch(r"(?:300|301)\d{3}\.SZ", symbol):
-        return "CHINEXT"
-    if re.fullmatch(r"688\d{3}\.SH", symbol):
-        return "STAR"
-    if re.fullmatch(r"(?:43|83|87|88|92)\d{4}\.BJ", symbol):
-        return "BSE"
-    raise ValueError("only recognized ordinary A-share symbols are supported")
 
 
 class TushareHistoricalProvider(TushareProvider):
@@ -427,7 +415,9 @@ class QmtLiveMarketProvider:
             for symbol in sorted(symbols):
                 detail = sdk.get_instrument_detail(symbol, iscomplete=True)
                 kind = sdk.get_instrument_type(symbol)
-                if not isinstance(detail, dict) or not isinstance(kind, dict) or kind.get("stock") is not True or kind.get("fund"):
+                if (not isinstance(detail, dict) or not isinstance(kind, dict)
+                        or kind.get("stock") is not True
+                        or any(kind.get(key, False) is not False for key in ("fund", "etf", "index"))):
                     raise ValueError("QMT instrument is not a verified ordinary stock")
                 code, exchange = symbol.split(".")
                 if detail["InstrumentID"] != code or detail["ExchangeID"] != exchange:

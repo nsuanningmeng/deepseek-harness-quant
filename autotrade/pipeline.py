@@ -1,4 +1,5 @@
 """Historical preparation and restart catch-up for the paper account only."""
+import copy
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -20,7 +21,11 @@ def replay_range(config, start, end):
     sessions = calendar["sessions"]
     if not sessions:
         raise ValueError("no trading sessions in requested range")
-    engine = Engine(config)
+    # A replay must never replace missing sealed history with a network fetch.
+    # The provider is operational routing, not part of the trading fingerprint.
+    offline_config = copy.deepcopy(config)
+    offline_config["data"]["provider"] = "files"
+    engine = Engine(offline_config)
     reports = [engine.cycle(session) for session in sessions]
     return {"ok": True, "mode": "paper", "sessions": len(reports), "start": sessions[0],
             "end": sessions[-1], "last_report": reports[-1], "orders": len(engine.broker.orders()),

@@ -89,6 +89,28 @@ class PaperBrokerTests(unittest.TestCase):
             self.broker.execute(intent(quantity=2000), market())
         self.assertEqual(self.broker.reconcile()["fills"], 1)
 
+    def test_invalid_quantity_rejection_does_not_poison_ledger(self):
+        for index, value in enumerate([-100, 0, "100", "bad", 100.5, True, None]):
+            with self.subTest(quantity=value):
+                result = self.broker.execute(intent(f"invalid-{index}", quantity=value), market())
+                self.assertEqual(result["status"], "REJECTED")
+                self.assertTrue(self.broker.reconcile()["ok"])
+        self.assertEqual(self.broker.execute(intent(), market())["status"], "FILLED")
+
+    def test_rejected_future_date_does_not_advance_execution_clock(self):
+        result = self.broker.execute(intent("future", trade_date="2030-01-01"), market())
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertEqual(self.broker.execute(intent(), market())["status"], "FILLED")
+        self.assertTrue(self.broker.reconcile()["ok"])
+
+    def test_committed_fill_prevents_backdated_new_orders(self):
+        self.broker.execute(intent(), market())
+        old = market("2026-11-09", "2026-11-06", "2026-11-10")
+        result = self.broker.execute(intent("backdated", trade_date=old.date,
+                                           signal_date=old.previous_session), old)
+        self.assertEqual(result["reason"], "NON_MONOTONIC_SESSION")
+        self.assertTrue(self.broker.reconcile()["ok"])
+
     def test_partial_fill_is_terminal_and_capacity_is_shared(self):
         day = market(volume=2500)
         first = self.broker.execute(intent(), day)
@@ -172,9 +194,22 @@ class PaperBrokerTests(unittest.TestCase):
 
     def test_fee_funded_cash_check(self):
         self.cfg["broker"]["min_commission"] = "100000"
-        broker = PaperBroker(self.path, self.cfg)
+        broker = PaperBroker(Path(self.tmp.name) / "high-fees.sqlite", self.cfg)
         self.assertEqual(broker.execute(intent(), market())["status"], "REJECTED")
         self.assertEqual(broker.account({}, "2026-11-10").cash, D(100000))
+
+    def test_broker_configuration_is_pinned_across_restarts(self):
+        self.cfg["risk"]["max_symbol_weight"] = "1"
+        with self.assertRaisesRegex(ValueError, "configuration changed"):
+            PaperBroker(self.path, self.cfg)
+        self.assertEqual(self.broker.config["risk"]["max_symbol_weight"], "0.9")
+        self.assertEqual(self.broker.execute(intent(), market())["status"], "FILLED")
+
+    def test_in_memory_broker_configuration_change_cannot_relax_risk(self):
+        self.broker.config["risk"]["max_symbol_weight"] = "1"
+        with self.assertRaisesRegex(ValueError, "configuration changed"):
+            self.broker.execute(intent(), market())
+        self.assertEqual(self.broker.orders(), [])
 
     def test_partial_sell_must_fund_actual_minimum_fee(self):
         cfg = config()
@@ -210,7 +245,8 @@ class PaperBrokerTests(unittest.TestCase):
         up = market(price="11")
         self.assertEqual(self.broker.execute(intent("limit-up", price="11"), up)["status"], "REJECTED")
         self.cfg["broker"]["slippage_bps"] = 10
-        self.assertEqual(self.broker.execute(intent("slip"), day)["status"], "REJECTED")
+        broker = PaperBroker(Path(self.tmp.name) / "slippage.sqlite", self.cfg)
+        self.assertEqual(broker.execute(intent("slip"), day)["status"], "REJECTED")
 
     def test_missing_held_mark_stops_risk(self):
         self.broker.execute(intent(), market())

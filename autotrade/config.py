@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from .models import D
+from .rules import board_for_symbol, board_rule
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / "config" / "autotrade.yaml.example"
@@ -88,6 +89,7 @@ def validate_config(cfg):
     if not isinstance(cfg["strategy"]["allowed_boards"], list) or not cfg["strategy"]["allowed_boards"]:
         raise ValueError("allowed_boards must be a nonempty list")
     for board, rules in cfg["boards"].items():
+        board_rule(board, cfg)
         for key in ["min_buy", "buy_step", "max_order"]:
             if type(rules[key]) is not int or rules[key] <= 0:
                 raise ValueError(f"invalid board quantity: {board}.{key}")
@@ -102,6 +104,8 @@ def validate_config(cfg):
         raise ValueError("universe must be a list of unique symbols")
     if any(not isinstance(s, str) or not re.fullmatch(r"\d{6}\.(SH|SZ|BJ)", s) for s in universe):
         raise ValueError("invalid universe symbol")
+    for symbol in universe:
+        board_for_symbol(symbol)
     if cfg["data"]["provider"] == "tushare" and not universe:
         raise ValueError("Tushare requires an explicit universe")
     if cfg["data"]["provider"] == "baostock" and not universe:

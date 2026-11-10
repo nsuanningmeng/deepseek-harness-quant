@@ -102,6 +102,21 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "configuration changed"):
             Engine(self.cfg)
 
+    def test_engine_does_not_share_mutable_caller_configuration(self):
+        engine = Engine(self.cfg)
+        original = engine.config["strategy"]["top_n"]
+        self.cfg["strategy"]["top_n"] = 99
+        self.assertEqual(engine.config["strategy"]["top_n"], original)
+        self.assertEqual(engine.cycle(self.dates[19])["state"], "PLANNED")
+
+    def test_changed_internal_config_stops_before_orders(self):
+        engine = Engine(self.cfg)
+        engine.cycle(self.dates[19])
+        engine.config["risk"]["max_symbol_weight"] = "0.5"
+        with self.assertRaisesRegex(ValueError, "configuration changed"):
+            engine.cycle(self.dates[20])
+        self.assertEqual(engine.broker.orders(), [])
+
     def test_concurrent_first_start_cannot_pin_two_configs(self):
         other = copy.deepcopy(self.cfg)
         other["strategy"]["top_n"] = 4

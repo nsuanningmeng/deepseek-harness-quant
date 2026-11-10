@@ -4,6 +4,7 @@ Source: https://dict.thinktrader.net/nativeApi/xttrader.html
 The paper engine never dispatches here. Importing this module does not load the
 SDK. A real session is opened only by connect(); no credentials are logged.
 """
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, time as clock_time, timedelta, timezone
 import hashlib
@@ -37,6 +38,10 @@ STATUS_NAMES = {
 
 class QmtError(RuntimeError):
     """Sanitized error suitable for command output."""
+
+
+class _DispatchBlocked(PermissionError):
+    """The worker rejected a write before invoking the SDK method."""
 
 
 @dataclass(frozen=True)
@@ -134,8 +139,11 @@ class QmtSession:
     """
     def __init__(self, config, store_path=None, sdk_factory=None,
                  market_provider: Callable[[set[str]], LiveMarketSnapshot] | None = None, now=None):
-        self.config = config
-        self.settings = config.get("qmt", {})
+        # A caller retaining its dictionary must not silently turn a connected
+        # read-only session into a writer or loosen the risk policy in flight.
+        self.config = deepcopy(config)
+        self.settings = self.config.get("qmt", {})
+        self._configuration = encode(self.config)
         self.now = now or (lambda: datetime.now(SHANGHAI))
         self.factory = sdk_factory or _sdk_factory
         self.market_provider = market_provider
@@ -164,30 +172,43 @@ class QmtSession:
             raise QmtError("invalid QMT request timeout")
         return timeout
 
-    def _call(self, method, *args):
+    def _call(self, method, *args, pre_dispatch=None):
         """Bound waiting time; timeout poisons this session and never retries."""
+        timeout = self._timeout()  # Validate before creating any SDK worker.
         if not self.sdk:
             raise QmtError("QMT SDK session has not been created")
         target = getattr(self.sdk.trader, method, None)
         if not callable(target):
             raise QmtError("QMT SDK does not support " + method)
+        if method in {"order_stock", "cancel_order_stock"} and pre_dispatch is None:
+            raise _DispatchBlocked("QMT write dispatch requires its final worker guard")
         result = queue.Queue(maxsize=1)
 
         def invoke():
+            if pre_dispatch is not None:
+                try:
+                    pre_dispatch()
+                except Exception:
+                    result.put(("blocked", None))
+                    return
+            # Never hold the callback lock while waiting for the synchronous
+            # SDK: it may need to deliver a callback before returning.
             try:
-                result.put((True, target(*args)))
+                result.put(("ok", target(*args)))
             except Exception:
-                result.put((False, None))
+                result.put(("failed", None))
 
         thread = threading.Thread(target=invoke, daemon=True)
         thread.start()
         try:
-            ok, value = result.get(timeout=self._timeout())
+            status, value = result.get(timeout=timeout)
         except queue.Empty:
             self._timed_out = True
             self._disconnect("request_timeout:" + method)
             raise QmtError("QMT request timed out; result is unknown, recreate session and reconcile") from None
-        if not ok:
+        if status == "blocked":
+            raise _DispatchBlocked("QMT dispatch blocked before sending; session, authorization or snapshot changed")
+        if status != "ok":
             self._disconnect("request_failed:" + method)
             raise QmtError("QMT request failed: " + method) from None
         return value
@@ -341,7 +362,7 @@ class QmtSession:
         result = {"symbol": self._symbol(value)}
         for key in ("volume", "can_use_volume", "frozen_volume", "on_road_volume"):
             result[key] = _integer(_field(value, key), key)
-        if result["can_use_volume"] > result["volume"] or result["frozen_volume"] > result["volume"]:
+        if result["can_use_volume"] + result["frozen_volume"] > result["volume"]:
             raise QmtError("invalid QMT position availability")
         result["market_value"] = _amount(_field(value, "market_value"), "market_value")
         return result
@@ -425,10 +446,23 @@ class QmtSession:
         positions = [self._position(value) for value in self._list_query("query_stock_positions")]
         orders = [self._order(value) for value in self._list_query("query_stock_orders")]
         trades = [self._trade(value) for value in self._list_query("query_stock_trades")]
-        # Independent requests are not an atomic broker snapshot: detect movement.
-        confirmation = [self._order(value) for value in self._list_query("query_stock_orders")]
-        if sorted(orders, key=lambda x: x["broker_id"]) != sorted(confirmation, key=lambda x: x["broker_id"]):
-            raise QmtError("QMT orders changed during snapshot; retry inspection")
+        # A fill can land after the first balances but before the first orders,
+        # without a callback arriving yet. Repeat the complete state sweep, not
+        # just orders. Market values may move with quotes; cash and quantities,
+        # order/trade facts must remain stable. Use the later marks for reporting.
+        confirmed_asset = self._asset(self._call("query_stock_asset", self.sdk.account))
+        confirmed_positions = [self._position(value) for value in self._list_query("query_stock_positions")]
+        confirmed_orders = [self._order(value) for value in self._list_query("query_stock_orders")]
+        confirmed_trades = [self._trade(value) for value in self._list_query("query_stock_trades")]
+        def holdings(rows):
+            return sorted(({key: value for key, value in row.items() if key != "market_value"}
+                           for row in rows), key=lambda row: row["symbol"])
+        if (any(asset[key] != confirmed_asset[key] for key in ("cash", "frozen_cash"))
+                or holdings(positions) != holdings(confirmed_positions)
+                or sorted(orders, key=lambda row: row["broker_id"]) != sorted(confirmed_orders, key=lambda row: row["broker_id"])
+                or sorted(trades, key=lambda row: row["trade_id"]) != sorted(confirmed_trades, key=lambda row: row["trade_id"])):
+            raise QmtError("QMT balances, positions or orders/trades changed during snapshot; retry inspection")
+        asset, positions, orders, trades = confirmed_asset, confirmed_positions, confirmed_orders, confirmed_trades
         if len({p["symbol"] for p in positions}) != len(positions):
             raise QmtError("duplicate QMT positions")
         if len({o["broker_id"] for o in orders}) != len(orders) or len({t["trade_id"] for t in trades}) != len(trades):
@@ -438,13 +472,16 @@ class QmtSession:
             if self._revision != revision:
                 raise QmtError("QMT callbacks changed during snapshot; retry inspection")
             now = self._clock()
+            if now.date() != started_at.date():
+                raise QmtError("QMT session date changed during snapshot; retry inspection")
             session = now.date().isoformat()
             for kind, items in (("order", orders), ("trade", trades)):
                 for item in items:
                     self.store.fact(kind, session, item)
             snapshot = {"observed_at": now.isoformat(), "started_at": started_at.isoformat(), "session": session, "asset": asset,
                         "positions": positions, "orders": orders, "trades": trades,
-                        "account_status": self._account_status, "read_only": self.settings.get("read_only", True)}
+                        "account_status": self._account_status, "revision": revision, "generation": self._generation,
+                        "read_only": self.settings.get("read_only", True)}
             self.store.snapshot(snapshot)
             self.store.peak(asset["total_asset"])
             return snapshot
@@ -468,6 +505,12 @@ class QmtSession:
                 errors.append("TRADE_WITHOUT_ORDER")
             elif trade["symbol"] != order["symbol"] or trade["side"] != order["side"]:
                 errors.append("TRADE_ORDER_IDENTITY")
+            elif order["price_type"] == BROKER_PRICE_LIMIT:
+                if ((order["side"] == "BUY" and D(trade["price"]) > D(order["price"]))
+                        or (order["side"] == "SELL" and D(trade["price"]) < D(order["price"]))):
+                    errors.append("TRADE_OUTSIDE_ORDER_LIMIT")
+            if D(trade["price"]) <= 0 or D(trade["amount"]) <= 0:
+                errors.append("INVALID_TRADE_VALUE")
             if abs(D(trade["amount"]) - D(trade["price"]) * trade["quantity"]) > tolerance:
                 errors.append("TRADE_AMOUNT")
             trade_quantities[trade["broker_id"]] = trade_quantities.get(trade["broker_id"], 0) + trade["quantity"]
@@ -518,6 +561,8 @@ class QmtSession:
         return self.store.events() if self.store else []
 
     def _authorization(self, operation, order=None, notional_bound=None):
+        if encode(self.config) != self._configuration or self.settings is not self.config.get("qmt", {}):
+            raise PermissionError("QMT configuration changed; create a new session and reauthorize")
         cfg = self.settings
         if (self.config.get("mode") != "live" or cfg.get("read_only", True) is not False
                 or cfg.get("live_trading_enabled") is not True
@@ -525,7 +570,9 @@ class QmtSession:
                 or cfg.get("manual_authorization") is not True):
             raise PermissionError("QMT live operations are disabled; paper/read-only mode cannot trade")
         self._require_connected()
-        if Path(self.config["risk"]["kill_switch_file"]).exists():
+        # Stopping new exposure must not strand existing broker orders. Cancel
+        # still requires the same account-bound, unexpired operator permission.
+        if operation == "submit" and Path(self.config["risk"]["kill_switch_file"]).exists():
             raise PermissionError("emergency stop is active")
         path = cfg.get("authorization_file")
         if not path:
@@ -608,11 +655,26 @@ class QmtSession:
         except (ValueError, TypeError, ArithmeticError):
             raise PermissionError("no verified upper bound for live authorization notional") from None
 
+    def _dispatch_guard(self, operation, order, snapshot, deadline, notional_bound=None):
+        """Recheck in the SDK worker, after any queue/scheduling delay.
+
+        The callback lock protects inspection only; it is released before the
+        SDK call, so synchronous SDK responses cannot deadlock on callbacks.
+        """
+        with self._guard:
+            self._authorization(operation, order, notional_bound)
+            self._require_trading_hours()
+            now = self._clock()
+            if (self._timed_out or self._generation != snapshot["generation"]
+                    or self._revision != snapshot["revision"] or self._account_status != 0
+                    or not datetime.fromisoformat(snapshot["started_at"]) <= now <= deadline):
+                raise PermissionError("QMT dispatch state or quote/account validity changed")
+
     def submit(self, order: OrderIntent):
         """Explicit real-order API. Not called by any paper CLI or scheduler."""
-        self._authorization("submit", order)
         if not isinstance(order, OrderIntent):
             raise PermissionError("live submission requires an immutable OrderIntent")
+        self._authorization("submit", order)
         with ProcessLock(self.store_path.with_suffix(".submit.lock")):
             previous = next((i for i in self.store.intents() if i["local_id"] == order.order_id), None)
             if previous:
@@ -622,7 +684,7 @@ class QmtSession:
                 self.reconcile()
                 return next(i for i in self.store.intents() if i["local_id"] == order.order_id)
             snapshot = self.snapshot()
-            snapshot_revision = self._revision
+            snapshot_revision = snapshot["revision"]
             result = self.reconcile(snapshot)
             if not result["ok"]:
                 raise PermissionError("QMT reconciliation failed before submission")
@@ -642,10 +704,20 @@ class QmtSession:
             from .risk import check_order
             count = sum(i["session"] == order.trade_date for i in self.store.intents())
             errors = check_order(order, market, account, self.config, daily_order_count=count)
+            notional_bound = self._notional_bound(order, market)
+            # For live sells, last tick and SELL limit are not an execution cap.
+            # The verified upper daily bound must also constrain independent
+            # order-size risk, in addition to the separate operator budget.
+            if order.side == "SELL" and not errors:
+                equity = account.cash + sum((market.bars[symbol].close * position.quantity
+                                             for symbol, position in positions.items()), D(0))
+                if notional_bound > D(self.config["risk"]["max_order_notional"]):
+                    errors.append("max_order_notional")
+                if equity <= 0 or notional_bound / equity > D(self.config["risk"]["max_order_weight"]):
+                    errors.append("max_order_weight")
             if errors:
                 self.store.event("risk_rejected", {"local_id": order.order_id, "reasons": errors})
                 raise PermissionError("independent risk rejected QMT order: " + ",".join(errors))
-            notional_bound = self._notional_bound(order, market)
             authorization = self._authorization("submit", order, notional_bound)
             self._require_trading_hours()
             if self._clock() > quote_deadline or self._revision != snapshot_revision:
@@ -667,7 +739,11 @@ class QmtSession:
             try:
                 side = getattr(self.sdk.constants, "STOCK_BUY" if order.side == "BUY" else "STOCK_SELL")
                 broker_id = self._call("order_stock", self.sdk.account, order.symbol, side, order.quantity,
-                                       self.sdk.constants.FIX_PRICE, float(order.limit_price), "autotrade", intent["remark"])
+                                       self.sdk.constants.FIX_PRICE, float(order.limit_price), "autotrade", intent["remark"],
+                                       pre_dispatch=lambda: self._dispatch_guard("submit", order, snapshot, quote_deadline, notional_bound))
+            except _DispatchBlocked:
+                self.store.set_state(order.order_id, "REJECTED")
+                raise
             except Exception:
                 self.store.event("submission_unknown", {"local_id": order.order_id})
                 raise QmtError("QMT submission result unknown; query and reconcile, never resend") from None
@@ -681,7 +757,7 @@ class QmtSession:
         self._authorization("cancel")
         with ProcessLock(self.store_path.with_suffix(".submit.lock")):
             snapshot = self.snapshot()
-            snapshot_revision = self._revision
+            snapshot_revision = snapshot["revision"]
             reconciliation = self.reconcile(snapshot)
             if not reconciliation["ok"]:
                 raise PermissionError("QMT reconciliation failed before cancellation")
@@ -706,7 +782,12 @@ class QmtSession:
                 self.store.abandon_cancel_before_send(local_order_id)
                 raise
             try:
-                result = self._call("cancel_order_stock", self.sdk.account, intent["broker_id"])
+                deadline = datetime.fromisoformat(snapshot["started_at"]) + timedelta(seconds=maximum_age)
+                result = self._call("cancel_order_stock", self.sdk.account, intent["broker_id"],
+                                    pre_dispatch=lambda: self._dispatch_guard("cancel", order, snapshot, deadline))
+            except _DispatchBlocked:
+                self.store.abandon_cancel_before_send(local_order_id)
+                raise
             except Exception:
                 self.store.event("cancel_unknown", {"local_id": local_order_id})
                 raise QmtError("QMT cancellation result unknown; query final state before any further action") from None

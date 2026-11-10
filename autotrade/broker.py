@@ -4,6 +4,7 @@ Daily volume is an end-of-day capacity approximation, not opening-auction depth.
 Unfilled quantities expire: this broker never retries a terminal order.
 """
 from contextlib import contextmanager
+import copy
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -14,6 +15,7 @@ import sqlite3
 from typing import Protocol
 
 from .models import Account, D, MarketDay, OrderIntent, Position, money
+from .config import digest
 
 
 class Broker(Protocol):
@@ -24,6 +26,7 @@ class Broker(Protocol):
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS paper_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS paper_account (
     id INTEGER PRIMARY KEY CHECK(id=1), initial_cash TEXT NOT NULL,
     cash TEXT NOT NULL, peak_equity TEXT NOT NULL
@@ -89,8 +92,9 @@ class PaperBroker:
     def __init__(self, db_path, config: dict):
         self.path = Path(db_path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.config = config
-        self.settings = config["broker"]
+        self.config = copy.deepcopy(config)
+        self.settings = self.config["broker"]
+        self._config_hash = self._execution_fingerprint()
         for key in ("initial_cash", "commission_rate", "min_commission", "stamp_tax_rate",
                     "transfer_fee_rate", "slippage_bps", "max_volume_fraction"):
             if D(self.settings[key]) < 0:
@@ -101,11 +105,24 @@ class PaperBroker:
             raise ValueError("max_volume_fraction must be in (0, 1]")
         with self._connection() as con:
             con.executescript(_SCHEMA)
+            con.execute("BEGIN IMMEDIATE")
             initial = str(money(self.settings["initial_cash"]))
             con.execute("INSERT OR IGNORE INTO paper_account VALUES(1,?,?,?)",
                         (initial, initial, initial))
             if D(con.execute("SELECT initial_cash FROM paper_account WHERE id=1").fetchone()[0]) != D(initial):
                 raise ValueError("initial_cash is fixed for an existing paper ledger; use a new database")
+            pinned = con.execute("SELECT value FROM paper_meta WHERE key='execution_config'").fetchone()
+            if pinned and pinned[0] != self._config_hash:
+                raise ValueError("broker trading configuration changed; use a new database")
+            con.execute("INSERT OR IGNORE INTO paper_meta VALUES('execution_config',?)", (self._config_hash,))
+            con.commit()
+
+    def _execution_fingerprint(self):
+        return digest({key: self.config[key] for key in ("broker", "risk", "boards")})
+
+    def _assert_config(self):
+        if self._execution_fingerprint() != self._config_hash or self.settings is not self.config["broker"]:
+            raise ValueError("broker trading configuration changed during execution")
 
     @contextmanager
     def _connection(self):
@@ -152,6 +169,7 @@ class PaperBroker:
             return self._account(con, marks, trade_date)
 
     def mark_equity(self, marks, trade_date):
+        self._assert_config()
         with self._transaction() as con:
             check = self._reconcile(con)
             if not check["ok"]:
@@ -173,9 +191,12 @@ class PaperBroker:
 
     def _record(self, con, order, payload, digest, status, filled=0, price=None,
                 fees=Decimal(0), reason=""):
+        # Retain the raw request in payload; invalid quantity types have no
+        # executable shares. Do not let SQLite's INTEGER affinity rewrite them.
+        requested_quantity = order.quantity if type(order.quantity) is int else 0
         con.execute("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (order.order_id, payload, digest, order.plan_id, order.symbol, order.side,
-                     order.quantity, order.trade_date, status, filled,
+                     requested_quantity, order.trade_date, status, filled,
                      str(price) if price is not None else None, str(fees), reason, _now()))
         con.execute("INSERT INTO paper_audit(created_at,order_id,event,detail) VALUES(?,?,?,?)",
                     (_now(), order.order_id, status, json.dumps({"reason": reason, "filled": filled})))
@@ -186,6 +207,7 @@ class PaperBroker:
         from .risk import check_order
         from .rules import round_buy_quantity, validate_quantity
 
+        self._assert_config()
         payload, digest = _payload(order)
         with self._transaction() as con:
             previous = con.execute("SELECT * FROM paper_orders WHERE order_id=?", (order.order_id,)).fetchone()
@@ -200,7 +222,11 @@ class PaperBroker:
             reconciliation = self._reconcile(con)
             if not reconciliation["ok"]:
                 return reject("RECONCILIATION_FAILED: " + "; ".join(reconciliation["errors"]))
-            latest = con.execute("SELECT MAX(trade_date) FROM paper_orders").fetchone()[0]
+            # Rejected requests may contain invalid or future dates. Only
+            # committed executions/valuations can advance the ledger clock.
+            latest = con.execute("SELECT MAX(trade_date) FROM ("
+                                 "SELECT trade_date FROM paper_fills UNION ALL "
+                                 "SELECT trade_date FROM paper_valuations)").fetchone()[0]
             if latest and order.trade_date < latest:
                 return reject("NON_MONOTONIC_SESSION")
             if isinstance(order.quantity, bool) or not isinstance(order.quantity, int) or order.quantity <= 0:
@@ -327,14 +353,17 @@ class PaperBroker:
                 errors.append("ORDER_PAYLOAD_MISMATCH:" + order["order_id"])
             try:
                 original = json.loads(order["payload"])
-                keys = ("order_id", "plan_id", "symbol", "side", "quantity", "trade_date")
-                if any(original[key] != order[key] for key in keys):
+                keys = ("order_id", "plan_id", "symbol", "side", "trade_date")
+                requested_quantity = original["quantity"] if type(original["quantity"]) is int else 0
+                if (any(original[key] != order[key] for key in keys)
+                        or requested_quantity != order["quantity"]):
                     errors.append("ORDER_INTENT_MISMATCH:" + order["order_id"])
             except (ValueError, KeyError, TypeError):
                 errors.append("INVALID_ORDER_PAYLOAD:" + order["order_id"])
             fill = con.execute("SELECT quantity FROM paper_fills WHERE order_id=?", (order["order_id"],)).fetchone()
             quantity = fill["quantity"] if fill else 0
-            if order["filled_quantity"] != quantity or quantity > order["quantity"]:
+            if order["filled_quantity"] != quantity or (quantity and (
+                    type(order["quantity"]) is not int or quantity > order["quantity"])):
                 errors.append("ORDER_QUANTITY_MISMATCH:" + order["order_id"])
             expected = ("FILLED" if quantity == order["quantity"] else "PARTIALLY_FILLED_CANCELLED") if quantity else None
             if (expected and order["status"] != expected) or (not quantity and order["status"] not in ("REJECTED", "CANCELLED")):

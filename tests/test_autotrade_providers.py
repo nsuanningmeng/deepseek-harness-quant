@@ -308,6 +308,12 @@ class QmtMarketTests(unittest.TestCase):
             provider = QmtLiveMarketProvider({})
             self.assertIsNone(provider.xtdata)
 
+    def test_conflicting_instrument_types_block_live_quotes(self):
+        for key, value in (("fund", True), ("etf", True), ("index", True), ("fund", "false")):
+            self.sdk.get_instrument_type = lambda symbol: {"stock": True, key: value}
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, "ordinary stock"):
+                self.provider({"600001.SH"})
+
 
 if __name__ == "__main__":
     unittest.main()

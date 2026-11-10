@@ -1,11 +1,13 @@
 """No XtQuant terminal or real account is used by these tests."""
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
 import time
 from types import SimpleNamespace as NS
 import unittest
@@ -98,7 +100,7 @@ class QmtTests(unittest.TestCase):
         self.cfg["risk"]["kill_switch_file"] = str(Path(self.temp.name) / "STOP")
         self.cfg["qmt"].update(enabled=True, read_only=True, live_trading_enabled=False,
                                account_id=ACCOUNT, userdata_path=self.temp.name,
-                               query_timeout_seconds=1, session_id=100,
+                               query_timeout_seconds=10, session_id=100,
                                max_quote_age_seconds=5, reconciliation_tolerance=1,
                                authorization_file=str(Path(self.temp.name) / "authorization.json"))
         self.fake = FakeTrader()
@@ -185,10 +187,22 @@ class QmtTests(unittest.TestCase):
 
     def test_query_timeout_disconnects_and_cannot_reuse(self):
         session = self.session()
-        self.cfg["qmt"]["query_timeout_seconds"] = 0.1
-        self.fake.query_delay = 0.3
-        with self.assertRaisesRegex(QmtError, "timed out"):
-            session.snapshot()
+        release, finished = threading.Event(), threading.Event()
+        query = self.fake.query_stock_asset
+        def blocked_query(account):
+            try:
+                release.wait(10)
+                return query(account)
+            finally:
+                finished.set()
+        try:
+            with patch.object(self.fake, "query_stock_asset", side_effect=blocked_query):
+                with patch.object(session, "_timeout", return_value=0.1):
+                    with self.assertRaisesRegex(QmtError, "timed out"):
+                        session.snapshot()
+        finally:
+            release.set()
+        self.assertTrue(finished.wait(10))
         with self.assertRaises(QmtError):
             session.connect()
         self.assertFalse(session.connected)
@@ -274,15 +288,31 @@ class QmtTests(unittest.TestCase):
 
     def test_submit_timeout_reconciles_without_resending(self):
         self.allow_live()
-        self.fake.submit_mode = "timeout"
         session = self.session()
-        self.cfg["qmt"]["query_timeout_seconds"] = 0.1
-        with self.assertRaisesRegex(QmtError, "unknown"):
-            session.submit(self.intent())
+        release, finished = threading.Event(), threading.Event()
+        call, send = session._call, self.fake.order_stock
+        def delayed_reply(*args):
+            try:
+                result = send(*args)
+                release.wait(10)
+                return result
+            finally:
+                finished.set()
+        def short_submit_timeout(method, *args, **kwargs):
+            if method == "order_stock":
+                with patch.object(session, "_timeout", return_value=0.1):
+                    return call(method, *args, **kwargs)
+            return call(method, *args, **kwargs)
+        try:
+            with patch.object(self.fake, "order_stock", side_effect=delayed_reply):
+                with patch.object(session, "_call", side_effect=short_submit_timeout):
+                    with self.assertRaisesRegex(QmtError, "unknown"):
+                        session.submit(self.intent())
+        finally:
+            release.set()
+        self.assertTrue(finished.wait(10))
         self.assertEqual(session.store.intents()[0]["state"], "UNKNOWN")
-        time.sleep(0.35)
         session.close()
-        self.fake.submit_mode = "normal"
         restarted = self.session()
         result = restarted.submit(self.intent())
         self.assertEqual(result["state"], "SUBMITTED")
@@ -591,6 +621,250 @@ class QmtTests(unittest.TestCase):
         callback.on_account_status(NS(account_id=ACCOUNT, status=0))
         self.assertIsNone(session.connection_status()["account_status"])
         self.assertFalse(session.connected)
+
+    def test_snapshot_detects_fill_between_balances_and_first_order_query(self):
+        self.allow_live()
+        session = self.session()
+        query = self.fake.query_stock_orders
+        def filled_before_orders(account):
+            if not self.fake.orders:
+                self.fake.orders = [broker_order(status=56, filled=100)]
+                self.fake.trades = [broker_trade()]
+                self.sell_position()
+                self.fake.asset.cash -= 1000
+                self.fake.asset.total_asset -= 1000
+            return query(account)
+        self.fake.query_stock_orders = filled_before_orders
+        with self.assertRaisesRegex(QmtError, "changed during snapshot"):
+            session.submit(self.intent())
+        self.assertFalse(self.fake.order_calls)
+
+    def test_callback_immediately_after_snapshot_is_not_folded_into_its_revision(self):
+        self.allow_live()
+        session = self.session()
+        snapshot = session.snapshot
+        def raced_snapshot():
+            result = snapshot()
+            self.fake.callback.on_account_status(NS(account_id=ACCOUNT, status=0))
+            return result
+        with patch.object(session, "snapshot", side_effect=raced_snapshot):
+            with self.assertRaisesRegex(PermissionError, "changed"):
+                session.submit(self.intent())
+        self.assertFalse(self.fake.order_calls)
+
+    def test_emergency_stop_blocks_submit_but_allows_authorized_cancel(self):
+        self.allow_live()
+        session = self.session()
+        session.submit(self.intent())
+        Path(self.cfg["risk"]["kill_switch_file"]).touch()
+        with self.assertRaisesRegex(PermissionError, "emergency stop"):
+            session.submit(self.intent("local-2"))
+        self.assertEqual(session.cancel("local-1")["state"], "CANCEL_PENDING")
+        self.assertEqual(self.fake.cancel_calls, [1])
+
+    def test_sell_daily_upper_bound_enforces_independent_risk_caps(self):
+        self.allow_live()
+        self.sell_position()
+        self.cfg["risk"]["max_order_notional"] = 1050
+        session = self.session()
+        with self.assertRaisesRegex(PermissionError, "max_order_notional"):
+            session.submit(replace(self.intent(), side="SELL", limit_price=D(9)))
+        self.assertFalse(self.fake.order_calls)
+
+    def test_order_remark_cannot_disappear_after_correlation(self):
+        self.allow_live()
+        session = self.session()
+        session.submit(self.intent())
+        self.fake.orders[0].order_status = 54
+        self.assertTrue(session.reconcile()["ok"])
+        self.fake.orders[0].order_remark = "manual"
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            session.reconcile()
+
+    def test_current_session_terminal_order_cannot_disappear_from_queries(self):
+        self.allow_live()
+        session = self.session()
+        session.submit(self.intent())
+        self.fake.orders[0].order_status = 54
+        self.fake.callback.on_stock_order(self.fake.orders[0])
+        # A restart retains correlation but the broker lost its query record.
+        session.close()
+        self.fake.orders = []
+        restarted = self.session()
+        self.assertFalse(restarted.reconcile()["ok"])
+
+    def test_broker_id_cannot_change_between_callback_and_return(self):
+        self.allow_live()
+        session = self.session()
+        send = self.fake.order_stock
+        def callback_before_return(*args):
+            broker_id = send(*args)
+            self.fake.callback.on_stock_order(self.fake.orders[0])
+            return broker_id + 1
+        self.fake.order_stock = callback_before_return
+        with self.assertRaisesRegex((ValueError, QmtError), "broker ID"):
+            session.submit(self.intent())
+        self.assertEqual(session.store.intents()[0]["broker_id"], 1)
+        self.assertEqual(len(self.fake.order_calls), 1)
+
+    def test_limit_trade_cannot_execute_outside_its_order_price(self):
+        session = self.session()
+        self.fake.orders = [broker_order(status=56, filled=100)]
+        trade = broker_trade()
+        trade.traded_price = 10.5
+        trade.traded_amount = 1050
+        self.fake.trades = [trade]
+        self.assertIn("TRADE_OUTSIDE_ORDER_LIMIT", session.reconcile()["errors"])
+
+    def test_external_config_mutation_cannot_enable_live_session(self):
+        session = self.session()
+        self.allow_live()
+        with self.assertRaisesRegex(PermissionError, "disabled"):
+            session.submit(self.intent())
+        self.assertFalse(self.fake.order_calls)
+
+    def test_risk_configuration_cannot_change_within_connected_session(self):
+        self.allow_live()
+        session = self.session()
+        session.config["risk"]["max_order_notional"] *= 2
+        with self.assertRaisesRegex(PermissionError, "configuration changed"):
+            session.submit(self.intent())
+        self.assertFalse(self.fake.order_calls)
+
+    def test_available_and_frozen_shares_cannot_overlap(self):
+        self.sell_position()
+        self.fake.positions[0].frozen_volume = 1
+        session = self.session()
+        with self.assertRaisesRegex(QmtError, "position availability"):
+            session.snapshot()
+
+    def test_concurrent_sessions_cannot_duplicate_reserved_submission(self):
+        self.allow_live()
+        first, second = self.session(), self.session()
+        sending, release = threading.Event(), threading.Event()
+        send = self.fake.order_stock
+        def delayed_send(*args):
+            sending.set()
+            if not release.wait(5):
+                raise RuntimeError("test release timed out")
+            return send(*args)
+        self.fake.order_stock = delayed_send
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(first.submit, self.intent())
+            try:
+                self.assertTrue(sending.wait(5))
+                with self.assertRaisesRegex(RuntimeError, "another autotrade cycle"):
+                    second.submit(self.intent())
+            finally:
+                release.set()
+            self.assertEqual(pending.result(timeout=5)["state"], "SUBMITTED")
+        second.submit(self.intent())
+        self.assertEqual(len(self.fake.order_calls), 1)
+
+    def test_partial_fill_callback_preceding_sync_return_remains_partial(self):
+        self.allow_live()
+        session = self.session()
+        send = self.fake.order_stock
+        def callback_before_return(*args):
+            broker_id = send(*args)
+            self.fake.orders[0].order_status = CONSTANTS.ORDER_PART_SUCC
+            self.fake.orders[0].traded_volume = 50
+            self.fake.callback.on_stock_order(self.fake.orders[0])
+            return broker_id
+        self.fake.order_stock = callback_before_return
+        self.assertEqual(session.submit(self.intent())["state"], "PARTIALLY_FILLED")
+
+    def test_disconnect_between_main_guard_and_submit_dispatch_blocks_write(self):
+        self.allow_live()
+        session = self.session()
+        call = session._call
+        def disconnect_before_dispatch(method, *args, **kwargs):
+            if method == "order_stock":
+                self.fake.callback.on_disconnected()
+            return call(method, *args, **kwargs)
+        with patch.object(session, "_call", side_effect=disconnect_before_dispatch):
+            with self.assertRaises((QmtError, PermissionError)):
+                session.submit(self.intent())
+        self.assertFalse(self.fake.order_calls)
+        self.assertEqual(session.store.intents()[0]["state"], "REJECTED")
+
+    def test_disconnect_between_main_guard_and_cancel_dispatch_blocks_write(self):
+        self.allow_live()
+        session = self.session()
+        session.submit(self.intent())
+        call = session._call
+        def disconnect_before_dispatch(method, *args, **kwargs):
+            if method == "cancel_order_stock":
+                self.fake.callback.on_disconnected()
+            return call(method, *args, **kwargs)
+        with patch.object(session, "_call", side_effect=disconnect_before_dispatch):
+            with self.assertRaises((QmtError, PermissionError)):
+                session.cancel("local-1")
+        self.assertFalse(self.fake.cancel_calls)
+        self.assertFalse(session.store.intents()[0]["cancel_requested"])
+
+    def test_worker_dispatch_rechecks_authorization_and_stop(self):
+        self.allow_live()
+        for reason in ("expired", "stale", "stop", "revision"):
+            with self.subTest(reason=reason):
+                session = self.session()
+                call = session._call
+                def revoke_before_dispatch(method, *args, **kwargs):
+                    if method == "order_stock":
+                        if reason == "expired":
+                            self.clock += timedelta(minutes=11)
+                        elif reason == "stale":
+                            self.clock += timedelta(seconds=6)
+                        elif reason == "stop":
+                            Path(self.cfg["risk"]["kill_switch_file"]).touch()
+                        else:
+                            self.fake.callback.on_account_status(NS(account_id=ACCOUNT, status=0))
+                    return call(method, *args, **kwargs)
+                with patch.object(session, "_call", side_effect=revoke_before_dispatch):
+                    with self.assertRaises((QmtError, PermissionError)):
+                        session.submit(self.intent(reason))
+                self.assertFalse(self.fake.order_calls)
+                self.clock = NOW
+                Path(self.cfg["risk"]["kill_switch_file"]).unlink(missing_ok=True)
+                session.close()
+
+    def test_timed_out_worker_cannot_dispatch_when_it_eventually_runs(self):
+        self.allow_live()
+        session = self.session()
+        call, thread_type = session._call, threading.Thread
+        release, finished = threading.Event(), threading.Event()
+        def delayed_thread(*args, **kwargs):
+            target = kwargs["target"]
+            def delayed():
+                release.wait(5)
+                try:
+                    target()
+                finally:
+                    finished.set()
+            return thread_type(*args, **{**kwargs, "target": delayed})
+        def delayed_dispatch(method, *args, **kwargs):
+            if method == "order_stock":
+                with patch.object(session, "_timeout", return_value=0.2):
+                    with patch("autotrade.qmt.threading.Thread", side_effect=delayed_thread):
+                        return call(method, *args, **kwargs)
+            return call(method, *args, **kwargs)
+        try:
+            with patch.object(session, "_call", side_effect=delayed_dispatch):
+                with self.assertRaisesRegex(QmtError, "unknown"):
+                    session.submit(self.intent())
+            self.assertFalse(session.connected)
+        finally:
+            release.set()
+        self.assertTrue(finished.wait(5))
+        self.assertFalse(self.fake.order_calls)
+        self.assertEqual(session.store.intents()[0]["state"], "UNKNOWN")
+
+    def test_invalid_timeout_is_rejected_before_any_sdk_call(self):
+        session = self.session()
+        session.settings["query_timeout_seconds"] = -1
+        with self.assertRaisesRegex(QmtError, "timeout"):
+            session._call("cancel_order_stock", self.fake, 1, pre_dispatch=lambda: None)
+        self.assertFalse(self.fake.cancel_calls)
 
 
 if __name__ == "__main__":

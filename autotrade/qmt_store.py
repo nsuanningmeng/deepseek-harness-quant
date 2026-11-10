@@ -111,7 +111,9 @@ class QmtStore:
     def set_state(self, local_id, state, broker_id=None):
         with self.connection() as con:
             con.execute("BEGIN IMMEDIATE")
-            old = con.execute("SELECT state,cancel_requested FROM qmt_intents WHERE local_id=?", (local_id,)).fetchone()
+            old = con.execute("SELECT state,cancel_requested,broker_id FROM qmt_intents WHERE local_id=?", (local_id,)).fetchone()
+            if old and old["broker_id"] is not None and broker_id is not None and old["broker_id"] != broker_id:
+                raise ValueError("QMT broker ID conflicts with recorded intent")
             terminal = {"FILLED", "CANCELLED", "PARTIALLY_FILLED_CANCELLED", "REJECTED"}
             if old and old["state"] in terminal:
                 if state not in terminal:
@@ -119,6 +121,8 @@ class QmtStore:
                 if old["state"] != state:
                     raise ValueError("QMT intent terminal state conflicts")
             if old and old["state"] == "CANCEL_PENDING" and old["cancel_requested"] and state in {"PENDING", "SUBMITTED", "PARTIALLY_FILLED"}:
+                return
+            if old and old["state"] == "PARTIALLY_FILLED" and state in {"PENDING", "SUBMITTED"}:
                 return
             con.execute("UPDATE qmt_intents SET state=?,broker_id=COALESCE(?,broker_id) WHERE local_id=?",
                         (state, broker_id, local_id))
@@ -153,7 +157,7 @@ class QmtStore:
                     if previous != payload:
                         raise ValueError("conflicting duplicate QMT trade")
                     return
-                if (any(previous[field] != payload[field] for field in ("symbol", "side", "quantity", "price_type"))
+                if (any(previous[field] != payload[field] for field in ("symbol", "side", "quantity", "price_type", "remark"))
                         or D(previous["price"]) != D(payload["price"])):
                     raise ValueError("QMT order identity changed")
                 terminal = {"FILLED", "CANCELLED", "PARTIALLY_FILLED_CANCELLED", "REJECTED"}

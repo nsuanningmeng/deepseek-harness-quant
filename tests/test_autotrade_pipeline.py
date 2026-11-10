@@ -77,6 +77,16 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(result["orders"], 0)
         self.assertTrue(result["reconciliation"]["ok"])
 
+    def test_replay_missing_snapshot_never_fetches_network(self):
+        self.cfg["data"].update(provider="tushare", universe=["600001.SH", "000001.SZ",
+            "300001.SZ", "688001.SH", "920001.BJ", "600002.SH"])
+        (Path(self.cfg["data"]["directory"]) / f"{self.days[0]}.json").unlink()
+        with patch("autotrade.engine.provider_for") as provider:
+            with self.assertRaises(FileNotFoundError):
+                replay_range(self.cfg, self.days[0], self.days[0])
+        provider.assert_not_called()
+        self.assertEqual(self.cfg["data"]["provider"], "tushare")
+
     def test_catchup_has_bounded_scope(self):
         self.cfg["data"].update(provider="tushare", max_catchup_sessions=1)
         self.cfg["data"]["universe"] = ["600001.SH", "000001.SZ", "300001.SZ", "688001.SH", "920001.BJ", "600002.SH"]

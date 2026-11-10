@@ -2,6 +2,7 @@
 
 与原研究账户隔离。订单意图先持久化，再逐笔原子提交；崩溃重跑复用同一意图。
 """
+import copy
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -24,7 +25,9 @@ from .rules import round_buy_quantity
 class Engine:
     def __init__(self, config):
         validate_config(config)
+        config = copy.deepcopy(config)
         self.config = config
+        self._config_hash = trading_fingerprint(config)
         self.runtime = Path(config["runtime_dir"])
         self.runtime.mkdir(parents=True, exist_ok=True)
         self.db_path = self.runtime / "paper.sqlite3"
@@ -178,6 +181,9 @@ class Engine:
         date.fromisoformat(trade_date)
         with ProcessLock(self.runtime / "cycle.lock"):
             try:
+                validate_config(self.config)
+                if trading_fingerprint(self.config) != self._config_hash:
+                    raise ValueError("trading configuration changed during execution")
                 result = self._cycle(trade_date)
                 atomic_json(self.runtime / "health.json", {"ok": True, "checked_at": utc_now(), "last_session": trade_date, "report": result})
                 return result

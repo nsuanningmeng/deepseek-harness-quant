@@ -9,6 +9,7 @@ import re
 import tempfile
 
 from autotrade.models import Bar, D, MarketDay
+from autotrade.rules import board_for_symbol
 
 
 def _date(value: str) -> str:
@@ -38,8 +39,8 @@ def validate_day(day: MarketDay) -> None:
             raise ValueError("invalid A-share symbol")
         if bar.symbol != symbol or bar.date != day.date:
             raise ValueError("bar symbol/date does not match snapshot")
-        if bar.board not in {"MAIN", "CHINEXT", "STAR", "BSE"}:
-            raise ValueError("unknown board")
+        if bar.board != board_for_symbol(symbol):
+            raise ValueError("ordinary A-share symbol and board do not match")
         if _date(bar.list_date) > day.date or not isinstance(bar.sector, str) or not bar.sector.strip():
             raise ValueError("invalid listing date or sector")
         if type(bar.is_st) is not bool or type(bar.suspended) is not bool:
@@ -48,17 +49,24 @@ def validate_day(day: MarketDay) -> None:
             raise ValueError("invalid volume or turnover")
         if bar.suspended and bar.volume != 0:
             raise ValueError("suspended bar has nonzero volume")
-        prices = [bar.open, bar.high, bar.low, bar.close, bar.prev_close]
-        if any(_number(price) <= 0 for price in prices):
+        prices = [_number(price) for price in (bar.open, bar.high, bar.low, bar.close, bar.prev_close)]
+        if any(price <= 0 for price in prices):
             raise ValueError("prices must be finite and positive")
-        if not bar.low <= min(bar.open, bar.close) <= max(bar.open, bar.close) <= bar.high:
+        opening, high, low, close, _ = prices
+        # The ex-rights reference may have extra precision; traded prices may not.
+        if any(price % D("0.01") for price in prices[:4]):
+            raise ValueError("raw A-share prices must use 0.01 ticks")
+        if not low <= min(opening, close) <= max(opening, close) <= high:
             raise ValueError("inconsistent OHLC prices")
         if (bar.limit_up is None) != (bar.limit_down is None):
             raise ValueError("both price limits must be present or absent")
         if bar.limit_up is not None:
-            if not 0 < _number(bar.limit_down) < _number(bar.limit_up):
+            lower, upper = _number(bar.limit_down), _number(bar.limit_up)
+            if not 0 < lower < upper:
                 raise ValueError("invalid price limits")
-            if bar.low < bar.limit_down or bar.high > bar.limit_up:
+            if lower % D("0.01") or upper % D("0.01"):
+                raise ValueError("exchange price limits must use 0.01 ticks")
+            if low < lower or high > upper:
                 raise ValueError("OHLC outside exchange price limits")
 
 
