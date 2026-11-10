@@ -12,6 +12,29 @@ AI 不预测个股。这是硬约束，不是选项。
 
 ## 开始
 
+### 全自动 A 股模拟交易（本 fork 第一阶段）
+
+新增独立 `autotrade/`，不改变原 HARNESS、人工审批、研究回测和旧模拟账户。
+盘后封存行情 → 低换手筛选 → 确定性目标股数 → 独立风控 → 次日行情模拟执行 → 订单/现金/持仓对账 → 调度与日志。
+无需 AI API Key；**本版本只能模拟交易，任何配置都不能启用真实下单**。
+
+```bash
+python -m pip install -r requirements-autotrade.txt
+python -m unittest discover -s tests -p "test_autotrade*.py" -v
+python -m autotrade demo
+```
+
+演示使用公开可分发的合成数据，输出到 `runtime/autotrade-demo/`。
+价格取次日开盘并计滑点、费用，成交容量使用次日总量作盘后近似；这不是实时开盘成交或收益验证。
+支持 T+1 批次、板块申报数量、显式涨跌停价、停牌/失败、部分成交撤余、订单幂等和异常阻断。
+
+- [部署、行情权限、调度与恢复](docs/自动交易部署.md)
+- [设计边界、原模块审查与变更清单](autotrade/DESIGN.md)
+- [安全配置模板](config/autotrade.yaml.example)
+
+真实行情的 Tushare 更新器需要用户自己的权限和 `TUSHARE_TOKEN`；启动后先积累完整因子窗口。
+QMT/XtQuant 仅预留禁用接口，实盘接入还需要实现券商回报与对账、权限确认、隔离部署和单独手动授权。
+
 新用户直接走 [一键部署](docs/一键部署.md)。接入 AI API 后，数据源、配置、验证全交给 AI 向导，不必读本页其余内容。
 
 ## 接入 DeepSeek API
