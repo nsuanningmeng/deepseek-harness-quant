@@ -12,6 +12,31 @@ AI 不预测个股。这是硬约束，不是选项。
 
 ## 开始
 
+### 全自动 A 股模拟交易与 QMT 接口（本 fork）
+
+新增独立 `autotrade/`，不改变原 HARNESS、人工审批、研究回测和旧模拟账户。
+盘后封存行情 → 低换手筛选 → 确定性目标股数 → 独立风控 → 次日行情模拟执行 → 订单/现金/持仓对账 → 调度与日志。
+无需 AI API Key；**自动运行入口始终为模拟盘，QMT 默认关闭且只读**。
+
+```bash
+python -m pip install -r requirements-autotrade.txt
+python -m unittest discover -s tests -p "test_autotrade*.py" -v
+python -m autotrade demo
+```
+
+演示使用公开可分发的合成数据，输出到 `runtime/autotrade-demo/`。
+价格取次日开盘并计滑点、费用，成交容量使用次日总量作盘后近似；这不是实时开盘成交或收益验证。
+支持 T+1 批次、板块申报数量、显式涨跌停价、停牌/失败、部分成交撤余、订单幂等和异常阻断。
+
+- [部署、行情权限、调度与恢复](docs/自动交易部署.md)
+- [设计边界、原模块审查与变更清单](autotrade/DESIGN.md)
+- [安全配置模板](config/autotrade.yaml.example)
+- [真实行情、历史预热、QMT只读配置与验收](docs/真实行情与QMT接入.md)
+
+Tushare 支持历史预热、增量和漏日恢复，需要自己的权限与 `TUSHARE_TOKEN`；BaoStock 提供明确标记推导限价、仅供模拟的无账号路线。
+QMT/XtQuant 已实现连接、查询、回调、对账和受控提交/撤单代码；CLI只允许只读连接，日频计划不能直接进入实盘。
+实时API须独立人工授权文件、实时行情、账户状态、独立风控和对账全部通过。尚未连接用户终端验收，没有尝试实际券商下单。
+
 新用户直接走 [一键部署](docs/一键部署.md)。接入 AI API 后，数据源、配置、验证全交给 AI 向导，不必读本页其余内容。
 
 ## 接入 DeepSeek API

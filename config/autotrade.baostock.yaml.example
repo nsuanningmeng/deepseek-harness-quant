@@ -1,0 +1,17 @@
+# 无账号公开行情，只供明确受限的纸面模拟。不是交易所涨跌停价源。
+mode: paper
+runtime_dir: runtime/baostock-paper
+data:
+  provider: baostock
+  universe: []  # 必填：仅成熟沪深主板/创业板；不要填科创板/北交所/ETF
+  directory: runtime/baostock-paper/market
+  calendar_cache: runtime/baostock-paper/calendar-cache.json
+  auto_bootstrap: true
+  allow_derived_limits: true
+  derived_limit_rates: {MAIN: 0.10, CHINEXT: 0.20}
+risk:
+  kill_switch_file: runtime/baostock-paper/STOP
+qmt:
+  enabled: false
+  read_only: true
+  live_trading_enabled: false

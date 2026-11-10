@@ -1,0 +1,2 @@
+# 离线模拟闭环；行情 Tushare 可选安装 requirements.txt 中的 tushare / pandas。
+PyYAML>=6.0,<7

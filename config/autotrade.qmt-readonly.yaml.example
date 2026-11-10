@@ -1,0 +1,14 @@
+# 仅只读查询；使用环境变量提供自己的终端路径和资金账号。
+mode: paper
+runtime_dir: runtime/qmt-readonly
+qmt:
+  enabled: true
+  read_only: true
+  live_trading_enabled: false
+  broker_permission_confirmed: false
+  manual_authorization: false
+  account_id_env: QMT_ACCOUNT_ID
+  userdata_path_env: QMT_USERDATA_PATH
+  account_type: STOCK
+  tick_volume_multiplier: 100  # 接真实终端前核实单位；存在pvolume时还会交叉检查
+  authorization_file: ''

@@ -1,0 +1,4 @@
+# Optional real-market readers; no broker SDK, credentials, or live trading.
+baostock>=0.9.4,<1
+pandas>=2.2,<4
+tushare>=1.4,<2
