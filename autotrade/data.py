@@ -152,8 +152,8 @@ class TushareProvider:
                 token = os.environ.get("TUSHARE_TOKEN")
                 if not token:
                     raise ValueError("TUSHARE_TOKEN is required")
-                import tushare
-                self.client = tushare.pro_api(token, timeout=30)
+                from .providers import TushareHttpClient
+                self.client = TushareHttpClient(token, timeout=30)
             frame = getattr(self.client, endpoint)(fields=",".join(fields), **params)
         except Exception:
             # 上游异常可能包含认证信息，不把原异常正文写进运行日志。

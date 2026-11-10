@@ -22,9 +22,40 @@ def main(argv=None):
     demo.add_argument("--runtime", default=str(ROOT / "runtime" / "autotrade-demo"))
     commands.add_parser("health", help="check reconciled ledger, last cycle freshness and scheduler errors")
     commands.add_parser("status", help="show persisted paper orders and reconciliation")
+    commands.add_parser("doctor", help="inspect local configuration without network access or broker connection")
+    bootstrap = commands.add_parser("bootstrap", help="download complete historical market snapshots; never place orders")
+    bootstrap.add_argument("--start", required=True)
+    bootstrap.add_argument("--end", required=True)
+    replay = commands.add_parser("run-range", help="replay sealed real or synthetic snapshots into the paper account")
+    replay.add_argument("--start", required=True)
+    replay.add_argument("--end", required=True)
+    check = commands.add_parser("market-check", help="read provider data and report field/permission readiness")
+    check.add_argument("--date", required=True)
+    commands.add_parser("qmt-inspect", help="read-only terminal account/order/trade snapshot and reconciliation")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
-    if args.command == "demo":
+    if args.command == "doctor":
+        from .diagnostics import configuration_report
+        result = configuration_report(cfg)
+    elif args.command == "bootstrap":
+        from .bootstrap import bootstrap_market
+        result = bootstrap_market(cfg, args.start, args.end)
+    elif args.command == "run-range":
+        from .pipeline import replay_range
+        result = replay_range(cfg, args.start, args.end)
+    elif args.command == "market-check":
+        from .providers import provider_for
+        result = provider_for(cfg).diagnose(args.date)
+    elif args.command == "qmt-inspect":
+        from .qmt import QmtSession
+        session = QmtSession(cfg)
+        try:
+            session.connect()
+            snapshot = session.snapshot()
+            result = {"read_only": True, "snapshot": snapshot, "reconciliation": session.reconcile()}
+        finally:
+            session.close()
+    elif args.command == "demo":
         from .demo import build_demo
         cfg["runtime_dir"] = str(Path(args.runtime).resolve())
         cfg["data"]["provider"] = "files"

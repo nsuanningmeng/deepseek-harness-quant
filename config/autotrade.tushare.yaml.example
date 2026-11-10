@@ -1,0 +1,16 @@
+# 基于autotrade.yaml.example自动合并；填入自己的证券池，Token只通过环境变量。
+mode: paper
+runtime_dir: runtime/tushare-paper
+data:
+  provider: tushare
+  universe: []  # 必填：你要研究的普通A股代码，如六位代码.SH/.SZ/.BJ；本模板不推荐标的
+  directory: runtime/tushare-paper/market
+  calendar_cache: runtime/tushare-paper/calendar-cache.json
+  auto_bootstrap: true
+  allow_derived_limits: false
+risk:
+  kill_switch_file: runtime/tushare-paper/STOP
+qmt:
+  enabled: false
+  read_only: true
+  live_trading_enabled: false

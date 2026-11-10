@@ -13,7 +13,8 @@ from factors.turnover_signal import low_turnover_scores
 
 from .broker import PaperBroker
 from .config import canonical, digest, trading_fingerprint, validate_config
-from .data import TushareProvider, load_day, validate_day
+from .data import load_day, validate_day
+from .providers import provider_for
 from .locking import ProcessLock
 from .models import D, OrderIntent, money
 from .monitoring import atomic_json, event, utc_now
@@ -189,8 +190,8 @@ class Engine:
     def _cycle(self, trade_date):
         directory = Path(self.config["data"]["directory"])
         snapshot_path = directory / f"{trade_date}.json"
-        if self.config["data"]["provider"] == "tushare" and not snapshot_path.exists():
-            TushareProvider(self.config).update(trade_date, directory)
+        if self.config["data"]["provider"] != "files" and not snapshot_path.exists():
+            provider_for(self.config).update(trade_date, directory)
         day = load_day(snapshot_path)
         validate_day(day)
         if day.date != trade_date:

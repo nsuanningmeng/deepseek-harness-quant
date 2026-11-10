@@ -147,7 +147,7 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((Path(self.temp.name) / "paper.sqlite3").exists())
 
     def test_live_and_invalid_config_cannot_construct_engine(self):
-        cases = [("mode", None, "live"), ("qmt", "enabled", True),
+        cases = [("mode", None, "live"), ("qmt", "live_trading_enabled", True),
                  ("qmt", "manual_authorization", True), ("risk", "max_total_weight", "NaN"),
                  ("strategy", "lookback", True), ("broker", "initial_cash", -1)]
         for section, key, value in cases:
@@ -171,7 +171,7 @@ class EngineTests(unittest.TestCase):
     def test_existing_tushare_snapshot_replay_is_offline(self):
         day = load_day(Path(self.cfg["data"]["directory"]) / f"{self.dates[19]}.json")
         self.cfg["data"].update(provider="tushare", universe=sorted(day.bars))
-        with patch("autotrade.engine.TushareProvider") as provider:
+        with patch("autotrade.engine.provider_for") as provider:
             engine = Engine(self.cfg)
             engine.cycle(day.date)
             engine.cycle(day.date)
@@ -220,7 +220,7 @@ class EngineTests(unittest.TestCase):
 
     def test_scheduler_cached_tushare_day_survives_network_failure(self):
         self.cfg["data"]["provider"] = "tushare"
-        with patch("autotrade.scheduler.TushareProvider", side_effect=RuntimeError("offline")):
+        with patch("autotrade.scheduler.provider_for", side_effect=RuntimeError("offline")):
             self.assertTrue(is_session(self.cfg, self.dates[19]))
 
 

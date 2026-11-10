@@ -4,21 +4,22 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .data import TushareProvider, load_day
-from .engine import Engine
+from .data import load_day
+from .providers import provider_for
+from .pipeline import prepare_and_run
 from .monitoring import atomic_json, event, utc_now
 
 SHANGHAI = timezone(timedelta(hours=8))
 
 
 def is_session(config, day):
-    if config["data"]["provider"] == "tushare":
+    if config["data"]["provider"] != "files":
         snapshot = Path(config["data"]["directory"]) / f"{day}.json"
         if snapshot.exists():
             if load_day(snapshot).date != day:
                 raise ValueError("cached session date mismatch")
             return True
-        return TushareProvider(config).is_trading_day(day)
+        return provider_for(config).is_trading_day(day)
     path = Path(config["data"]["directory"]) / "calendar.json"
     calendar = json.loads(path.read_text(encoding="utf-8"))
     if not calendar["start"] <= day <= calendar["end"]:
@@ -39,7 +40,7 @@ def tick(config, now=None):
     day = now.date().isoformat()
     if not is_session(config, day):
         return {"state": "MARKET_CLOSED", "date": day}
-    return Engine(config).cycle(day)
+    return prepare_and_run(config, day)
 
 
 def run(config, once=False):

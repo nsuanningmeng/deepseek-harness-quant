@@ -350,30 +350,6 @@ class PaperBroker:
                 return {"ok": False, "errors": ["INVALID_LEDGER:" + type(exc).__name__]}
 
 
-class QmtAdapter:
-    """Future XtQuant mapping, never an enabled real-money implementation.
-
-    Future implementations must reconcile broker order IDs before retrying network
-    timeouts and consume callbacks for fills/rejections. A configuration toggle is
-    insufficient authorization. This class never imports or connects XtQuant.
-    """
-
-    def __init__(self, config: dict):
-        self.config = config
-
-    def execute(self, order: OrderIntent, day: MarketDay) -> dict:
-        live = self.config.get("qmt", {})
-        if not live.get("enabled", False):
-            raise PermissionError("live trading is disabled")
-        if not live.get("broker_permission_confirmed", False) or not live.get("manual_authorization", ""):
-            raise PermissionError("broker permission and explicit manual authorization are required")
-        raise NotImplementedError("real order submission is not implemented in phase one")
-
-    def account(self, marks, trade_date):
-        raise NotImplementedError("QMT account reconciliation requires a broker-approved adapter")
-
-    def reconcile(self):
-        raise NotImplementedError("QMT reconciliation is not implemented")
-
-    def orders(self):
-        raise NotImplementedError("QMT order queries are not implemented")
+# Compatibility import; importing QmtSession never loads or connects the SDK.
+# The paper engine still constructs PaperBroker exclusively.
+from .qmt import QmtAdapter  # noqa: E402,F401

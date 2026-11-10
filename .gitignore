@@ -8,6 +8,7 @@ __pycache__/
 # ---- 本地配置（含真实密钥，勿提交） ----
 config/params.yaml
 config/autotrade.yaml
+config/autotrade.*.yaml
 runtime/
 harness/home/.credentials.yaml
 
@@ -25,6 +26,9 @@ data/factorpool/
 data/trash/
 *.db
 *.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 *.parquet
 *.xlsx
 

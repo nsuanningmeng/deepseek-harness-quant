@@ -241,7 +241,7 @@ class PaperBrokerTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             QmtAdapter(self.cfg).execute(intent(), market())
         self.cfg["qmt"].update(enabled=True, broker_permission_confirmed=True, manual_authorization=True)
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(PermissionError):
             QmtAdapter(self.cfg).execute(intent(), market())
 
 

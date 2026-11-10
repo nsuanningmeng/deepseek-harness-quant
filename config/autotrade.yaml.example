@@ -5,6 +5,15 @@ data:
   provider: files
   directory: runtime/autotrade/market
   universe: []  # files 从快照读取；tushare 必须显式指定有权限的 A 股池
+  request_attempts: 3
+  retry_seconds: 2
+  request_timeout: 20
+  calendar_cache: runtime/autotrade/calendar-cache.json
+  bootstrap_calendar_days: 120
+  max_catchup_sessions: 120
+  auto_bootstrap: true
+  allow_derived_limits: false  # 仅Baostock纸面成交可显式启用；不能用于QMT实盘
+  derived_limit_rates: {MAIN: 0.10, CHINEXT: 0.20}
 strategy:
   name: turn_low
   lookback: 20
@@ -43,8 +52,20 @@ schedule:
   poll_seconds: 60
   health_max_age_seconds: 172800
 qmt:
-  enabled: false
+  enabled: false  # 仅开启终端连接；不代表允许交易
+  read_only: true
+  live_trading_enabled: false
   broker_permission_confirmed: false
   manual_authorization: false
   account_id: ''
   userdata_path: ''
+  account_id_env: QMT_ACCOUNT_ID
+  userdata_path_env: QMT_USERDATA_PATH
+  account_type: STOCK
+  session_id: 0
+  query_timeout_seconds: 10
+  max_quote_age_seconds: 5
+  max_account_age_seconds: 10
+  tick_volume_multiplier: 100
+  reconciliation_tolerance: 1.0
+  authorization_file: ''

@@ -34,9 +34,22 @@ def _merge(base, overrides):
 
 
 def validate_config(cfg):
-    if cfg["mode"] != "paper" or cfg["qmt"]["enabled"] is not False or cfg["qmt"]["manual_authorization"] is not False:
-        raise ValueError("This release supports paper trading only; live trading is disabled")
-    if cfg["data"]["provider"] not in {"files", "tushare"}:
+    if cfg["mode"] != "paper" or cfg["qmt"]["manual_authorization"] is not False:
+        raise ValueError("The automated engine supports paper trading only")
+    for key in ["enabled", "read_only", "live_trading_enabled", "broker_permission_confirmed", "manual_authorization"]:
+        if type(cfg["qmt"][key]) is not bool:
+            raise ValueError(f"qmt.{key} must be boolean")
+    if cfg["qmt"]["read_only"] is not True or cfg["qmt"]["live_trading_enabled"] is not False:
+        raise ValueError("The CLI allows read-only QMT connections; live trading is disabled")
+    if cfg["qmt"]["account_type"] != "STOCK":
+        raise ValueError("only ordinary STOCK cash accounts are supported")
+    if type(cfg["qmt"]["session_id"]) is not int or cfg["qmt"]["session_id"] < 0:
+        raise ValueError("qmt.session_id must be a non-negative integer")
+    if not 0 <= D(cfg["qmt"]["reconciliation_tolerance"]) <= 100:
+        raise ValueError("qmt reconciliation tolerance outside [0,100] yuan")
+    if type(cfg["qmt"]["tick_volume_multiplier"]) is not int or cfg["qmt"]["tick_volume_multiplier"] not in (1, 100):
+        raise ValueError("qmt tick volume multiplier must be 1 or 100")
+    if cfg["data"]["provider"] not in {"files", "tushare", "baostock"}:
         raise ValueError("unsupported data provider")
     if cfg["strategy"]["name"] != "turn_low":
         raise ValueError("only the reviewed deterministic turn_low strategy is enabled")
@@ -44,6 +57,8 @@ def validate_config(cfg):
         "strategy": ["lookback", "top_n", "rebalance_sessions", "min_listing_days", "min_volume"],
         "risk": ["max_daily_orders"],
         "schedule": ["poll_seconds", "health_max_age_seconds"],
+        "data": ["request_attempts", "request_timeout", "bootstrap_calendar_days", "max_catchup_sessions"],
+        "qmt": ["query_timeout_seconds", "max_quote_age_seconds", "max_account_age_seconds"],
     }.items():
         for key in keys:
             if type(cfg[group][key]) is not int or cfg[group][key] <= 0:
@@ -89,6 +104,20 @@ def validate_config(cfg):
         raise ValueError("invalid universe symbol")
     if cfg["data"]["provider"] == "tushare" and not universe:
         raise ValueError("Tushare requires an explicit universe")
+    if cfg["data"]["provider"] == "baostock" and not universe:
+        raise ValueError("Baostock requires an explicit universe")
+    if type(cfg["data"]["auto_bootstrap"]) is not bool or type(cfg["data"]["allow_derived_limits"]) is not bool:
+        raise ValueError("market policy switches must be booleans")
+    if not 0 <= D(cfg["data"]["retry_seconds"]) <= 30:
+        raise ValueError("retry_seconds must be in [0,30]")
+    if cfg["data"]["request_attempts"] > 5:
+        raise ValueError("request_attempts must not exceed 5")
+    if cfg["data"]["request_timeout"] > 120:
+        raise ValueError("market request_timeout must not exceed 120 seconds")
+    if cfg["data"]["provider"] == "baostock" and cfg["data"]["allow_derived_limits"] is not True:
+        raise ValueError("Baostock paper simulation requires explicit allow_derived_limits=true")
+    if {key: D(value) for key, value in cfg["data"]["derived_limit_rates"].items()} != {"MAIN": D("0.10"), "CHINEXT": D("0.20")}:
+        raise ValueError("unsupported derived paper-limit policy; update and review rules before changing")
     if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", cfg["schedule"]["after_close"]):
         raise ValueError("invalid after_close time")
     if cfg["schedule"]["after_close"] < "15:30":
@@ -103,7 +132,7 @@ def load_config(path=None):
             raise ValueError("configuration must be a mapping")
         _merge(cfg, overrides)
     validate_config(cfg)
-    for group, key in [(None, "runtime_dir"), ("data", "directory"), ("risk", "kill_switch_file")]:
+    for group, key in [(None, "runtime_dir"), ("data", "directory"), ("data", "calendar_cache"), ("risk", "kill_switch_file")]:
         obj = cfg[group] if group else cfg
         value = Path(obj[key])
         obj[key] = str(value if value.is_absolute() else ROOT / value)
@@ -111,5 +140,8 @@ def load_config(path=None):
 
 
 def trading_fingerprint(cfg):
-    return digest({"execution_version": 1, "universe": sorted(cfg["data"]["universe"]),
-                   **{key: cfg[key] for key in ["mode", "strategy", "broker", "risk", "boards"]}})
+    payload = {"execution_version": 1, "universe": sorted(cfg["data"]["universe"]),
+               **{key: cfg[key] for key in ["mode", "strategy", "broker", "risk", "boards"]}}
+    if cfg["data"].get("allow_derived_limits"):
+        payload["derived_paper_limits"] = cfg["data"]["derived_limit_rates"]
+    return digest(payload)
