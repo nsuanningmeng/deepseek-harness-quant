@@ -1,0 +1,9 @@
+enabled: false
+research_config: config/research.yaml
+runtime_dir: runtime/research/minute-service
+request_interval_seconds: 3600
+rate_limit_cooldown_seconds: 3600
+poll_seconds: 60
+heartbeat_seconds: 15
+heartbeat_grace_seconds: 90
+maximum_source_rows: 8000

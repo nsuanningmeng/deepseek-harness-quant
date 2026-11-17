@@ -1,552 +1,517 @@
-# -*- coding: utf-8 -*-
-"""data/sector_research.py — 板块研究台（相对独立模块 · 2026-08-14 v2 重构）
+"""Sector research from local prices and real, dated opportunity observations.
 
-用户需求（v2 重定向）：「我主观框定一个板块，机器帮我择时 + 选板块内强因子」。
-替代 v1 的"事件标签+贝叶斯"。
-
-能力：
-  1. list_sectors()：证监会 83 大类列表
-  2. sector_timing(sector)：板块等权指数 60日动量 + MA20/60 → 可进/观望/回避
-  3. sector_strong_factors(sector)：七大机会类型在该板块内的历史胜率排名
-     （未来接入：散户因子，因子池正在研究）
-
-强因子口径 = 主系统 7 大机会类型（reversal/value/breakout/revalue/event/quality_gap/pv_consensus）
-  → 在选定板块内的历史 20 日跑赢 HS300 胜率。
-
-数据：daily_close.parquet（缓存）+ stock_basic.db（行业）+ finance.db + hist_mv.db
+The public functions keep the dashboard contract. No static historical success
+rates, latest financial snapshots applied to past dates, or network fallbacks.
 """
-import sqlite3
+import json
+import hashlib
+from datetime import datetime
 import sys
 from pathlib import Path
-
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import numpy as np
 import pandas as pd
 
 BASE = Path(__file__).resolve().parent.parent
-CACHE = Path(r"data/cache")
-DAILY_PIVOT = BASE / "output" / "daily_close.parquet"
-HS300_PARQUET = BASE / "output" / "hs300_monthly.parquet"
-HORIZON = 20
-MIN_N = 30
-
-# 七大机会类型（与 factors/opportunities/registry.py 一致）
-OTYPES = {
-    "value": "低估值",
-    "reversal": "反转",
-    "breakout": "突破",
-    "revalue": "价值重估",
-    "quality_gap": "质量折价",
-    "pv_consensus": "量价共识",
-    "event": "事件驱动",
-}
-
-# 七大机会类型全市场 17 年回测 6月胜率/均收益（from registry evidence）
-OTYPE_WINRATE = {
-    "value": {"name": "低估值", "winrate": 62.5, "excess": 11.6},
-    "quality_gap": {"name": "质量折价", "winrate": 70.4, "excess": 14.6},
-    "revalue": {"name": "价值重估", "winrate": 53.6, "excess": 8.7},
-    "reversal": {"name": "反转", "winrate": 39.0, "excess": -1.8, "neg": True},
-    "breakout": {"name": "突破", "winrate": 45.5, "excess": 5.4},
-    "pv_consensus": {"name": "量价共识", "winrate": 53.3, "excess": 4.3},
-    "event": {"name": "事件驱动", "winrate": 51.5, "excess": 8.3},
-}
-
-SECTOR_MAP = {
-    "A": "农林牧渔", "B": "采矿业", "C": "制造业", "D": "公用事业", "E": "建筑业",
-    "F": "商贸零售", "G": "交通运输", "H": "住宿餐饮", "I": "信息技术", "J": "金融",
-    "K": "房地产", "L": "商务服务", "M": "科研服务", "N": "环保水利", "O": "居民服务",
-    "P": "教育", "Q": "卫生", "R": "文化传媒", "S": "综合",
-}
+sys.path.insert(0, str(BASE))
+from factors.research_context import (cache_dir, connect, read_bars as _read_bars, universe,
+                                      scope_metadata, json_safe)
+from factors.opportunities.registry import OPPORTUNITY_TYPES
+from etf.etf_map import execution_config, _panels, _tradeable
 
 
-def _to_bar_code(c):
-    c = str(c).strip()[:6]
-    if c[:1] in ("6", "9"):
-        return c + ".SH"
-    if c[:1] in ("4", "8"):
-        return c + ".BJ"
-    return c + ".SZ"
+_BUILD_CONTEXT = {}
+_ARTIFACT_CACHE = {"key": None, "data": None}
+
+
+def _bars(columns, **kwargs):
+    key = "none_bars" if kwargs.get("adjust") == "none" else "bars"
+    if not kwargs.get("symbols") and key in _BUILD_CONTEXT:
+        return _BUILD_CONTEXT[key][columns.split(",")].copy()
+    return _read_bars(columns, **kwargs)
+
+
+def _cfg():
+    return execution_config()['sector']
+
+
+def _to_bar_code(code):
+    value = str(code).strip().upper()
+    if len(value) == 9 and value[6:] in ('.SH', '.SZ', '.BJ'):
+        return value
+    if len(value) != 6 or not value.isdigit():
+        raise ValueError('证券代码无效')
+    return value + ('.SH' if value.startswith(('6', '9')) else '.BJ' if value.startswith(('4', '8')) else '.SZ')
 
 
 def _load_sector_detail():
-    """code(带后缀) → (大类代码, 大类名称)；返回全量映射 + 大类列表"""
-    con = sqlite3.connect(r"data/cache/stock_basic.db")
-    rows = con.execute("SELECT code, industry FROM stock_basic WHERE industry!=''").fetchall()
-    con.close()
-    m = {}
-    for code, ind in rows:
-        c = str(code).strip()
-        if len(c) >= 6 and ind:
-            m[c] = (ind[:3], ind[3:])
-    return m
+    if "sector_map" in _BUILD_CONTEXT:
+        return _BUILD_CONTEXT["sector_map"]
+    import re
+    with connect(cache_dir()/'stock_basic.db') as con:
+        rows = con.execute("SELECT code,industry FROM stock_basic WHERE industry IS NOT NULL AND industry!=''").fetchall()
+    allowed = universe()
+    return {code: ((ind[:3], ind[3:]) if re.match(r'^[A-S]\d{2}.+', ind) else (ind, ind))
+            for code, ind in rows if code in allowed}
 
 
-def list_sectors():
-    """83 大类列表 [{code, name, n}]"""
-    m = _load_sector_detail()
+def _names():
+    if "names" in _BUILD_CONTEXT:
+        return _BUILD_CONTEXT["names"]
+    with connect(cache_dir()/'stock_basic.db') as con:
+        return dict(con.execute('SELECT code,name FROM stock_basic'))
+
+
+def _compute_list_sectors():
     from collections import Counter
-    cnt = Counter(v[0] for v in m.values())
-    name = {v[0]: v[1] for v in m.values()}
-    out = [{"code": k, "name": name.get(k, k), "n": cnt[k]}
-           for k in sorted(cnt)]
-    return out
+    mapping = _load_sector_detail()
+    counts = Counter(value[0] for value in mapping.values())
+    names = {value[0]: value[1] for value in mapping.values()}
+    return [{'code': code, 'name': names[code], 'n': counts[code]} for code in sorted(counts)]
 
 
 def _daily():
-    return pd.read_parquet(DAILY_PIVOT)
+    if "daily" in _BUILD_CONTEXT:
+        return _BUILD_CONTEXT["daily"]
+    frame = _bars('code,date,close')
+    frame['date'] = pd.to_datetime(frame['date'])
+    return frame.pivot(index='date', columns='code', values='close').sort_index()
 
 
 def _sector_index(daily, sector):
-    """板块等权净值（板块内股票的日均收益 cumprod）"""
-    m = _load_sector_detail()
-    codes = [c for c, (sc, _) in m.items() if sc == sector and c in daily.columns]
-    if len(codes) < 5:
+    codes = [c for c, (sc, _) in _load_sector_detail().items() if sc == sector and c in daily]
+    if len(codes) < int(_cfg()['min_members']):
         return None, len(codes)
-    sub = daily[codes].ffill().dropna(how="all")
-    ret = sub.pct_change().mean(axis=1, skipna=True)
-    nav = (1 + ret.fillna(0)).cumprod()
-    return nav, len(codes)
+    returns = daily[codes].pct_change(fill_method=None).iloc[1:]
+    # No forward fill or zero return for missing sessions. This is a descriptive index, not a traded portfolio.
+    if returns.isna().any().any():
+        return None, len(codes)
+    valid = returns.mean(axis=1)
+    return pd.concat([pd.Series([1.], index=[daily.index[0]]), (1+valid).cumprod()]), len(codes)
 
 
-def sector_timing(sector):
-    """板块择时：60日动量 + MA20/MA60 → {state, mom60, ma_state, n}"""
+def _compute_sector_timing(sector):
     daily = _daily()
-    nav, n = _sector_index(daily, sector)
-    if nav is None:
-        return {"ok": False, "n": n, "note": "板块成分不足"}
-    close = nav
-    mom60 = close.iloc[-1] / close.iloc[-61] - 1 if len(close) > 61 else np.nan
-    ma20 = close.rolling(20).mean().iloc[-1]
-    ma60 = close.rolling(60).mean().iloc[-1]
-    ma_state = "多头" if ma20 > ma60 else "空头"
-    if mom60 > 0 and ma_state == "多头":
-        state, label, color = "in", "可进", "green"
-    elif mom60 < 0 and ma_state == "空头":
-        state, label, color = "out", "回避", "red"
-    else:
-        state, label, color = "wait", "观望", "yellow"
-    return {"ok": True, "n": n, "state": state, "label": label, "color": color,
-            "mom60": round(float(mom60) * 100, 2), "ma_state": ma_state,
-            "asof": str(daily.index[-1])[:10]}
-
-
-def _finance():
-    con = sqlite3.connect(f"file:{CACHE / 'finance.db'}?mode=ro&immutable=1", uri=True)
-    fr = pd.read_sql("SELECT code, period, sq_net_profit, sq_net_yoy, roe FROM finance_report", con)
-    con.close()
-    fr["code"] = fr["code"].astype(str).str[:6]
-    fr["period"] = fr["period"].astype(str).str.replace("-", "").str[:8]
-    fr["sq_net_yoy"] = pd.to_numeric(fr["sq_net_yoy"], errors="coerce")
-    fr["sq_net_profit"] = pd.to_numeric(fr["sq_net_profit"], errors="coerce")
-    fr["roe"] = pd.to_numeric(fr["roe"], errors="coerce")
-    return fr
-
-
-def _break_net():
-    con = sqlite3.connect(f"file:{CACHE / 'hist_mv.db'}?mode=ro&immutable=1", uri=True)
-    mv = pd.read_sql("SELECT month, code, circ_mv FROM hist_mv", con)
-    con.close()
-    con = sqlite3.connect(f"file:{CACHE / 'finance_ts.db'}?mode=ro&immutable=1", uri=True)
-    fs = pd.read_sql("SELECT code, end_date, total_hldr_eqy_exc_min_int FROM financials_ts", con)
-    con.close()
-    mv["month"] = mv["month"].astype(str).str.replace("-", "").str[:6]
-    mv["code"] = mv["code"].astype(str).str[:6]
-    fs["code"] = fs["code"].astype(str).str[:6]
-    fs["end_date"] = fs["end_date"].astype(str).str[:10].str.replace("-", "").str[:8]
-    fs = fs[fs["total_hldr_eqy_exc_min_int"].notna()].sort_values("end_date").drop_duplicates(subset="code", keep="last")
-    m = mv.merge(fs, on="code", how="inner")
-    m["circ_mv"] = pd.to_numeric(m["circ_mv"], errors="coerce")
-    m["nav"] = pd.to_numeric(m["total_hldr_eqy_exc_min_int"], errors="coerce")
-    m = m[(m["circ_mv"] > 0) & (m["nav"] > 0)]
-    m["pb"] = m["circ_mv"] * 1e8 / m["nav"]   # circ_mv 单位=亿元 → 换算成元再除以净资产
-    m["day"] = pd.to_datetime(m["month"] + "01") + pd.offsets.MonthEnd(0)
-    return m[["code", "day", "pb"]]
+    codes = [c for c, (sc, _) in _load_sector_detail().items() if sc == sector and c in daily]
+    cfg = _cfg(); slow = int(cfg['timing_slow']); fast = int(cfg['timing_fast'])
+    if len(codes) < int(cfg['min_members']) or len(daily) < slow+1:
+        return {'ok': False, 'n': len(codes), 'note': '板块成分或真实日历史不足'}
+    sub = daily[codes].tail(slow+1)
+    if sub.isna().any().any():
+        return {'ok': False, 'n': len(codes), 'note': '板块价格窗口有缺口，未ffill或记0收益'}
+    returns = sub.pct_change(fill_method=None).iloc[1:].mean(axis=1)
+    nav = pd.concat([pd.Series([1.], index=[sub.index[0]]), (1+returns).cumprod()])
+    mom = nav.iloc[-1]/nav.iloc[0]-1
+    ma_state = '多头' if nav.tail(fast).mean() > nav.tail(slow).mean() else '空头'
+    state, label, color = ('in', '可进', 'green') if mom > 0 and ma_state == '多头' else (
+        ('out', '回避', 'red') if mom < 0 and ma_state == '空头' else ('wait', '观望', 'yellow'))
+    return {'ok': True, 'n': len(codes), 'state': state, 'label': label, 'color': color,
+            'mom60': float(mom*100), 'ma_state': ma_state, 'asof': str(daily.index[-1].date()),
+            'kind': 'descriptive_rule', 'auto_trade_allowed': False}
 
 
 def _monthly_factors(daily):
-    """月度价格因子面板：60日回撤、20日动量、距52周高点"""
-    m = daily.resample("ME").last()
-    mom20 = m.pct_change(20)
-    hh250 = m.rolling(250, min_periods=60).max()
-    near_high = m / hh250 - 1
-    dd60 = m / m.rolling(60, min_periods=20).max() - 1
-    return m, mom20, near_high, dd60
+    # Roll on actual DAILY observations before choosing monthly signal dates.
+    close = daily.resample('ME').last()
+    momentum = daily.pct_change(20, fill_method=None).resample('ME').last()
+    near_high = (daily/daily.rolling(250, min_periods=250).max()-1).resample('ME').last()
+    drawdown = (daily/daily.rolling(60, min_periods=60).max()-1).resample('ME').last()
+    return close, momentum, near_high, drawdown
 
 
-def _fwd_winrate(daily, hs300, events, sector_map, horizon=HORIZON):
-    """事件 → forward horizon 日 跑赢 HS300；返回 {板块: (n, winrate, excess)}
-    ★2026-08-15 T+1 口径：事件月末收盘才确定 → 次一交易日（i+1）起算持有 horizon 日，
-    不含事件日收盘→次日的隔夜跳空（原 close_i 起算含跳空，轻度前视）。"""
-    dates = daily.index
-    dpos = {d: i for i, d in enumerate(dates)}
-    hpos = {d: i for i, d in enumerate(hs300.index)}
-    cols = set(daily.columns)
-    buckets = {}
-    for code, day in events:
-        if code not in cols or day not in dpos or day not in hpos:
+def _fwd_winrate(daily, hs300, events, sector_map, horizon=None, *, opens=None,
+                 benchmark_opens=None, bars=None, fees=None, return_diagnostics=False, panels=None):
+    """Signal close -> next session OPEN -> close on the Hth held session.
+
+    Actual dated benchmark prices use the identical entry/exit dates. Unfinished
+    horizons never contribute. Exit/benchmark data gaps remain explicit unresolved
+    observations; callers must not publish a validated score from censored winners.
+    """
+    horizon = int(horizon or _cfg()['horizon_sessions'])
+    if horizon < 2 or opens is None or benchmark_opens is None or bars is None:
+        raise ValueError('真实next-open检验需要open/OHLC/基准open和至少跨日持有期')
+    fees = fees or execution_config()['stock_fees']
+    commission, tax, slip = (float(fees[k]) for k in ('commission_rate', 'sell_tax_rate', 'slippage_rate'))
+    dates = pd.DatetimeIndex(daily.index); p = panels if panels is not None else _panels(bars)
+    buckets, diagnostics = {}, {}
+    for code, day in set((str(c), pd.Timestamp(d)) for c, d in events):
+        sector = sector_map.get(code[:6], '其他')
+        diag = diagnostics.setdefault(sector, {'signals': 0, 'completed': 0, 'unmatured': 0,
+                                              'entry_untradeable': 0, 'exit_untradeable': 0, 'benchmark_missing': 0})
+        diag['signals'] += 1
+        if code not in daily or day not in dates:
+            diag['entry_untradeable'] += 1; continue
+        i = dates.get_loc(day); entry_i = i+1; exit_i = entry_i+horizon-1
+        if exit_i >= len(dates):
+            diag['unmatured'] += 1; continue
+        entry, exit_day = dates[entry_i], dates[exit_i]
+        if not _tradeable(p, entry, code):
+            diag['entry_untradeable'] += 1; continue
+        if not _tradeable(p, exit_day, code):
+            diag['exit_untradeable'] += 1; continue
+        try:
+            buy = float(opens.at[entry, code]); sell = float(daily.at[exit_day, code])
+            bench_buy = float(benchmark_opens.loc[entry]); bench_sell = float(hs300.loc[exit_day])
+        except (KeyError, TypeError, ValueError):
+            diag['benchmark_missing'] += 1; continue
+        if not all(np.isfinite(v) and v > 0 for v in (buy, sell, bench_buy, bench_sell)):
+            diag['benchmark_missing'] += 1; continue
+        net = sell*(1-slip)*(1-commission-tax)/(buy*(1+slip)*(1+commission))-1
+        benchmark = bench_sell/bench_buy-1
+        buckets.setdefault(sector, []).append(net-benchmark)
+        diag['completed'] += 1
+    return (buckets, diagnostics) if return_diagnostics else buckets
+
+
+def _compute_sector_strong_factors(sector):
+    if "strong_by_sector" in _BUILD_CONTEXT:
+        return _BUILD_CONTEXT["strong_by_sector"].get(sector, [])
+    cfg = _cfg(); source = BASE/'logs/opportunity_winrates.json'
+    base = [{'otype': ot, 'name': spec['name'], 'n': 0, 'winrate': None, 'excess': None, 'ok': False,
+             'source': str(source.relative_to(BASE)), 'sample_horizon': f"{cfg['horizon_sessions']} sessions",
+             'execution': 'signal_close -> next_open -> Hth_close; stock fees/slippage; gross HS300 index proxy',
+             'note': '缺真实带日期的校准观察记录'} for ot, spec in OPPORTUNITY_TYPES.items()]
+    if not source.is_file():
+        return base
+    data = json.loads(source.read_text(encoding='utf-8'))
+    scope = (data.get('meta') or {}).get('research_scope') or {}
+    if data.get('kind') != 'historical_calibration' or scope.get('universe_fingerprint') != scope_metadata()['universe_fingerprint']:
+        return base
+    observations = data.get('observations') or []
+    frame = _bars('code,date,open,high,low,close,volume')
+    frame['date'] = pd.to_datetime(frame['date'])
+    daily = frame.pivot(index='date', columns='code', values='close').sort_index()
+    opens = frame.pivot(index='date', columns='code', values='open').sort_index()
+    benchmark = _bars('code,date,open,close', adjust='none', symbols=['SH.000300', '000300.SH'])
+    benchmark['date'] = pd.to_datetime(benchmark['date'])
+    benchmark = benchmark.sort_values('date').drop_duplicates('date').set_index('date')
+    mapping = {c[:6]: value[0] for c, value in _load_sector_detail().items()}
+    for result in base:
+        # One-month source records provide actual past signal dates, not a fabricated new trigger series.
+        events = [(row['code'], row['signal_date']) for row in observations
+                  if row.get('otype') == result['otype'] and row.get('horizon_months') == 1 and
+                  mapping.get(row['code'][:6]) == sector]
+        buckets, diag = _fwd_winrate(daily, benchmark['close'], events, mapping, opens=opens,
+                                     benchmark_opens=benchmark['open'], bars=frame, return_diagnostics=True)
+        values = np.asarray(buckets.get(sector, []), dtype=float)
+        details = diag.get(sector, {})
+        result.update({'n': len(values), 'diagnostics': details,
+                       'data_limits': ['当前行业分类与成分股回看历史存在选择偏差',
+                                       '源策略只过滤已知ST；财务修订与交易所队列未完整重建',
+                                       '仅对源校准文件已存完整1月观察记录重测20交易日；不是完整事件总体',
+                                       '比例费用未模拟最低佣金/整手，历史印花税使用配置常数']})
+        if details.get('exit_untradeable') or details.get('benchmark_missing'):
+            result['note'] = '存在无法确认退出/基准的持有样本，未只展示可计算赢家'
+        elif len(values) < int(cfg['min_samples']):
+            result['note'] = f"完整可执行样本不足({len(values)}/{cfg['min_samples']})"
+        else:
+            result.update({'winrate': float((values > 0).mean()*100), 'excess': float(values.mean()*100),
+                           'ok': True, 'evidence_ready': True, 'note': '真实有日期信号的板块内固定持有期净超额描述统计；非样本外预测'})
+    return sorted(base, key=lambda x: -(x['winrate'] if x['winrate'] is not None else -1))
+
+
+def _compute_stock_search(q, limit=20):
+    q = str(q or '').strip()
+    if not q:
+        return []
+    with connect(cache_dir()/'stock_basic.db') as con:
+        rows = con.execute('SELECT code,name FROM stock_basic WHERE code LIKE ? OR name LIKE ? LIMIT ?',
+                           ('%'+q+'%', '%'+q+'%', int(limit))).fetchall()
+    allowed = universe()
+    return [{'code': c, 'name': name} for c, name in rows if c in allowed]
+
+
+def _current_panel():
+    if "current_panel" in _BUILD_CONTEXT:
+        return _BUILD_CONTEXT["current_panel"]
+    from factors.opportunities import scan
+    daily = _daily(); end = str(daily.index[-1].date())
+    px, vx = scan.load_panel(end=end, days=int(_cfg()['min_history']))
+    if px is None or px.empty:
+        raise ValueError('当前研究范围缺足量真实日线')
+    factors = scan.compute_factors(px, vx, scan.load_fundamentals(end), scan.load_basic(), scan.load_st_codes())
+    return factors, end, scan.triggers()
+
+
+def _compute_stock_factors(code):
+    code = _to_bar_code(code)
+    if code not in universe():
+        return {'ok': False, 'error': '证券不在当前研究范围'}
+    panel, asof, triggers = _current_panel()
+    if code not in panel.index:
+        return {'ok': False, 'error': '历史或已公告基本面不足'}
+    row = panel.loc[code]; sc, sn = _load_sector_detail().get(code, ('', ''))
+    evidence = {r['otype']: r for r in _compute_sector_strong_factors(sc)} if sc else {}
+    hits = []
+    for ot, spec in OPPORTUNITY_TYPES.items():
+        proof = evidence.get(ot, {})
+        met = bool(triggers[ot](row)) if ot in triggers else None
+        hits.append({'otype': ot, 'name': spec['name'], 'met': met, 'winrate': proof.get('winrate'),
+                     'excess': proof.get('excess'), 'n': proof.get('n', 0), 'evidence_ready': bool(proof.get('ok')),
+                     'note': proof.get('note') or '外部共识触发未接入，未使用低波冒充',
+                     'neg': bool(proof.get('excess') is not None and proof['excess'] < 0)})
+    hits.sort(key=lambda x: (x['met'] is not True, -(x['winrate'] if x['winrate'] is not None else -1)))
+    return json_safe({'ok': True, 'code': code, 'name': _names().get(code, ''), 'sector': f'{sc} {sn}',
+                      'price': float(row['close']), 'factors': {'dd60': row.get('drawdown_60d')*100,
+                      'mom20': row.get('mom20')*100, 'nh250': row.get('near_high_250')*100,
+                      'vol20': None, 'pb': row.get('pb'), 'roe': row.get('roe')*100,
+                      'sq_nyoy': row.get('sq_nyoy')*100}, 'hits': hits, 'asof': asof, 'auto_trade_allowed': False})
+
+
+def _compute_sector_pitch(sector, topn=20, strong_factors=None):
+    strong = strong_factors if strong_factors is not None else _compute_sector_strong_factors(sector)
+    valid = [r for r in strong if r.get('ok') and r.get('evidence_ready') and r.get('n', 0) >= int(_cfg()['min_samples'])
+             and r.get('winrate') is not None][:int(_cfg()['strong_count'])]
+    codes = [c for c, (s, _) in _load_sector_detail().items() if s == sector]
+    if not valid:
+        return {'ok': True, 'status': 'awaiting_evidence', 'n_total': len(codes), 'n_pitch': 0,
+                'strong_factors': [], 'pitch': [], 'auto_trade_allowed': False,
+                'note': '没有足量真实板块检验；未按旧静态胜率生成买入评分'}
+    panel, asof, triggers = _current_panel(); names = _names(); picks = []
+    weights = {r['otype']: r for r in valid}
+    for code in codes:
+        if code not in panel.index:
             continue
-        i = dpos[day]
-        if i + 1 + horizon >= len(dates) or hpos[day] + 1 + horizon >= len(hs300):
-            continue
-        c = daily[code]
-        if not (c.iloc[i + 1] > 0 and c.iloc[i + 1 + horizon] > 0):
-            continue
-        sr = c.iloc[i + 1 + horizon] / c.iloc[i + 1] - 1
-        hr = hs300.iloc[hpos[day] + 1 + horizon] / hs300.iloc[hpos[day] + 1] - 1
-        sec = sector_map.get(str(code)[:6], "其他")
-        buckets.setdefault(sec, []).append(sr - hr)
-    return buckets
+        row = panel.loc[code]
+        met = [ot for ot in weights if ot in triggers and bool(triggers[ot](row))]
+        if met:
+            picks.append({'code': code, 'name': names.get(code, ''), 'price': float(row['close']),
+                          'hits': [OPPORTUNITY_TYPES[ot]['name'] for ot in met], 'hits_otype': met,
+                          'score': float(sum(weights[ot]['winrate'] for ot in met)), 'n_hits': len(met)})
+    picks.sort(key=lambda r: (-r['n_hits'], -r['score']))
+    return json_safe({'ok': True, 'status': 'limited', 'n_total': len(codes), 'n_pitch': len(picks), 'n_excluded': 0,
+                      'strong_factors': valid, 'pitch': picks[:topn], 'asof': asof, 'auto_trade_allowed': False,
+                      'note': '当前规则命中×真实板块历史统计；启发式排名分不等于成功概率'})
+
+
+def _compute_sector_retail(sector, topn=20):
+    codes = [c for c, (s, _) in _load_sector_detail().items() if s == sector]
+    if len(codes) < int(_cfg()['min_members']):
+        return {'ok': False, 'note': '板块成分不足', 'n': len(codes)}
+    window = int(_cfg()['turnover_window'])
+    if "turn_means" in _BUILD_CONTEXT:
+        means = _BUILD_CONTEXT["turn_means"]
+    else:
+        frame = _bars('code,date,turn'); frame['date'] = pd.to_datetime(frame['date'])
+        turn = frame[frame['code'].isin(codes)].pivot(index='date', columns='code', values='turn').sort_index()
+        means = turn.tail(window).mean().where(turn.tail(window).count() == window)
+    panel, asof, _ = _current_panel(); names = _names(); low = []
+    for code in codes:
+        if code in panel.index and panel.at[code, 'non_st'] == 1 and panel.at[code, 'roe'] > 0 and pd.notna(means.get(code)):
+            low.append({'code': code, 'name': names.get(code, ''), 'turnover': float(means[code]),
+                        'roe': float(panel.at[code, 'roe']*100)})
+    low.sort(key=lambda r: r['turnover'])
+    return {'ok': True, 'status': 'limited', 'n_total': len(codes), 'n_inflow': None, 'n_outflow': None,
+            'n_filtered': len(codes)-len(low), 'inflow': [], 'outflow': [], 'lowturn': low[:topn],
+            'holder_data_available': False, 'asof': asof,
+            'note': '换手取官方turn真实列；股东户数尚未提供可验证公告序列，未填0或推断散户流入'}
+
+
+def _compute_sector_crowd(sector):
+    mapping = _load_sector_detail(); members = [c for c, (s, _) in mapping.items() if s == sector]
+    if len(members) < int(_cfg()['min_members']):
+        return {'ok': False, 'note': '板块成分不足'}
+    if "amount_panel" in _BUILD_CONTEXT:
+        grouped = _BUILD_CONTEXT["amount_panel"]
+    else:
+        from data.cache import normalize_units
+        frame = normalize_units(_bars('code,date,amount,source', adjust='none'))
+        grouped = frame.pivot(index='date', columns='code', values='amount').sort_index().tail(int(_cfg()['crowd_window']))
+    if grouped.empty or grouped.iloc[-1].isna().any() or grouped.iloc[-1].sum() <= 0:
+        return {'ok': False, 'note': '当前研究池成交额缺失，不推断市场热度'}
+    share = grouped[members].sum(axis=1, min_count=len(members))/grouped.sum(axis=1, min_count=len(grouped.columns))
+    current = float(share.iloc[-1]); cfg = _cfg()
+    return {'ok': True, 'share_pct': current*100, 'avg_share_pct': float(share.mean()*100),
+            'heat': '热门' if current > cfg['hot_share'] else ('中性' if current > cfg['neutral_share'] else '冷门'),
+            'n': len(members), 'denominator': '当前研究股票池',
+            'note': '真实成交额占比的描述性特征；未引用旧收益数字，也不据此宣称因子已验证'}
+
+
+def _method_fingerprint():
+    cfg = execution_config()
+    return hashlib.sha256(json.dumps({'sector': cfg['sector'], 'fees': cfg['stock_fees']},
+                                     sort_keys=True).encode()).hexdigest()
+
+
+def _factor_template(source, cfg):
+    return [{'otype': ot, 'name': spec['name'], 'n': 0, 'winrate': None, 'excess': None,
+             'ok': False, 'evidence_ready': False, 'source': source,
+             'sample_horizon': f"{cfg['horizon_sessions']} sessions",
+             'execution': 'signal_close -> next_open -> Hth_close; net stock vs gross HS300 index proxy',
+             'note': '缺真实带日期的校准观察记录'} for ot, spec in OPPORTUNITY_TYPES.items()]
+
+
+def _precompute_strong(calibration, frame, mapping, sectors, benchmark):
+    cfg = _cfg(); price_panels = _panels(frame)
+    daily, opens = price_panels['close'], price_panels['open']
+    by_sector = {code: _factor_template('logs/opportunity_winrates.json', cfg) for code in sectors}
+    observations = calibration.get('observations') or []
+    for ot in OPPORTUNITY_TYPES:
+        events = [(row['code'], row['signal_date']) for row in observations
+                  if row.get('otype') == ot and row.get('horizon_months') == 1 and row['code'][:6] in mapping]
+        buckets, diagnostics = _fwd_winrate(daily, benchmark['close'], events, mapping,
+                                           opens=opens, benchmark_opens=benchmark['open'], bars=frame,
+                                           panels=price_panels, return_diagnostics=True)
+        for sector in sectors:
+            result = next(item for item in by_sector[sector] if item['otype'] == ot)
+            values = np.asarray(buckets.get(sector, []), dtype=float)
+            diag = diagnostics.get(sector, {})
+            result.update(n=len(values), diagnostics=diag,
+                          data_limits=['当前行业与成分股回看历史存在选择偏差', '仅重测源已存完整1月样本子集',
+                                       '历史ST/财务修订/实际队列未完整验证；比例费用与固定税率有近似'])
+            if diag.get('exit_untradeable') or diag.get('benchmark_missing'):
+                result['note'] = '退出或基准存在未解决样本，未只展示可计算结果'
+            elif len(values) < int(cfg['min_samples']):
+                result['note'] = f"完整可执行样本不足({len(values)}/{cfg['min_samples']})"
+            else:
+                result.update(ok=True, evidence_ready=True, winrate=float((values > 0).mean()*100),
+                              excess=float(values.mean()*100), note='真实历史净超额描述统计；非样本外预测')
+    return {code: sorted(values, key=lambda row: -(row['winrate'] if row['winrate'] is not None else -1))
+            for code, values in by_sector.items()}
+
+
+def build():
+    """Offline job. Load price matrices once and evaluate all industries together."""
+    from factors.research_context import config as research_config
+    from data.cache import normalize_units
+    source = BASE/'logs/opportunity_winrates.json'
+    calibration_bytes = source.read_bytes()
+    calibration = json.loads(calibration_bytes)
+    scope = scope_metadata()
+    if calibration.get('kind') != 'historical_calibration' or (calibration.get('meta', {}).get('research_scope') or {}).get('universe_fingerprint') != scope['universe_fingerprint']:
+        raise ValueError('缺本轮当前股票池的真实校准证据')
+    if not isinstance(calibration.get('observations'), list) or not calibration['observations']:
+        raise ValueError('缺带真实信号日期的校准观察记录')
+    try:
+        frame = _read_bars('code,date,open,high,low,close,volume,turn,is_st,source')
+        if frame.empty:
+            raise ValueError('研究范围行情为空')
+        frame['date'] = pd.to_datetime(frame['date'])
+        daily = frame.pivot(index='date', columns='code', values='close').sort_index()
+        metadata = _load_sector_detail(); names = _names()
+        if not metadata:
+            raise ValueError('缺当前股票池的实际行业元数据')
+        _BUILD_CONTEXT.update(bars=frame, daily=daily, sector_map=metadata, names=names)
+        sectors = _compute_list_sectors()
+        _BUILD_CONTEXT['current_panel'] = _current_panel()
+        benchmark = _read_bars('code,date,open,close', adjust='none', symbols=[research_config()['index_code']])
+        benchmark['date'] = pd.to_datetime(benchmark['date'])
+        benchmark = benchmark.sort_values('date').drop_duplicates('date').set_index('date')
+        if benchmark.empty:
+            raise ValueError('缺配置指定HS300指数的真实open/close')
+        mapping = {code[:6]: value[0] for code, value in metadata.items()}
+        _BUILD_CONTEXT['strong_by_sector'] = _precompute_strong(calibration, frame, mapping,
+                                                               [row['code'] for row in sectors], benchmark)
+        turn = frame.pivot(index='date', columns='code', values='turn').sort_index().tail(int(_cfg()['turnover_window']))
+        _BUILD_CONTEXT['turn_means'] = turn.mean().where(turn.count() == int(_cfg()['turnover_window']))
+        raw = _read_bars('code,date,amount,source', adjust='none')
+        raw['date'] = pd.to_datetime(raw['date'])
+        amounts = normalize_units(raw).pivot(index='date', columns='code', values='amount').sort_index()
+        _BUILD_CONTEXT['amount_panel'] = amounts.tail(int(_cfg()['crowd_window']))
+        analyses = {}
+        for item in sectors:
+            code = item['code']; evidence = _compute_sector_strong_factors(code)
+            analyses[code] = {'timing': _compute_sector_timing(code), 'factors': evidence,
+                              'pitch': _compute_sector_pitch(code, strong_factors=evidence),
+                              'retail': _compute_sector_retail(code), 'crowd': _compute_sector_crowd(code)}
+        stocks = {code: _compute_stock_factors(code) for code in sorted(universe())}
+        for code, diagnostic in stocks.items():
+            diagnostic.setdefault('code', code)
+            diagnostic.setdefault('name', names.get(code, code))
+        result = json_safe({'schema_version': 1, 'kind': 'sector_research_evidence', 'status': 'limited',
+                           'date': str(daily.index[-1].date()), 'generated_at': datetime.now().isoformat(timespec='seconds'),
+                           'research_scope': scope, 'method_fingerprint': _method_fingerprint(),
+                           'calibration': {'path': 'logs/opportunity_winrates.json',
+                                           'sha256': hashlib.sha256(calibration_bytes).hexdigest()},
+                           'source_values': sorted(set(frame['source'].dropna().astype(str))),
+                           'sectors': sectors, 'analyses': analyses, 'stocks': stocks,
+                           'auto_trade_allowed': False,
+                           'note': '实际校准及日线的离线研究；公开查询只读本产物，不同步执行回测'})
+        target = BASE/'output/sector_evidence.json'; target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(result, ensure_ascii=False, allow_nan=False), encoding='utf-8')
+        temporary.replace(target)
+        return target
+    finally:
+        _BUILD_CONTEXT.clear()
+
+
+def _artifact():
+    target = BASE/'output/sector_evidence.json'; source = BASE/'logs/opportunity_winrates.json'
+    if not target.is_file() or not source.is_file():
+        raise ValueError('板块离线研究尚未生成；请运行data.sector_research --build')
+    current_scope = scope_metadata()['universe_fingerprint']; methods = _method_fingerprint()
+    key = (str(target), target.stat().st_mtime_ns, target.stat().st_size,
+           source.stat().st_mtime_ns, source.stat().st_size, current_scope, methods)
+    if _ARTIFACT_CACHE['key'] == key:
+        return _ARTIFACT_CACHE['data']
+    raw = json.loads(target.read_text(encoding='utf-8'))
+    if (raw.get('kind') != 'sector_research_evidence' or raw.get('schema_version') != 1 or
+        (raw.get('research_scope') or {}).get('universe_fingerprint') != current_scope or
+        raw.get('method_fingerprint') != methods or
+        (raw.get('calibration') or {}).get('sha256') != hashlib.sha256(source.read_bytes()).hexdigest()):
+        raise ValueError('板块研究股票池、方法或校准源已变化；需要重新离线计算')
+    if not isinstance(raw.get('analyses'), dict) or not isinstance(raw.get('stocks'), dict):
+        raise ValueError('板块离线研究结构不完整')
+    _ARTIFACT_CACHE.update(key=key, data=raw)
+    return raw
+
+
+def list_sectors():
+    return _artifact()['sectors']
+
+
+def _analysis(sector, field):
+    result = _artifact()['analyses'].get(str(sector))
+    if result is None:
+        return [] if field == 'factors' else {'ok': False, 'error': '行业不在已计算研究范围'}
+    return result[field]
+
+
+def sector_timing(sector):
+    return _analysis(sector, 'timing')
 
 
 def sector_strong_factors(sector):
-    """七大机会类型在该板块内的历史胜率排名"""
-    daily = _daily()
-    hs300 = pd.read_parquet(HS300_PARQUET)["close"].sort_index()
-    hs300.index = pd.to_datetime(hs300.index)
-    fr = _finance()
-    bn = _break_net()
-    m, mom20, near_high, dd60 = _monthly_factors(daily)
-    sector_map = {str(c)[:6]: sc for c, (sc, _) in _load_sector_detail().items()}
-
-    # 各机会类型的简化触发事件（月度，code→bar_code, day）
-    def _stack(df, name):
-        s = df.stack().reset_index()
-        s.columns = ["day", "code", name]
-        s["code"] = s["code"].astype(str).str[:6]
-        return s
-
-    def mk_events(df):
-        return [(c, d) for c, d in zip(df["code"].apply(_to_bar_code), df["day"])]
-
-    dd = _stack(dd60, "dd")
-    mom = _stack(mom20, "mom")
-    nh = _stack(near_high, "nh")
-    vol = _stack(m.pct_change().rolling(20).std(), "vol")
-
-    events = {}
-    # 低估值：PB < 1
-    events["value"] = mk_events(bn[bn["pb"] < 1.0])
-    # 质量折价：ROE>15% 且 60日回撤<-25%
-    fr_latest = fr.sort_values("period").drop_duplicates(subset="code", keep="last")
-    q = dd.merge(fr_latest[["code", "roe"]], on="code", how="inner")
-    events["quality_gap"] = mk_events(q[(q["roe"] > 0.15) & (q["dd"] < -0.25)])
-    # 价值重估：单季净利同比 > 50%（公告日近似用月末）
-    fr2 = fr[fr["sq_net_yoy"] > 0.5].sort_values("period").drop_duplicates(subset="code", keep="last")
-    fr2 = fr2.copy()
-    fr2["day"] = pd.to_datetime(fr2["period"]) + pd.offsets.MonthEnd(0)
-    events["revalue"] = mk_events(fr2)
-    # 反转：60日回撤<-25% 且 20日动量>0
-    r = dd.merge(mom, on=["day", "code"], how="inner")
-    events["reversal"] = mk_events(r[(r["dd"] < -0.25) & (r["mom"] > 0)])
-    # 突破：距52周高点 < 5%
-    events["breakout"] = mk_events(nh[nh["nh"] > -0.05])
-    # 量价共识：低波（20日波动率低分位，简化）
-    vq = vol[vol["vol"] < vol["vol"].quantile(0.3)]
-    events["pv_consensus"] = mk_events(vq)
-    # 事件驱动（精确化）：近20日涨停 且 所属行业20日动量>0（板块突破确认，事件/政策→涨停+趋势）
-    up = daily.pct_change()
-    ind_of = pd.Series({c: sector_map.get(str(c)[:6], "Z") for c in daily.columns})
-    ind_ret = up.T.groupby(ind_of).median().T              # 行业日收益（date × 行业）
-    ind_mom = ind_ret.rolling(20).sum().resample("ME").last()  # 行业20日动量（月末）
-    ind_mom_long = ind_mom.reset_index().melt(id_vars="date", var_name="ind", value_name="ind_mom")
-    ind_mom_long = ind_mom_long.rename(columns={"date": "day"})
-    code_ind = pd.DataFrame({"code": [str(c)[:6] for c in ind_of.index], "ind": list(ind_of.values)})
-    lim_m = (up > 0.095).rolling(20, min_periods=1).sum().resample("ME").last()
-    ev = _stack(lim_m, "limup")
-    ev2 = ev.merge(code_ind, on="code", how="left").merge(ind_mom_long, on=["day", "ind"], how="left")
-    events["event"] = mk_events(ev2[(ev2["limup"] > 0) & (ev2["ind_mom"] > 0)])
-
-    out = []
-    for otype, ev in events.items():
-        if not ev:
-            out.append({"otype": otype, "name": OTYPES[otype], "n": 0,
-                        "winrate": None, "excess": None, "ok": False, "note": "数据待接入"})
-            continue
-        buckets = _fwd_winrate(daily, hs300, ev, sector_map)
-        if sector not in buckets or len(buckets[sector]) < MIN_N:
-            n = len(buckets.get(sector, []))
-            out.append({"otype": otype, "name": OTYPES[otype], "n": n,
-                        "winrate": None, "excess": None, "ok": False,
-                        "note": f"样本不足({n})"})
-            continue
-        a = np.array(buckets[sector])
-        out.append({"otype": otype, "name": OTYPES[otype], "n": len(a),
-                    "winrate": round(float((a > 0).mean()) * 100, 1),
-                    "excess": round(float(a.mean()) * 100, 1), "ok": True, "note": ""})
-    out.sort(key=lambda x: -(x["winrate"] if x["winrate"] is not None else -1))
-    return out
-
-
-def stock_search(q, limit=20):
-    """按代码/名称搜索股票"""
-    q = str(q or "").strip()
-    if not q:
-        return []
-    con = sqlite3.connect(r"data/cache/stock_basic.db")
-    rows = con.execute(
-        "SELECT code, name FROM stock_basic WHERE code LIKE ? OR name LIKE ? LIMIT ?",
-        (f"%{q}%", f"%{q}%", limit)).fetchall()
-    con.close()
-    return [{"code": r[0], "name": r[1]} for r in rows]
-
-
-def stock_factors(code):
-    """个股诊断：主观选个股 → 机器判断命中哪些机会类型 + 各因子历史命中率"""
-    code = _to_bar_code(code)
-    daily = _daily()
-    if code not in daily.columns:
-        return {"ok": False, "error": f"{code} 不在日线池"}
-    c = daily[code].dropna()
-    if len(c) < 260:
-        return {"ok": False, "error": "历史不足 260 日"}
-    close = float(c.iloc[-1])
-    dd60 = close / float(c.iloc[-60:].max()) - 1
-    mom20 = close / float(c.iloc[-21]) - 1
-    nh250 = close / float(c.iloc[-250:].max()) - 1
-    vol20 = float(c.pct_change().iloc[-20:].std() * np.sqrt(252))
-
-    fr = _finance()
-    fr_l = fr[fr["code"] == code[:6]].sort_values("period")
-    roe = float(fr_l["roe"].dropna().iloc[-1]) if len(fr_l) and fr_l["roe"].notna().any() else None
-    sq_nyoy = float(fr_l["sq_net_yoy"].dropna().iloc[-1]) if len(fr_l) and fr_l["sq_net_yoy"].notna().any() else None
-    bn = _break_net()
-    bnb = bn[bn["code"] == code[:6]]
-    pb = float(bnb["pb"].iloc[-1]) if len(bnb) else None
-
-    sec_map = _load_sector_detail()
-    sc, sn = sec_map.get(code, ("", ""))
-    con = sqlite3.connect(r"data/cache/stock_basic.db")
-    row = con.execute("SELECT name FROM stock_basic WHERE code=?", (code,)).fetchone()
-    con.close()
-    name = row[0] if row else ""
-
-    hits = []
-    def hit(ot, met, note=""):
-        w = OTYPE_WINRATE[ot]
-        hits.append({"otype": ot, "name": w["name"], "met": met, "winrate": w["winrate"],
-                     "excess": w["excess"], "note": note, "neg": w.get("neg", False)})
-    hit("value", pb is not None and pb < 1.0, f"PB {pb:.2f}" if pb is not None else "")
-    hit("quality_gap", roe is not None and roe > 0.15 and dd60 < -0.25,
-        f"ROE {roe*100:.0f}% · 回撤 {dd60*100:.0f}%" if roe is not None else "")
-    hit("revalue", sq_nyoy is not None and sq_nyoy > 0.5,
-        f"单季净利同比 {sq_nyoy*100:.0f}%" if sq_nyoy is not None else "")
-    hit("reversal", dd60 < -0.25 and mom20 > 0, f"回撤 {dd60*100:.0f}% · 20日动量 {mom20*100:.0f}%")
-    hit("breakout", nh250 > -0.05, f"距52周高点 {nh250*100:.0f}%")
-    hit("pv_consensus", vol20 < 0.3, f"20日波动率 {vol20*100:.0f}%")
-    _up20 = c.pct_change().iloc[-20:]
-    _n_limup = int((_up20 > 0.095).sum())
-    hit("event", _n_limup > 0, f"近20日涨停 {_n_limup} 次" if _n_limup else "近20日无涨停")
-    hits.sort(key=lambda x: (not x["met"], -x["winrate"]))
-
-    return {"ok": True, "code": code, "name": name, "sector": f"{sc} {sn}".strip(),
-            "price": round(close, 2),
-            "factors": {"dd60": round(dd60*100, 1), "mom20": round(mom20*100, 1),
-                        "nh250": round(nh250*100, 1), "vol20": round(vol20*100, 1),
-                        "pb": round(pb, 2) if pb is not None else None,
-                        "roe": round(roe*100, 1) if roe is not None else None,
-                        "sq_nyoy": round(sq_nyoy*100, 1) if sq_nyoy is not None else None},
-            "hits": hits}
+    return _analysis(sector, 'factors')
 
 
 def sector_pitch(sector, topn=20, strong_factors=None):
-    """Pitch 层：用板块强因子筛选板块内股票 → 候选买入清单
-    逻辑同主 pitch：命中强因子 → 按因子命中率加权评分 → 排序取 TopN"""
-    daily = _daily()
-    sec_map = _load_sector_detail()
-    codes = [c for c, (sc, _) in sec_map.items() if sc == sector and c in daily.columns]
-    if len(codes) < 5:
-        return {"ok": False, "n": len(codes), "note": "板块成分不足"}
-    sub = daily[codes].dropna(axis=1, how="all").iloc[-260:]
-    if len(sub) < 60:
-        return {"ok": False, "n": len(codes), "note": "历史不足"}
-    close = sub.iloc[-1]
-    dd60 = close / sub.iloc[-60:].max() - 1
-    mom20 = close / sub.iloc[-21] - 1
-    nh250 = close / sub.iloc[-250:].max() - 1
-    vol20 = sub.pct_change().iloc[-20:].std() * np.sqrt(252)
-
-    fr = _finance().sort_values("period").drop_duplicates(subset="code", keep="last").set_index("code")
-    bn = _break_net().sort_values("day").drop_duplicates(subset="code", keep="last").set_index("code")
-
-    # 散户涌入排雷（因子池研究 2026-08-15：户数大增=散户追涨 → 剔除）
-    con = sqlite3.connect(r"data/cache/gdhs_full.db")
-    gd = pd.read_sql("SELECT code, chg_pct, ann_date FROM gdhs", con)
-    con.close()
-    gd["code"] = gd["code"].astype(str).str[:6]
-    gd = gd.sort_values("ann_date").drop_duplicates(subset="code", keep="last").set_index("code")
-
-    # 板块强因子（复用已算的，避免重复计算）
-    strong = strong_factors if strong_factors is not None else sector_strong_factors(sector)
-    strong_ok = [f for f in strong if f.get("ok") and f["winrate"] is not None][:3]
-    strong_names = {f["otype"] for f in strong_ok}
-    if not strong_names:
-        return {"ok": True, "n_total": len(codes), "n_pitch": 0, "strong_factors": [], "pitch": []}
-
-    con = sqlite3.connect(r"data/cache/stock_basic.db")
-    names = dict(con.execute("SELECT code, name FROM stock_basic").fetchall())
-    con.close()
-
-    def _f(v):
-        return float(v) if pd.notna(v) else None
-
-    rows = []
-    n_excluded = 0
-    for code in sub.columns:
-        c6 = code[:6]
-        # 散户涌入排雷：户数大增(>10%) 剔除
-        if c6 in gd.index and pd.notna(gd.loc[c6, "chg_pct"]) and float(gd.loc[c6, "chg_pct"]) > 10:
-            n_excluded += 1
-            continue
-        roe = _f(fr.loc[c6, "roe"]) if c6 in fr.index else None
-        sq = _f(fr.loc[c6, "sq_net_yoy"]) if c6 in fr.index else None
-        pb = _f(bn.loc[c6, "pb"]) if c6 in bn.index else None
-        hits = []
-        if pb is not None and pb < 1.0:
-            hits.append("value")
-        if roe is not None and roe > 0.15 and dd60[code] < -0.25:
-            hits.append("quality_gap")
-        if sq is not None and sq > 0.5:
-            hits.append("revalue")
-        if dd60[code] < -0.25 and mom20[code] > 0:
-            hits.append("reversal")
-        if nh250[code] > -0.05:
-            hits.append("breakout")
-        if vol20[code] < 0.3:
-            hits.append("pv_consensus")
-        strong_hits = [h for h in hits if h in strong_names]
-        if strong_hits:
-            score = sum(OTYPE_WINRATE[h]["winrate"] for h in strong_hits)
-            rows.append({"code": code, "name": names.get(code, ""),
-                         "price": round(float(close[code]), 2),
-                         "hits": [OTYPE_WINRATE[h]["name"] for h in strong_hits],
-                         "hits_otype": strong_hits, "score": round(score, 1),
-                         "n_hits": len(strong_hits)})
-    rows.sort(key=lambda x: (-x["n_hits"], -x["score"]))
-    return {"ok": True, "n_total": len(codes), "n_pitch": len(rows),
-            "n_excluded": n_excluded,
-            "strong_factors": [{"otype": f["otype"], "name": f["name"], "winrate": f["winrate"]}
-                               for f in strong_ok],
-            "pitch": rows[:topn]}
+    result = dict(_analysis(sector, 'pitch'))
+    result['pitch'] = result.get('pitch', [])[:max(0, int(topn))]
+    return result
 
 
 def sector_retail(sector, topn=20):
-    """散户因子（因子池 2026-08-15 研究落地）：
-    ① 股东户数：散户涌入（chg_pct>10%）= 排雷；主力吸筹（chg_pct<-10%）= 正向
-    ② 换手率：20日平均换手率（低换手=防守，反过度交易）"""
-    daily = _daily()
-    sec_map = _load_sector_detail()
-    codes = [c for c, (sc, _) in sec_map.items() if sc == sector and c in daily.columns]
-    if len(codes) < 5:
-        return {"ok": False, "n": len(codes), "note": "板块成分不足"}
-
-    con = sqlite3.connect(r"data/cache/stock_basic.db")
-    names = dict(con.execute("SELECT code, name FROM stock_basic").fetchall())
-    con.close()
-
-    # 质量过滤（ROE）——"低换手好股"必须基本面合格，剔除 ST/亏损
-    fr = _finance().sort_values("period").drop_duplicates(subset="code", keep="last").set_index("code")
-
-    # 股东户数（每 code 最新一期）
-    con = sqlite3.connect(r"data/cache/gdhs_full.db")
-    gd = pd.read_sql("SELECT code, chg_pct, ann_date FROM gdhs", con)
-    con.close()
-    gd["code"] = gd["code"].astype(str).str[:6]
-    gd = gd.sort_values("ann_date").drop_duplicates(subset="code", keep="last").set_index("code")
-
-    # 换手率：最近20日成交额均值 / 流通市值（★只取 tushare 源，amount 单位一致=千元；baostock 源 amount 单位=元会污染）
-    dates = daily.index[-20:]
-    dmin, dmax = dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d")
-    codes_s = ",".join("'%s'" % c for c in codes)
-    con = sqlite3.connect(f"file:{CACHE / 'bars.db'}?mode=ro&immutable=1", uri=True)
-    amt = pd.read_sql(f"SELECT code, AVG(amount) AS amt FROM daily_bar WHERE adjust='qfq' AND source='tushare' AND code IN ({codes_s}) AND date>='{dmin}' AND date<='{dmax}' GROUP BY code", con)
-    con.close()
-    amt["code"] = amt["code"].astype(str).str[:6]
-    con = sqlite3.connect(f"file:{CACHE / 'hist_mv.db'}?mode=ro&immutable=1", uri=True)
-    mv = pd.read_sql("SELECT month, code, circ_mv FROM hist_mv", con)
-    con.close()
-    mv["code"] = mv["code"].astype(str).str[:6]
-    mv = mv.sort_values("month").drop_duplicates(subset="code", keep="last").set_index("code")
-    turn = amt.set_index("code").join(mv["circ_mv"], how="inner")
-    turn["turnover"] = turn["amt"] * 1000 / (turn["circ_mv"] * 1e8) * 100  # 日换手率%
-
-    inflow, outflow = [], []
-    for code in codes:
-        c6 = code[:6]
-        chg = float(gd.loc[c6, "chg_pct"]) if c6 in gd.index and pd.notna(gd.loc[c6, "chg_pct"]) else None
-        name = names.get(code, "")
-        tv = float(turn.loc[c6, "turnover"]) if c6 in turn.index and pd.notna(turn.loc[c6, "turnover"]) else None
-        if chg is not None and chg > 10:
-            inflow.append({"code": code, "name": name, "chg": round(chg, 1), "turnover": round(tv, 2) if tv is not None else None})
-        elif chg is not None and chg < -10:
-            outflow.append({"code": code, "name": name, "chg": round(chg, 1), "turnover": round(tv, 2) if tv is not None else None})
-    inflow.sort(key=lambda x: -x["chg"])
-    outflow.sort(key=lambda x: x["chg"])
-
-    # 低换手（防守）Top：全板块按换手率升序，★剔除 ST + 亏损（ROE<=0）——"低换手好股"而非流动性枯竭的垃圾股
-    lowturn = []
-    n_filtered = 0
-    for code in codes:
-        c6 = code[:6]
-        name = names.get(code, "")
-        if name.startswith("ST") or name.startswith("*ST") or name.startswith("退"):
-            n_filtered += 1
-            continue
-        roe = float(fr.loc[c6, "roe"]) if c6 in fr.index and pd.notna(fr.loc[c6, "roe"]) else None
-        if roe is None or roe <= 0:
-            n_filtered += 1
-            continue
-        tv = float(turn.loc[c6, "turnover"]) if c6 in turn.index and pd.notna(turn.loc[c6, "turnover"]) else None
-        if tv is not None:
-            lowturn.append({"code": code, "name": name, "turnover": round(tv, 2), "roe": round(roe * 100, 1)})
-    lowturn.sort(key=lambda x: x["turnover"])
-
-    return {"ok": True, "n_total": len(codes), "n_inflow": len(inflow), "n_outflow": len(outflow),
-            "n_filtered": n_filtered,
-            "inflow": inflow[:topn], "outflow": outflow[:topn], "lowturn": lowturn[:topn]}
+    result = dict(_analysis(sector, 'retail'))
+    for key in ('lowturn', 'inflow', 'outflow'):
+        result[key] = result.get(key, [])[:max(0, int(topn))]
+    return result
 
 
 def sector_crowd(sector):
-    """热度板块因子（因子池最新研究 2026-08-15）：行业成交额占全市场比重的 60 日滚动分位
-    ★结论：冷门板块（低拥挤）= 流动性陷阱；散户错误正确因子 = 个股低换手（turn_low），非板块热度"""
-    daily = _daily()
-    sec_map = _load_sector_detail()
-    codes = [c for c, (sc, _) in sec_map.items() if sc == sector and c in daily.columns]
-    if len(codes) < 5:
-        return {"ok": False, "note": "板块成分不足"}
-    dates = daily.index[-60:]
-    dmin, dmax = dates[0].strftime("%Y-%m-%d"), dates[-1].strftime("%Y-%m-%d")
-    all_codes = ",".join("'%s'" % c for c in daily.columns)
-    sec_codes = ",".join("'%s'" % c for c in codes)
-    con = sqlite3.connect(f"file:{CACHE / 'bars.db'}?mode=ro&immutable=1", uri=True)
-    tot = pd.read_sql(f"SELECT date, SUM(amount) AS amt FROM daily_bar WHERE adjust='qfq' AND source='tushare' AND code IN ({all_codes}) AND date>='{dmin}' AND date<='{dmax}' GROUP BY date", con)
-    sec = pd.read_sql(f"SELECT date, SUM(amount) AS amt FROM daily_bar WHERE adjust='qfq' AND source='tushare' AND code IN ({sec_codes}) AND date>='{dmin}' AND date<='{dmax}' GROUP BY date", con)
-    con.close()
-    if len(tot) == 0 or len(sec) == 0:
-        return {"ok": False, "note": "成交额数据缺失"}
-    share = sec.set_index("date")["amt"] / tot.set_index("date")["amt"]
-    cur = float(share.iloc[-1])
-    avg = float(share.mean())
-    # 热度分档（占全市场成交额比重）
-    if cur > 0.05:
-        heat = "热门"
-    elif cur > 0.02:
-        heat = "中性"
+    return _analysis(sector, 'crowd')
+
+
+def stock_search(q, limit=20):
+    text = str(q or '').strip().lower()
+    if not text:
+        return []
+    rows = [{'code': code, 'name': row.get('name', '')} for code, row in _artifact()['stocks'].items()
+            if text in code.lower() or text in str(row.get('name') or '').lower()]
+    return rows[:max(0, int(limit))]
+
+
+def stock_factors(code):
+    return _artifact()['stocks'].get(_to_bar_code(code), {'ok': False, 'error': '证券不在已计算研究范围'})
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--build', action='store_true', help='计算真实板块证据并原子保存，API不会调用本计算')
+    args = parser.parse_args()
+    if args.build:
+        print('板块离线研究已生成:', build())
     else:
-        heat = "冷门"
-    return {"ok": True, "share_pct": round(cur * 100, 2), "avg_share_pct": round(avg * 100, 2),
-            "heat": heat, "n": len(codes),
-            "note": "★热度板块因子已证伪（2026-08-15 主系统 T+1 复算）：冷门板块=流动性陷阱；热门×低换手也不加分（复算 +41.96% ≈ 纯低换手 +42.18%）。散户错误唯一实证=个股低换手（turn_low）"}
-
-
-if __name__ == "__main__":
-    secs = list_sectors()
-    print(f"板块数: {len(secs)}")
-    for s in secs[:5]:
-        print(f"  {s['code']} {s['name']} {s['n']} 只")
-    t = sector_timing("C39")
-    print("C39 择时:", t)
-    print("C39 强因子:")
-    for f in sector_strong_factors("C39"):
-        print(f"  {f['name']:<8} n={f['n']:<6} 胜率={f['winrate']}% 超额={f['excess']}% {f['note']}")
+        print(json.dumps({'sectors': list_sectors()}, ensure_ascii=False))

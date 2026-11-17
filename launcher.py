@@ -60,12 +60,38 @@ def start_harness(base: Path):
               "复制为 .credentials.yaml 并填入 DeepSeek API Key（见 docs/HARNESS接入.md）")
     env = dict(os.environ)
     env["DSH_HOME"] = str(harness_root / "home")
+    env["DSH_TELEMETRY_DISABLED"] = "1"
     print(f"[QuantDeck] 启动 DeepSeek HARNESS（DSH_HOME={env['DSH_HOME']}）...")
     try:
-        proc = subprocess.Popen([str(node), str(dsh_bin), "web"],
-                                cwd=str(harness_root), env=env,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return proc
+        from data.local_services import entry_lock, load_policy, publish_pid, resolve_service, running_service
+        log_dir = base / "runtime" / "ai"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        service = {'command': [str(node), str(dsh_bin), 'web'],
+                   'pid_file': log_dir / 'harness.pid', 'log_file': log_dir / 'harness.log'}
+        # macOS login recovery and the manual launcher must use the same
+        # command. Other platforms retain their portable Node selection.
+        if sys.platform == 'darwin' and (base / 'config/local_services.yaml').exists():
+            policy = load_policy(base)
+            service = resolve_service('ai', policy, base)
+            if not service['enabled']:
+                return None
+            env.update({'PATH': policy['path'], **service['environment']})
+        existing = running_service(service, base)
+        if existing is not None:
+            print('[QuantDeck] HARNESS 已在运行')
+            return existing
+        with entry_lock(service):
+            existing = running_service(service, base)
+            if existing is not None:
+                print('[QuantDeck] HARNESS 已在运行')
+                return existing
+            service['log_file'].parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(service['log_file'], os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "ab") as log:
+                proc = subprocess.Popen(service['command'], cwd=str(base), env=env,
+                                        stdout=log, stderr=log)
+            publish_pid(service, proc.pid)
+            return proc
     except Exception as e:
         print(f"[QuantDeck] HARNESS 启动失败: {e}")
         return None
@@ -79,20 +105,80 @@ def _open_browsers():
         pass
 
 
+def start_paperlive(base: Path):
+    """Resume the separately configured quote-driven virtual account."""
+    if not (base / "config" / "paperlive.yaml").exists():
+        return None
+    from paperlive.config import load_config
+    configuration = base / 'config/paperlive.yaml'
+    cfg = load_config(configuration)
+    if Path(cfg['risk']['kill_switch_file']).exists() and not cfg.get('activation', {}).get('enabled'):
+        print('[QuantDeck] 盘中模拟已暂停，保留原虚拟账户')
+        return None
+    log_dir = Path(cfg['runtime_dir'])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    pid_file = log_dir / "runner.pid"
+    try:
+        import psutil
+        proc = psutil.Process(int(pid_file.read_text()))
+        if "paperlive" in proc.cmdline() and Path(proc.cwd()).resolve() == base.resolve():
+            print("[QuantDeck] 实时模拟账户已在运行")
+            return proc
+    except Exception:
+        pass
+    with (log_dir / "runner.log").open("ab") as log:
+        proc = subprocess.Popen([sys.executable, "-u", "-m", "paperlive", "--config", str(configuration), "run"],
+                                cwd=str(base), stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    pid_file.write_text(str(proc.pid) + "\n", encoding="utf-8")
+    print("[QuantDeck] 行情验收后台已启动；是否模拟以条件验收和暂停状态为准：/paperlive")
+    return proc
+
+
+def start_research(base: Path):
+    """Start the independent, verified after-close research updater."""
+    if not (base / 'config/research_service.yaml').exists():
+        return None
+    try:
+        from data.research_service import start_service
+        proc=start_service(base)
+        print('[QuantDeck] 研究更新服务已启用：官方收盘数据核实后更新')
+        return proc
+    except Exception:
+        print('[QuantDeck] 研究更新服务启动失败，请检查本机研究服务配置与日志')
+        return None
+
+
+def start_research_minute(base: Path):
+    """Start the selected, isolated public-minute cache maintainer."""
+    if not (base / 'config/research_minute_source.yaml').exists():
+        return None
+    try:
+        from data.minute_readiness import start_service
+        proc = start_service(base)
+        print('[QuantDeck] 分钟研究数据后台已启用；完整性以真实数据验收为准')
+        return proc
+    except Exception:
+        print('[QuantDeck] 分钟研究数据后台启动失败，请检查独立日志')
+        return None
+
+
 def main():
     base = base_dir()
     if not os.environ.get("LWQUANT_CACHE_DIR"):
-        os.environ["LWQUANT_CACHE_DIR"] = str(base / "data")
+        from data.cache import CACHE_DIR
+        os.environ["LWQUANT_CACHE_DIR"] = str(CACHE_DIR)
     data_dir = os.environ["LWQUANT_CACHE_DIR"]
     print(f"[QuantDeck] 数据目录: {data_dir}")
     if not (Path(data_dir) / "bars.db").exists():
         print("[QuantDeck] 提示: 未检测到 bars.db —— 请先获取数据（docs/快速开始.md §3），或使用演示数据模式")
 
     start_harness(base)                 # HARNESS（可选，:3080）
+    start_paperlive(base)               # 当前市场报价 + 独立虚拟账户
+    start_research(base)                # 官方盘后数据 + 独立研究产物
+    start_research_minute(base)         # 独立分钟研究库，不操作账户
     threading.Thread(target=_open_browsers, daemon=True).start()
 
-    from deck.deck_server import Handler, PORT
-    from http.server import ThreadingHTTPServer
+    from deck.deck_server import Handler, PORT, ThreadingHTTPServer
 
     print(f"[QuantDeck] 量化系统已启动: http://127.0.0.1:{PORT}  （Ctrl+C 退出）")
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

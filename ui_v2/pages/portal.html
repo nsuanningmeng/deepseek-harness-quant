@@ -104,7 +104,7 @@
 
       <!-- ★2026-08-16 五福轮动摆件（全球 ETF 代理池常态动量面板 + 弱市防守建议，常显） -->
       <div class="v2-card anim-fade-in-up d0" id="wufu-box">
-        <h2> 五福轮动 <span class="tag">9 只全球 ETF 代理池 · 25日动量×R²</span></h2>
+        <h2> 五福轮动 <span class="tag" id="wufu-method">全球 ETF 代理研究</span></h2>
         <div id="wufu-body" class="mini" style="opacity:.6;line-height:2"> 加载中…</div>
       </div>
 
@@ -113,7 +113,7 @@
 
       <!-- 实时行情快照（新浪实时 · 60s 轮询） -->
       <div class="v2-card anim-fade-in-up d1">
-        <h2> 实时行情 <span class="tag">盘中快照 · 60s 刷新 · 新浪</span></h2>
+        <h2> 行情状态 <span class="tag" id="rt-source">读取本机行情状态</span></h2>
         <div id="rt-box" class="mini" style="line-height:2"> 加载中…</div>
       </div>
 
@@ -136,6 +136,10 @@
       </div>
 
       <!-- API 接口状态窗口（全端点自探测，接口是否在线/响应耗时） -->
+      <section class="v2-card">
+        <h2>历史分钟数据补齐 <span class="tag">独立固定窗口任务</span></h2>
+        <div id="minute-job" class="mini" role="status" aria-live="polite" style="line-height:1.9">读取独立后台任务…</div>
+      </section>
       <div class="v2-card anim-fade-in-up d2">
         <h2> API 接口状态 <span class="tag" id="api-status-tag">探测中…</span></h2>
         <div id="api-box" class="mini" style="line-height:2"> 加载中…</div>
@@ -146,13 +150,15 @@
         <summary style="cursor:pointer;font-weight:600;font-size:14px"> 数据决策链 <span class="tag" id="chain-tag">健康度</span></summary>
         <div style="padding-top:10px">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
-            <button id="chain-refresh-btn" class="v2-btn" style="font-size:12px;padding:5px 16px">更新全域数据</button>
+            <button id="chain-refresh-btn" class="v2-btn" style="font-size:12px;padding:5px 16px">更新研究数据</button>
             <span class="mini" style="color:var(--muted)">触发完整数据管道，完成后按「数据日 vs 最新交易日」刷新下方各环节状态</span>
             <div id="chain-progress" style="display:none;flex:1;align-items:center;gap:8px">
               <div class="chain-progress-bar"><div id="chain-progress-fill" class="chain-progress-fill"></div></div>
               <span id="chain-progress-pct" class="mini" style="font-variant-numeric:tabular-nums;color:var(--navy2);font-weight:600;min-width:42px;text-align:right">0%</span>
             </div>
           </div>
+          <div id="chain-update-status" class="mini" role="status" aria-live="polite" style="line-height:1.8"></div>
+          <div id="chain-update-detail" class="mini" style="white-space:pre-wrap;line-height:1.8;opacity:.7"></div>
           <div id="chain-box" class="mini" style="line-height:2"> 加载中…</div>
         </div>
       </details>
@@ -164,6 +170,8 @@
 
 <script src="/v2/core/api.js"></script>
 <script src="/v2/core/render.js"></script>
+<script src="/v2/components/research-update.js"></script>
+<script src="/v2/components/minute-status.js"></script>
 <script src="/v2/components/icons.js"></script>
 <script src="/v2/components/search.js"></script>
 <script src="/v2/components/sidebar.js"></script>
@@ -172,6 +180,7 @@
   LW.sidebar.render('sidebar', {active: 'portal'});
   var R = LW.render;
   var IC = LW.icons;
+  LW.minuteStatus.bind('minute-job');
   R.loadEnums();   // ★#348 预热 enums（类型/因子族中文名动态下发，渲染时用 R.otypeCN/familyCN）
 
   // ★#314 去 emoji（API 返回 🔥✅🟢 等，前端清洗为纯文字）
@@ -181,9 +190,43 @@
       .replace(/\s+/g, ' ').trim();
   }
 
+  function escapeHtml(value) {
+    var span = document.createElement('span');
+    span.textContent = value == null ? '' : String(value);
+    return span.innerHTML;
+  }
+
+  function healthState(value) {
+    return ({ready:'已核验',empty_valid:'分析完成，0候选',waiting_market:'等待开市',waiting_data:'等待数据核验',pending_history:'历史待积累',initializing:'初始化中',probing:'后台核验中',missing_data:'缺数据',missing_schema:'缺业务表',permission_blocked:'权限阻塞',optional_unconfigured:'可选项未配置',deferred:'暂不启用',initialized:'已初始化，待核验',failed:'执行失败',stale:'内容日期滞后',unknown:'尚未验收'})[value] || '尚未验收';
+  }
+
+  var portalLoading = false, portalRetry = null;
+  function renderPendingPortal(d) {
+    var research = d.research_data || {}, boot = research.bootstrap || {};
+    var health = d.api_health || {}, keys = Object.keys(health);
+    var initialized = keys.filter(function(k){return health[k].initialized === true;}).length;
+    var progress = boot.total_units ? boot.completed_units + '/' + boot.total_units : '当前阶段处理中';
+    document.getElementById('summary-box').textContent = (d.reason || '门户汇总正在后台核验') + ' · ' + initialized + '/' + keys.length + ' 项已初始化';
+    document.getElementById('sys-box').innerHTML = '<div><b>当前研究阶段</b> · '+escapeHtml(boot.stage || boot.phase || research.status || '核验中')+' · '+escapeHtml(progress)+'</div>'+
+      '<div>'+escapeHtml(research.message || '正在读取真实研究结果')+'</div>'+
+      (boot.last_error ? '<div style="color:var(--gold)">'+escapeHtml(boot.last_error)+'</div>' : '')+
+      keys.map(function(k){var row=health[k];return '<div style="margin-top:7px"><b>'+escapeHtml(k)+'</b> · '+escapeHtml(healthState(row.state))+'<div style="opacity:.7">'+escapeHtml(row.reason || '尚未核验')+'</div></div>';}).join('');
+    document.getElementById('kpi-box').textContent = '正在后台读取真实候选池，尚未把缺数据当作0候选。';
+    document.getElementById('timing-box').textContent = '市场择时等待完整汇总。';
+    document.getElementById('brief-box').textContent = '研究简报等待完整汇总。';
+    document.getElementById('chain-tag').textContent = '后台核验中';
+    document.getElementById('chain-box').textContent = '正在核验完整行情日期与各环节产物。';
+  }
+
   // 门户 1 API 聚合（★#347 封装 loadPortal，60s 轮询）
   function loadPortal() {
-  LW.api.get('/api/live/portal_dash').then(function (d) {
+  if (portalLoading) return;
+  portalLoading = true;
+  if (portalRetry) { clearTimeout(portalRetry); portalRetry = null; }
+  LW.api.get('/api/live/portal_dash', {bypass:true,staleFallback:false}).then(function (d) {
+    portalLoading = false;
+    if (d.loading) portalRetry = setTimeout(loadPortal, 2000);
+    if (!d.snapshot_at && (d.loading || d.state === 'failed')) { renderPendingPortal(d); return; }
     var tm = (d.timing && d.timing.timing) || {};
     var dd = d.data_date || (d.brief && d.brief.date) || (tm && tm.date) || '—';
 
@@ -209,6 +252,9 @@
     // ★2026-08-14 择时趋势计（均线金叉6/12：连续趋势强度标尺，替代三灯）
     var tl = d.traffic_light || {};
     var tlBox = document.getElementById('traffic-light-box');
+    if (tlBox && !tl.state) {
+      tlBox.innerHTML = '<h2>择时趋势</h2><div class="mini" style="opacity:.7">尚无趋势数据，完成研究行情初始化后生成。</div>';
+    }
     if (tlBox && tl.state) {
       var ratio = tl.ratio != null ? +tl.ratio : 0;
       var pos = Math.max(0, Math.min(100, (ratio + 5) / 10 * 100));  // -5%~+5% → 0~100%
@@ -277,10 +323,10 @@
             '<div class="pt-info-row">沪深300 <b>' + R._f(tl.hs300, '—') + '</b> · ' + R._f(tl.asof, '—') + ' · ' + lcTxt + '</div>' +
           '</div>' +
           '<div>' +
-            '<div class="pt-dim-h">回测（近7年 · T+1执行）</div>' +
+            '<div class="pt-dim-h">' + escapeHtml(btR.start || '—') + ' ~ ' + escapeHtml(btR.end || '—') + ' · 月度研究统计</div>' +
             '<div class="pt-info-row">回撤 <b>' + R._f(btR.mdd, '—') + '%</b> vs 满仓 ' + R._f(btR.bench_mdd, '—') + '%</div>' +
             '<div class="pt-info-row">夏普 <b>' + R._f(btR.sharpe, '—') + '</b> vs 满仓 ' + R._f(btR.bench_sharpe, '—') + '</div>' +
-            '<div class="pt-info-row" style="color:#a1a1aa">趋势跟随 · 降回撤/控风险参考</div>' +
+            '<div class="pt-info-row" style="color:#a1a1aa">' + escapeHtml(btR.note || '月度关联统计，不等于实际T+1成交验证。') + '</div>' +
           '</div>' +
         '</div>' +
         '<div class="tl-spark-wrap">' +
@@ -296,18 +342,24 @@
     var apiKeys = Object.keys(apiHealth);
     var staleApis = apiKeys.filter(function (k) {
       var a = apiHealth[k];
-      return a.stale === true || (a.stale == null && (a.online === false || (a.age_h != null && a.age_h > 24)));
+      return a.ready !== true;
     });
+    var pendingN = apiKeys.filter(function(k){return apiHealth[k].state === 'pending_history';}).length;
+    var initializedN = apiKeys.filter(function(k){return apiHealth[k].initialized === true;}).length;
     var apiTxt = apiKeys.length
-      ? '<span class="mini">数据源 ' + apiKeys.length + ' 项' +
-        (staleApis.length ? ' · <b style="color:var(--gold)">' + staleApis.length + ' 项滞后</b>' : ' · <b style="color:var(--green)">全部正常</b>') + '</span>'
+      ? '<span class="mini">' + initializedN + ' 项已初始化' +
+        (pendingN ? ' · ' + pendingN + ' 项等待样本' : '') +
+        (apiKeys.length-initializedN ? ' · <b style="color:var(--gold)">' + (apiKeys.length-initializedN) + ' 项未初始化</b>' : '') + '</span>'
       : '';
     var sem = d.data_semantic || ('最新完整交易日 ' + dd);
+    if (d.research_data && !d.research_data.ready) sem = d.research_data.message;
+    if (d.state === 'failed') sem = d.reason || '门户部分模块尚未通过核验';
+    if (d.stale) sem = '上次真实快照 '+(d.ts || '时间未知')+' · '+(d.loading?'正在后台刷新':'本次核验未通过')+'；'+sem;
     // 数据日语义色：盘前/盘中=蓝（实时），已更新=绿，滞后=金
     var semCls = sem.indexOf('已更新') >= 0 ? 'var(--green)' : (sem.indexOf('盘') >= 0 ? 'var(--navy2)' : 'var(--gold)');
     sm.innerHTML =
       '<span class="tm">择时 ' + R._f(tm.level, '—') + ' · ' + R._f(tm.score, '—') + ' 分</span>' +
-      '<span class="mini" style="color:' + semCls + ';font-weight:600" title="数据流通状态：日线数据每日 18:30 收盘后由管道更新，盘中显示上一交易日为正常">' + sem + '</span>' +
+      '<span class="mini" style="color:' + semCls + ';font-weight:600" title="显示本机实际核验与研究更新进度">' + escapeHtml(sem) + '</span>' +
       apiTxt +
       '<span class="mini">' + stripEmoji(tm.temp_zone || tm.reason || '').slice(0, 40) + '</span>';
 
@@ -328,7 +380,7 @@
       kpiCard('doc', 'Pitch 长线', p.pitch ? p.pitch.n : '—', '只', p.pitch ? (pitchTypes ? pitchTypes + ' · ' : '') + p.pitch.date : '', ks.pitch, 1),
       kpiCard('gauge', 'Pitch 短线', p.tech_pitch ? p.tech_pitch.n : '—', '只', p.tech_pitch ? (p.tech_pitch.new ? '新增 ' + p.tech_pitch.new + ' · ' : '') + (techTypes || p.tech_pitch.date || '') : '', ks.tech, 2),
       kpiCard('calendar', '远期池', p.forward_track ? p.forward_track.n : '—', '只', '四池 · T+1/5/20/60 验证', null, 3),
-      kpiCard('help', '止损预警', (p.stop_alerts && p.stop_alerts.held_near != null) ? p.stop_alerts.held_near : '—', '持仓临近', p.stop_alerts ? '持仓 ' + (p.stop_alerts.held_n || 0) + ' · 触发 ' + (p.stop_alerts.held_triggered || 0) + ' · 监测 ' + (p.stop_alerts.monitored || 0) : '', null, 4)
+      kpiCard('help', '止损预警', (p.stop_alerts && p.stop_alerts.held_near != null) ? p.stop_alerts.held_near : '—', '持仓临近', p.stop_alerts ? (p.stop_alerts.portfolio_recorded === false ? p.stop_alerts.reason : '持仓 ' + (p.stop_alerts.held_n == null?'—':p.stop_alerts.held_n) + ' · 触发 ' + (p.stop_alerts.held_triggered == null?'—':p.stop_alerts.held_triggered) + ' · 监测 ' + (p.stop_alerts.monitored == null?'—':p.stop_alerts.monitored)) : '', null, 4)
     ];
     document.getElementById('kpi-box').innerHTML = kpis.join('');
     // ★#401 KPI 数字 count-up 滚动（expo-out，首次加载数字从 0 递增）
@@ -387,23 +439,39 @@
     try {
       var ns = d.next_schedule || [];
       var nsHtml = ns.length ? ns.slice(0, 4).map(function (s) {
-        var m = s.mins_left != null ? s.mins_left : '';
+        var m = s.mins_left != null ? s.mins_left : null;
         var txt = (m != null && m <= 0) ? '已到点' : (m != null ? m + ' 分钟后' : '');
         return '<span style="display:inline-block;margin-right:14px"><b>' + R._f(s.name) + '</b> ' + R._f(s.desc) + ' · ' +
           '<span style="color:' + (txt === '已到点' ? 'var(--green)' : 'var(--navy2)') + ';font-weight:600">' + txt + '</span></span>';
       }).join('') : '<span style="opacity:.6">暂无计划任务</span>';
-      var staleN = staleApis.length;
+      var auto = d.autotrade || {};
+      var jobs = auto.jobs || [];
+      var autoHtml = jobs.length ? jobs.map(function (job) {
+        var status = job.heartbeat_stale ? '心跳已过期，请检查调度任务' : job.status_label;
+        var detail = job.kind === 'paperlive'
+          ? '逐股报价 ' + (job.quote_count || 0) + '/' + (job.universe_count || 0) + ' · 当前市场实时模拟'
+          : '历史行情 ' + (job.market_sessions || 0) + '/' + (job.warmup_sessions || 0) + ' 个交易日 · ' + (job.market_ready ? '预热已完成' : '尚未完成预热');
+        return '<div style="margin-top:5px"><b>' + escapeHtml(job.provider) + ' 模拟盘</b> · ' + escapeHtml(status) +
+          (job.after_close ? ' · ' + escapeHtml(job.after_close) : '') +
+          '<div style="opacity:.7">' + escapeHtml(detail) + '</div></div>';
+      }).join('') : '<div style="opacity:.7">' + escapeHtml(auto.message || '尚未启动自动模拟任务') + '</div>';
       var healthTxt = apiKeys.length
-        ? '<span style="color:' + (staleN ? 'var(--gold)' : 'var(--green)') + ';font-weight:600">' +
-          (staleN ? staleN + ' 项滞后：' + staleApis.slice(0, 3).join('、') + (staleN > 3 ? ' 等' : '') : '全部 ' + apiKeys.length + ' 项正常') + '</span>'
+        ? apiKeys.map(function(key){var h=apiHealth[key];return '<div style="margin-top:5px"><b>'+escapeHtml(key)+'</b> · <span style="color:'+(h.ready?'var(--green)':'var(--gold)')+'">'+escapeHtml(healthState(h.state))+'</span>'+(h.data_date?' · '+escapeHtml(h.data_date):'')+'<div style="opacity:.7">'+escapeHtml(h.reason||'尚缺业务验收信息')+'</div></div>';}).join('')
         : '<span style="opacity:.6">无健康数据</span>';
+      var research = d.research || d.research_data || {};
+      var bootstrap = research.bootstrap || {};
+      var progress = bootstrap.total_units ? bootstrap.completed_units + '/' + bootstrap.total_units : '尚未开始';
+      var researchTxt = '<div style="margin-top:8px">'+(research.initialized?'核心研究已初始化 · '+escapeHtml(research.initialized_count)+'/'+escapeHtml(research.total)+' 项':'研究初始化：'+escapeHtml(bootstrap.stage||bootstrap.phase||research.status||'尚未读取')+' · '+escapeHtml(progress))+'</div>'+
+        '<div style="opacity:.7">'+escapeHtml(research.message||'研究功能需验证业务数据和分析产物，文件存在不代表功能可用。')+'</div>'+
+        (!research.initialized && bootstrap.last_error?'<div style="color:var(--gold)">'+escapeHtml(bootstrap.last_error)+'</div>':'');
       sb.innerHTML =
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start">' +
-          '<div><div style="font-size:12px;font-weight:700;color:#5e6ad2;letter-spacing:.5px;margin-bottom:6px">下次计划运行</div>' + nsHtml + '</div>' +
+          '<div><div style="font-size:12px;font-weight:700;color:#5e6ad2;letter-spacing:.5px;margin-bottom:6px">自动模拟任务</div>' + autoHtml +
+            '<div style="margin-top:8px">下次检查：' + nsHtml + '</div>' + researchTxt + '</div>' +
           '<div><div style="font-size:12px;font-weight:700;color:#5e6ad2;letter-spacing:.5px;margin-bottom:6px">数据源健康</div>' +
-            '<div>数据日 ' + sem + '</div>' +
+            '<div>数据日 ' + escapeHtml(sem) + '</div>' +
             '<div>' + healthTxt + '</div>' +
-            '<div style="opacity:.7;margin-top:4px">日线数据每日 18:30 收盘后更新 · 盘中显示上一交易日为正常</div>' +
+            '<div style="opacity:.7;margin-top:4px">研究看板与自动模拟盘使用各自的数据目录。</div>' +
           '</div>' +
         '</div>';
     } catch (e) { sb.innerHTML = '运行状态加载失败：' + e; }
@@ -411,7 +479,8 @@
     // 决策链
     renderChain(d.chain || {});
   }).catch(function (e) {
-    document.getElementById('summary-box').innerHTML = '<span class="tm"> 门户数据加载失败</span><span class="mini">' + e + '</span>';
+    portalLoading = false;
+    document.getElementById('summary-box').innerHTML = '<span class="tm"> 门户数据加载失败</span><span class="mini">' + escapeHtml(e.message || e) + '</span>';
   });
   }
   loadPortal();
@@ -427,30 +496,33 @@
           (d && d.error ? ' <span style="color:var(--muted)">' + String(d.error).slice(0, 60) + '</span>' : '');
         return;
       }
+      var method = d.method || {};
+      var methodLabel = document.getElementById('wufu-method');
+      if (methodLabel) methodLabel.textContent = d.assets.length + ' 只全球 ETF 代理 · ' + (method.momentum_window ? method.momentum_window + '日趋势×R²' : '趋势研究');
       var weak = d.a_share_weak;
       var defHtml = '';
       if (weak) {
         var g = d.defensive || {};
         defHtml = '<div style="margin-bottom:8px;padding:8px 10px;border-radius:8px;background:rgba(242,201,76,.08);border:1px solid rgba(242,201,76,.3);font-size:12px;line-height:1.7">' +
-          '<b style="color:var(--gold)">⚠ A股弱市确认（投票 ' + d.weak_vote + '/4）</b> → 建议加配避险资产：' +
+          '<b style="color:var(--gold)">⚠ A股弱市规则触发（投票 ' + d.weak_vote + '/' + (d.indices || []).length + '）</b> · 防守研究候选：' +
           (g.name ? '<b style="color:#f2c94c">' + R._f(g.name) + '</b>（动量×R² score ' + g.score + '）' : '黄金/债券/现金') +
-          '<span style="color:var(--muted)"> · 非强制调仓</span></div>';
+          '<span style="color:var(--muted)"> · 未校准，不自动调仓</span></div>';
       }
-      var maxMom = Math.max.apply(null, d.assets.map(function (a) { return Math.abs(a.mom_ann || 0); })) || 1;
+      var maxMom = Math.max.apply(null, d.assets.map(function (a) { return Math.abs(a.mom_score || 0); })) || 1;
       var rows = d.assets.map(function (a) {
-        var mom = a.mom_ann;
+        var mom = a.mom_score;
         var r20 = a.ret20;
         var col = mom >= 0 ? '#4ade80' : '#eb5757';
         var w = Math.max(3, Math.min(100, Math.abs(mom) / maxMom * 100));
         return '<div class="wf-row">' +
-          '<span class="wf-name">' + R._f(a.name) + (a.above_ma10 ? '<span class="wf-tag">▲MA10</span>' : '') + '</span>' +
+          '<span class="wf-name">' + R._f(a.official_name || a.name) + (a.above_ma10 ? '<span class="wf-tag">▲MA' + R._f(method.moving_average_window, '—') + '</span>' : '') + '</span>' +
           '<div class="wf-bar"><i style="width:' + w.toFixed(0) + '%;background:' + col + '"></i></div>' +
           '<span class="wf-pct" style="color:' + col + '">' + (r20 != null ? (r20 >= 0 ? '+' : '') + (r20 * 100).toFixed(1) + '%' : '—') + '</span>' +
-          '<span class="wf-tag" style="min-width:64px;text-align:right">' + (mom != null ? (mom >= 0 ? '+' : '') + (mom * 100).toFixed(0) + '%/y' : '—') + '</span>' +
+          '<span class="wf-tag" style="min-width:64px;text-align:right">' + (mom != null ? (mom >= 0 ? '+' : '') + (mom * 100).toFixed(1) + '%' : '—') + '</span>' +
           '</div>';
       }).join('');
       body.innerHTML = defHtml +
-        '<div style="font-size:11px;color:var(--muted);margin-bottom:2px">近20日涨幅（条=25日年化动量×R²）· 数据日 ' + R._f(d.date, '—') + '</div>' +
+        '<div style="font-size:11px;color:var(--muted);margin-bottom:2px">近20日涨幅；条为年化对数趋势×R²研究指标 · 数据日 ' + R._f(d.date, '—') + ' · 研究规则未校准，不自动调仓</div>' +
         rows;
     }).catch(function (e) {
       var body = document.getElementById('wufu-body');
@@ -462,17 +534,31 @@
 
   // ★2026-08-14 实时行情快照轮询（独立接口 /api/live/realtime，60s）
   function loadRealtime() {
-    LW.api.get('/api/live/realtime').then(function (d) {
+    LW.api.get('/api/live/realtime',{bypass:true,staleFallback:false}).then(function (d) {
       var box = document.getElementById('rt-box');
       if (!box) return;
+      var source = document.getElementById('rt-source');
+      if (source) source.textContent = (d && d.source ? d.source : '来源尚未读取')+' · 本机状态快照';
+      if (d && d.ok!==false && d.state==='waiting_market') {
+        box.innerHTML='<div data-realtime-state="waiting_market" style="color:var(--muted)"><b>等待开市</b><div style="margin-top:6px">'+escapeHtml(d.reason || '基础数据、AI与账户已核验，等待下一交易时段再核验实时行情。')+'</div>'+
+          (d.next_open?'<div style="margin-top:6px">下一交易时段：'+escapeHtml(d.next_open)+'</div>':'')+
+          '<div style="margin-top:6px">当前不交易；开市后仍须通过实时行情与交易条件检查。</div></div>';
+        return;
+      }
+      if (d && ['waiting_data','missing_data','missing_schema','permission_blocked','failed','stale'].indexOf(d.state)!==-1) {
+        box.innerHTML='<div data-realtime-state="'+escapeHtml(d.state)+'" style="color:var(--gold)"><b>实时行情尚未就绪 · '+escapeHtml(healthState(d.state))+'</b><div style="margin-top:6px">'+escapeHtml(d.reason || d.error || '数据或账户检查尚未全部通过，请查看实时模拟盘的验收项。')+'</div></div>';
+        return;
+      }
+      if (d && d.paused) { box.textContent = d.reason || '盘中模拟已暂停；研究与历史数据补齐继续运行。'; return; }
       if (!d || d.ok === false) {
         box.innerHTML = '<span style="color:var(--gold)">实时行情暂不可用</span>' +
-          '<span style="opacity:.7"> ' + (d && d.error ? String(d.error).slice(0, 60) : '') + '</span>';
+          '<span style="opacity:.7"> ' + escapeHtml(d && (d.reason || d.error) || '') + '</span>';
         return;
       }
       var open = !!d.market_open;
       var stat = open ? '<span style="color:var(--green);font-weight:700">交易中</span>' : '<span style="opacity:.7">已收盘/未开盘</span>';
-      var stale = d.stale ? ' <span style="color:var(--gold)">(上次快照 ' + (d.stale_ts || '') + '，行情源暂不可达)</span>' : '';
+      var stale = d.stale ? ' <span style="color:var(--gold)">(上次快照 ' + (d.stale_ts || d.ts || '') +
+        (d.loading ? '，正在刷新' : '，行情源暂不可达') + ')</span>' : '';
       var up = d.up || 0, down = d.down || 0, flat = d.flat || 0;
       var lu = d.limit_up || 0, ld = d.limit_down || 0;
       var med = d.median_chg != null ? d.median_chg : '—';
@@ -504,28 +590,40 @@
         '</div>';
     }).catch(function (e) {
       var box = document.getElementById('rt-box');
-      if (box) box.innerHTML = '<span style="color:var(--gold)">实时行情加载失败</span><span style="opacity:.7"> ' + e + '</span>';
+      if (box) box.innerHTML = '<span style="color:var(--gold)">实时行情加载失败</span><span style="opacity:.7"> ' + escapeHtml(e.message || String(e)) + '</span>';
     });
   }
   loadRealtime();
   setInterval(loadRealtime, 60000);
 
   // ★2026-08-14 API 接口状态轮询（/api/live/endpoints，120s 后端缓存 → 前端 60s）
+  var apiStatusBusy=false,apiStatusTimer=null;
   function loadApiStatus() {
-    LW.api.get('/api/live/endpoints').then(function (d) {
+    if(apiStatusBusy)return;apiStatusBusy=true;clearTimeout(apiStatusTimer);
+    var nextCheck=60000;
+    LW.api.get('/api/live/endpoints',{bypass:true,retry:0,staleFallback:false}).then(function (d) {
       var box = document.getElementById('api-box');
       var tag = document.getElementById('api-status-tag');
       if (!box) return;
-      if (!d || d.ok === false) {
+      if (!d || d.ok === false || d.state==='failed' || d.state==='optional_unconfigured') {
+        nextCheck=5000;if(tag)tag.textContent='暂不可用，稍后重试';
         box.innerHTML = '<span style="color:var(--gold)">接口状态探测暂不可用</span>' +
-          '<span style="opacity:.7"> ' + (d && d.error ? String(d.error).slice(0, 60) : '') + '</span>';
+          '<span style="opacity:.7"> ' + escapeHtml(d && (d.reason || d.error) || '') + '</span>';
         return;
       }
-      var okN = d.ok_count || 0, tot = d.total || 0;
-      if (tag) tag.textContent = okN + '/' + tot + ' 在线 · ' + (d.ts || '');
+      if(d.loading)nextCheck=2000;
       var eps = d.endpoints || [];
-      var fails = eps.filter(function (e) { return !e.ok; });
-      var okEps = eps.filter(function (e) { return e.ok; });
+      function usable(e) { return e.ok===true && e.state!=='waiting_market'; }
+      var fails = eps.filter(function (e) { return !usable(e); });
+      var disconnected = fails.filter(function (e) { return !e.reachable; });
+      var waitingMarket = fails.filter(function(e){return e.reachable && e.state==='waiting_market';});
+      var pendingHistory = fails.filter(function(e){return e.reachable && e.state==='pending_history';});
+      var optional = fails.filter(function(e){return e.reachable && e.state==='optional_unconfigured';});
+      var deferred = fails.filter(function(e){return e.reachable && ['deferred','initialized'].indexOf(e.state)!==-1;});
+      var expected=waitingMarket.concat(pendingHistory,optional,deferred);
+      var unready = fails.filter(function (e) { return e.reachable && expected.indexOf(e)===-1; });
+      var okEps = eps.filter(usable), okN=okEps.length, tot=d.total || eps.length;
+      if (tag) tag.textContent = d.loading ? '后台检查 '+(d.checked_count || 0)+'/'+tot : '连接 ' + (d.connected_count || 0) + '/' + tot + ' · 当前可用 ' + okN + '/' + tot + (waitingMarket.length?' · 等待开市 '+waitingMarket.length:'');
       // 排序：慢的在前（响应 >300ms 标黄，便于发现性能隐患）
       okEps.sort(function (a, b) { return (b.ms || 0) - (a.ms || 0); });
       function chip(e) {
@@ -535,26 +633,37 @@
         var msTxt = e.ms != null ? e.ms + 'ms' : '—';
         return '<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 9px;border:1px solid #2a2a30;' +
           'border-radius:20px;background:#16161a;font-size:12px">' +
-          '<span style="color:' + col + ';font-weight:700">●</span> ' + label +
-          ' <span style="color:#a1a1aa">' + msTxt + '</span></span>';
+          '<span style="color:' + col + ';font-weight:700">●</span> ' + escapeHtml(label) +
+          ' <span style="color:#a1a1aa">' + escapeHtml(msTxt) + '</span></span>';
       }
-      var failHtml = fails.length
-        ? '<div style="margin-top:6px;color:var(--red);font-weight:600">离线 ' + fails.length + ' 个：' +
-          fails.map(function (e) { return e.path + (e.error ? ' (' + String(e.error).slice(0, 30) + ')' : ''); }).join('；') + '</div>'
-        : '<div style="margin-top:6px;color:var(--green);font-weight:600">全部 ' + tot + ' 个端点在线</div>';
+      function reason(e) {
+        var detail=e.reason || e.error;
+        return escapeHtml(e.path) + ' · '+escapeHtml(healthState(e.state)) + (detail ? '（' + escapeHtml(String(detail)) + '）' : '') + (e.next_open?' · 下一交易时段 '+escapeHtml(e.next_open):'');
+      }
+      var failHtml = unready.length
+        ? '<div data-interface-group="unready" style="margin-top:8px;color:var(--gold)"><b>' + unready.length + ' 项功能未就绪 · 需要处理</b> · 请按原因检查数据、配置或上游服务：<br>' +
+          unready.map(reason).join('<br>') + '</div>' : '';
+      if (disconnected.length) failHtml += '<div style="margin-top:8px;color:var(--red)"><b>连接失败 ' + disconnected.length + ' 项：</b><br>' + disconnected.map(reason).join('<br>') + '</div>';
+      if (waitingMarket.length) failHtml += '<div data-interface-group="waiting_market" style="margin-top:8px;color:var(--muted)"><b>等待开市 '+waitingMarket.length+' 项</b><div>基础准备已完成；开市后仍需核验实时行情与交易条件，当前不可交易。</div>'+waitingMarket.map(reason).join('<br>')+'</div>';
+      if (pendingHistory.length) failHtml += '<details data-interface-group="pending_history" style="margin-top:8px;color:var(--muted)"><summary>历史待积累 '+pendingHistory.length+' 项</summary><div>真实交易、审批或前向收益记录需随操作和交易日积累；不补造历史记录。</div>'+pendingHistory.map(reason).join('<br>')+'</details>';
+      if (optional.length) failHtml += '<details data-interface-group="optional_unconfigured" style="margin-top:8px;color:var(--muted)"><summary>可选项未配置 '+optional.length+' 项</summary><div>这些可选功能尚未启用，当前不计入可用接口。</div>'+optional.map(reason).join('<br>')+'</details>';
+      if (deferred.length) failHtml += '<details data-interface-group="deferred" style="margin-top:8px;color:var(--muted)"><summary>暂不启用或待核验 '+deferred.length+' 项</summary>'+deferred.map(reason).join('<br>')+'</details>';
+      if (!fails.length && d.ready===true && d.checked_count===tot) failHtml = '<div style="margin-top:6px;color:var(--green)">全部 ' + tot + ' 个接口检查通过</div>';
       box.innerHTML =
-        '<div><span style="opacity:.7">最快 ' + okEps.length + ' 个（&lt;300ms 绿色，≥300ms 金色为性能关注项）：</span></div>' +
+        (d.loading?'<div style="color:var(--gold)">正在后台检查，已完成 '+(d.checked_count || 0)+'/'+tot+' 项；未完成项尚无可用结论。</div>':'')+
+        '<div><span style="opacity:.7">' + okEps.length + ' 个接口检查通过（&lt;300ms 绿色，≥300ms 金色）：</span></div>' +
         '<div style="margin-top:4px">' + okEps.slice(0, 18).map(chip).join('') +
         (okEps.length > 18 ? '<span style="opacity:.5;margin-left:4px">+ ' + (okEps.length - 18) + ' 个</span>' : '') + '</div>' +
         failHtml +
-        (d.stale ? '<div style="opacity:.6;margin-top:4px">(上次成功快照 ' + (d.stale_ts || '') + '，本次探测异常)</div>' : '');
+        ((d.excluded_routes || []).length?'<details style="margin-top:6px;color:var(--muted)"><summary>'+d.excluded_routes.length+' 条配置不在只读检查范围，未执行</summary>'+d.excluded_routes.map(escapeHtml).join('<br>')+'</details>':'');
     }).catch(function (e) {
+      nextCheck=5000;
       var box = document.getElementById('api-box');
-      if (box) box.innerHTML = '<span style="color:var(--gold)">接口状态加载失败</span><span style="opacity:.7"> ' + e + '</span>';
-    });
+      var tag=document.getElementById('api-status-tag');if(tag)tag.textContent='读取失败，5秒后重试';
+      if (box) box.innerHTML = '<span style="color:var(--gold)">接口状态读取超时或失败；尚未判定可用。</span><span style="opacity:.7"> ' + (e.name==='AbortError'?'':escapeHtml(e.message)) + '</span>';
+    }).finally(function(){apiStatusBusy=false;apiStatusTimer=setTimeout(loadApiStatus,nextCheck);});
   }
   loadApiStatus();
-  setInterval(loadApiStatus, 60000);
 
   /* ★#345 决策链渲染：每环节显示「数据日」，对照最新交易日判断是否最新（结果导向，非文件新鲜度） */
   function renderChain(data) {
@@ -566,7 +675,7 @@
       var dot = c.ok ? '<span class="anim-pulse-ring"></span>' : '<span class="anim-pulse-ring amber"></span>';
       var dateTxt = '';
       if (c.date) {
-        if (latest && c.date >= latest) dateTxt = '<span style="color:var(--green);font-weight:600"> ' + R._f(c.date) + ' 最新</span>';
+        if (latest && c.ok && c.date === latest) dateTxt = '<span style="color:var(--green);font-weight:600"> ' + R._f(c.date) + ' 最新</span>';
         else if (latest) dateTxt = '<span style="color:var(--gold)"> ' + R._f(c.date) + ' 滞后</span>';
         else dateTxt = ' ' + R._f(c.date);
       }
@@ -575,63 +684,10 @@
     }).join('') : '<span style="opacity:.6">暂无决策链数据</span>';
   }
 
-  /* ★#341 实时更新 = 触发完整数据管道（结果导向，非假动画）：
-     点一下 → POST /api/manual_update 真触发管道 → 轮询 /api/update_status 显示真实步骤日志
-     → 完成后 chain_refresh 重扫健康度，展示「更新结果」（失败步骤 + 最新数据日期） */
-  document.getElementById('chain-refresh-btn').onclick = function () {
-    var btn = document.getElementById('chain-refresh-btn');
-    var prog = document.getElementById('chain-progress');
-    var fill = document.getElementById('chain-progress-fill');
-    var pct = document.getElementById('chain-progress-pct');
-    var box = document.getElementById('chain-box');
-    btn.disabled = true;
-    prog.style.display = 'flex';
-    fill.style.width = '8%';
-    pct.textContent = '触发中';
-    box.innerHTML = '<div class="mini">正在触发完整数据管道（Tushare 增量 + 择时 + 扫描 + Pitch + 看板）…</div>';
+  // Only queue the current research service; progress is read from its public state.
+  LW.researchUpdate.bind({buttonId:'chain-refresh-btn',statusId:'chain-update-status',detailId:'chain-update-detail',
+    progressId:'chain-progress',fillId:'chain-progress-fill',percentId:'chain-progress-pct',onIdle:loadPortal});
 
-    var finish = function (summaryHtml, pctTxt) {
-      LW.api.get('/api/live/chain_refresh', { bypass: true, timeout: 20000 }).then(function (d) {
-        renderChain(d || {});
-        pct.textContent = pctTxt || '完成';
-        if (summaryHtml) box.insertAdjacentHTML('beforeend', summaryHtml);
-        btn.disabled = false;
-        setTimeout(function () { prog.style.display = 'none'; }, 1800);
-      }).catch(function (e) {
-        box.innerHTML = '刷新失败：' + e; btn.disabled = false; prog.style.display = 'none';
-      });
-    };
-
-    LW.api.post('/api/manual_update', {}).then(function (d) {
-      if (!d.ok) {
-        // 触发被拒（自动程序运行中 / 刚触发过）→ 至少重扫健康度给结果
-        finish('<div class="mini" style="color:var(--gold);margin-top:6px">' + (d.reason || d.error || '触发失败') + '（已重扫健康度）</div>', '已重扫');
-        return;
-      }
-      pct.textContent = '更新中';
-      var poll = function () {
-        LW.api.get('/api/update_status', { bypass: true }).then(function (s) {
-          if (s.busy) {
-            var tail = (s.log_tail || []).slice(-4);
-            box.innerHTML = '<div class="mini" style="font-family:monospace;white-space:pre-wrap;line-height:1.7">' + tail.join('\n') + '</div>';
-            fill.style.width = '55%';
-            setTimeout(poll, 3000);
-          } else {
-            var last = s.last || {};
-            var failed = last.failed_steps || [];
-            fill.style.width = '100%';
-            var summary;
-            if (failed.length) summary = '<div class="mini" style="color:var(--red);margin-top:6px">更新完成，但有 ' + failed.length + ' 步失败：' + failed.join('、') + '</div>';
-            else summary = '<div class="mini" style="color:var(--green);margin-top:6px">更新完成' + (last.finished_at ? ' · ' + last.finished_at.slice(11, 16) : '') + '</div>';
-            finish(summary, '完成');
-          }
-        }).catch(function () { setTimeout(poll, 3000); });
-      };
-      poll();
-    }).catch(function (e) {
-      finish('<div class="mini" style="color:var(--red);margin-top:6px">触发失败：' + e + '（已重扫健康度）</div>', '已重扫');
-    });
-  };
 })();
 </script>
 </body>

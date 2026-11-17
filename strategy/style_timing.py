@@ -28,29 +28,35 @@ SMALL_PCT = 0.20             # 小盘组：市值后 20%
 
 def small_large_strength(closes: pd.DataFrame, mv_map: dict,
                          window: int = STRENGTH_WINDOW,
-                         smooth: int = SMOOTH_WINDOW) -> pd.Series:
+                         smooth: int = SMOOTH_WINDOW, *, large_pct=LARGE_PCT,
+                         small_pct=SMALL_PCT, minimum_members=40, minimum_group=5) -> pd.Series:
     """大小盘相对强度序列（按日期）。
     >0 = 小盘近 window 日跑赢大盘；<0 = 大盘跑赢小盘。
     closes: 全市场收盘价面板（列=股票代码 600519.SH）
     mv_map: {code6 -> 流通市值(亿)}
     """
     # 市值分组
-    mvs = pd.Series({c: mv_map.get(c.split(".")[0], np.nan) for c in closes.columns})
-    valid = mvs.dropna()
-    if len(valid) < 40:
-        return pd.Series(0.0, index=closes.index)
+    mvs = pd.Series({c: mv_map.get(c, mv_map.get(c.split(".")[0], np.nan)) for c in closes.columns})
+    valid = mvs.where(mvs > 0).dropna()
+    missing = pd.Series(np.nan, index=closes.index)
+    if len(valid) < minimum_members:
+        return missing
 
-    large_q = valid.quantile(1 - LARGE_PCT)
-    small_q = valid.quantile(SMALL_PCT)
+    large_q = valid.quantile(1 - large_pct)
+    small_q = valid.quantile(small_pct)
     large_codes = valid[valid >= large_q].index
     small_codes = valid[valid <= small_q].index
-    if len(large_codes) < 5 or len(small_codes) < 5:
-        return pd.Series(0.0, index=closes.index)
+    if len(large_codes) < minimum_group or len(small_codes) < minimum_group or set(large_codes) & set(small_codes):
+        return missing
 
     # 两组等权净值
     def group_nav(codes):
-        sub = closes[codes].ffill()
-        return (1 + sub.pct_change().fillna(0).mean(axis=1)).cumprod()
+        sub = closes[codes].where(closes[codes] > 0)
+        returns = sub.pct_change(fill_method=None)
+        daily = returns.mean(axis=1).where(returns.notna().sum(axis=1) == len(codes))
+        if len(daily) and sub.iloc[0].notna().all():
+            daily.iloc[0] = 0.0  # Observed starting-price normalization, not a missing return.
+        return (1 + daily).cumprod(skipna=False)
 
     nav_large = group_nav(large_codes)
     nav_small = group_nav(small_codes)
@@ -58,11 +64,11 @@ def small_large_strength(closes: pd.DataFrame, mv_map: dict,
     # 相对强度 = 小盘 window 日累计收益 - 大盘 window 日累计收益
     ret_large = nav_large / nav_large.shift(window) - 1
     ret_small = nav_small / nav_small.shift(window) - 1
-    strength = (ret_small - ret_large).fillna(0)
+    strength = ret_small - ret_large
 
     # 平滑（防单日噪声）
     if smooth > 1:
-        strength = strength.rolling(smooth).mean().fillna(0)
+        strength = strength.rolling(smooth, min_periods=smooth).mean()
     return strength
 
 

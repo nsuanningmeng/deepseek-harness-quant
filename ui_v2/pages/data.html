@@ -29,9 +29,18 @@
 <div class="v2-wrap">
   <div class="v2-h"><span class="bar"></span><h1>数据</h1><span class="sub">持仓复盘 · 因子实战库 · 加权结果 · 数据资产</span></div>
 
+  <section class="v2-card" style="margin-top:14px">
+    <h2 style="display:flex;justify-content:space-between;gap:12px;align-items:center">5分钟历史行情 <button class="v2-btn" id="minute-refresh" type="button">刷新状态</button></h2>
+    <div id="minute-meta" class="mini" role="status" aria-live="polite" style="line-height:1.9">读取实际分钟库…</div>
+    <div id="minute-job" class="mini" role="status" aria-live="polite" style="line-height:1.9;padding:10px 12px;margin-top:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg)">读取独立后台任务…</div>
+    <div id="minute-box" style="overflow:auto;margin-top:10px"></div>
+    <div class="mini" style="opacity:.65;line-height:1.9;margin-top:8px">这里展示历史5分钟记录；实时模拟还需当前盘口报价通过时效和风控检查，状态见 <a href="/paperlive">实时模拟盘</a>。本页不含1分钟或集合竞价数据。</div>
+  </section>
+
   <!-- ★#332 持仓复盘（当前持仓 + 止盈 + 历史决策，方便复盘） -->
   <div class="v2-card anim-fade-in-up" style="margin-top:14px">
-    <h2> 持仓复盘 <span class="tag">当前持仓 · 止盈信号 · 历史决策</span></h2>
+    <h2> 历史研究审批组合 <span class="tag">持仓 · 止盈信号 · 审批历史</span></h2>
+    <div class="mini" style="opacity:.7;line-height:1.9">实时 AI 虚拟账户的资金、订单与收益位于 <a href="/paperlive">实时模拟盘</a>。</div>
     <div id="hold-box"> 加载中…</div>
   </div>
 
@@ -39,7 +48,7 @@
   <div class="v2-card anim-fade-in-up" style="margin-top:14px">
     <h2> 因子实战库 <span class="tag">unified.db · factor_agg 实战聚合 + 加权结果</span></h2>
     <div id="agg-box"> 加载中…</div>
-    <div class="db-sec"><h3>因子全量回测（top20% → T+1）</h3><div id="bt-box"> 加载中…</div></div>
+    <div class="db-sec"><h3>因子历史检验（固定持有期）</h3><div id="bt-box"> 加载中…</div></div>
     <div class="db-sec"><h3>加权结果（回测排名 × 实战排名融合）</h3><div id="rank-box"> 加载中…</div></div>
     <details class="db-sec">
       <summary style="cursor:pointer;font-weight:600;font-size:13px"> 因子 × Pitch 明细（factor_pitch · <span id="fp-count">—</span> 行）</summary>
@@ -60,12 +69,13 @@
   <!-- 数据资产清单 -->
   <div class="v2-card anim-fade-in-up d2" style="margin-top:14px">
     <h2> 数据资产清单 <span class="tag">asset_inventory · 源 / 冗余组 / 核心资产</span></h2>
+    <div class="mini" style="opacity:.7;line-height:1.8;margin:6px 0">清单中的行数、日期和文件大小来自最近一次盘点快照；当前研究和分钟状态以上方实时核验为准。</div>
     <div id="inventory-box" style="margin-top:6px"> 加载中…</div>
   </div>
 
   <!-- 数据链路 -->
   <div class="v2-card anim-fade-in-up d3" style="margin-top:14px">
-    <h2> 数据链路 <span class="tag">data_lineage · 源库 → 消费端（防删错）</span></h2>
+    <h2> 数据链路 <span class="tag">data_lineage · 源库 → 代码引用快照</span></h2>
     <div id="lineage-box" style="margin-top:6px"> 加载中…</div>
   </div>
 
@@ -73,6 +83,7 @@
 </div>
 
 <script src="/v2/core/api.js"></script>
+<script src="/v2/components/minute-status.js"></script>
 <script src="/v2/core/render.js"></script>
 <script src="/v2/components/icons.js"></script>
 <script src="/v2/components/search.js"></script>
@@ -81,6 +92,23 @@
 (function () {
   LW.sidebar.render('sidebar', {active: 'data'});
   var R = LW.render;
+  function esc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  function plainNumber(value, decimals) { return value == null || value === '' || !Number.isFinite(Number(value)) ? '—' : Number(value).toLocaleString('zh-CN',{maximumFractionDigits:decimals == null?2:decimals}); }
+  function formatBytes(value) { if(value == null || !Number.isFinite(Number(value)) || Number(value)<0)return '—';var n=Number(value),units=['B','KB','MB','GB','TB'],i=0;while(n>=1000 && i<units.length-1){n/=1000;i++;}return plainNumber(n,i?2:0)+' '+units[i]; }
+  function loadMinute() {
+    var button=document.getElementById('minute-refresh');button.disabled=true;
+    LW.api.get('/api/live/minute',{bypass:true,retry:0,staleFallback:false}).then(function(data){
+      var meta=document.getElementById('minute-meta'),box=document.getElementById('minute-box');
+      LW.minuteStatus.render(document.getElementById('minute-job'),data);
+      meta.textContent=(data.reason || data.message || '请查看实际数据状态')+' · 本轮回执 '+(data.completed_symbols == null?'—':data.completed_symbols)+'/'+(data.expected_symbols == null?'未知':data.expected_symbols)+(data.rate_limited?' · 官方接口限频，等待权限或下个许可时段'+(data.retry_at?'（最早 '+data.retry_at+'）':''):'')+(data.rows!=null?' · 强验窗口 '+data.rows+' 行':' · 完整窗口行数待强验')+' · 来源 '+(data.source||'—');
+      var rows=Array.isArray(data.latest)?data.latest:[];
+      box.innerHTML=rows.length?'<table><thead><tr><th>代码</th><th>记录时间</th><th>开盘</th><th>最高</th><th>最低</th><th>收盘</th><th>成交量</th><th>成交额</th></tr></thead><tbody>'+rows.map(function(row){return '<tr><td>'+esc(row.code)+'</td><td>'+esc(row.trade_time)+'</td><td>'+plainNumber(row.open,3)+'</td><td>'+plainNumber(row.high,3)+'</td><td>'+plainNumber(row.low,3)+'</td><td>'+plainNumber(row.close,3)+'</td><td>'+plainNumber(row.volume,0)+'</td><td>'+plainNumber(row.amount,0)+'</td></tr>';}).join('')+'</tbody></table>':'<div class="mini" style="opacity:.7">完成独立强验后显示少量真实行情样本；下载期间仅显示回执进度。</div>';
+    }).catch(function(error){document.getElementById('minute-meta').textContent='5分钟状态读取失败：'+error.message;document.getElementById('minute-box').textContent='';})
+      .finally(function(){button.disabled=false;});
+  }
+  document.getElementById('minute-refresh').onclick=loadMinute;
+  loadMinute();
+  setInterval(loadMinute,60000);
   function pv(v, d) { return (v != null && !isNaN(v)) ? (v * 100).toFixed(d || 1) + '%' : '—'; }
   function rc(v) { return (v != null && !isNaN(v)) ? '<b style="color:' + R.color(v) + '">' + (v > 0 ? '+' : '') + (v * 100).toFixed(2) + '%</b>' : '<span style="opacity:.35">—</span>'; }
 
@@ -128,31 +156,15 @@
       }).join('') + '</tbody></table>' : '<div class="mini" style="opacity:.6">暂无实战数据（因子被 pitch 后自动入此库）</div>';
     document.getElementById('agg-box').innerHTML = aggHtml;
 
-    // ★#322 因子全量回测（factor_backtest：top20% → T+1）
-    var bt = (d.tables && d.tables.factor_backtest) || {};
-    var btRows = (bt.rows || []).slice().sort(function (a, b) { return (b[2] || -9) - (a[2] || -9); }).slice(0, 30);
-    var btHtml = btRows.length ? '<table><thead><tr><th>因子</th><th style="text-align:right">T+1 平均</th><th style="text-align:right">胜率</th><th style="text-align:right">样本</th><th style="text-align:right">IC</th><th>区间</th></tr></thead><tbody>' +
-      btRows.map(function (r) {
-        return '<tr><td><b>' + R._f(r[0]) + '</b></td>' +
-          '<td class="td-num">' + rc(r[2]) + '</td>' +
-          '<td class="td-num">' + (r[3] != null ? pv(r[3], 0) : '—') + '</td>' +
-          '<td class="td-num">' + R._f(r[4]) + '</td>' +
-          '<td class="td-num">' + (r[5] != null ? Number(r[5]).toFixed(3) : '—') + '</td>' +
-          '<td>' + R._f(r[6]) + '</td></tr>';
-      }).join('') + '</tbody></table>' : '<div class="mini" style="opacity:.6">暂无回测数据</div>';
-    // ★#412 样本天数提示：factor_backtest 仅 6 天历史（daily_scores 08-06 起），代表性有限，引导看 ICIR120
-    var btHint = '';
-    if (btRows.length) {
-      var _dr = btRows[0][6] || '';
-      var _m = _dr.match(/(\d{4}-\d{2}-\d{2})~(\d{4}-\d{2}-\d{2})/);
-      if (_m) {
-        var _days = Math.round((new Date(_m[2]) - new Date(_m[1])) / 86400000) + 1;
-        if (_days < 30) {
-          btHint = '<div class="mini" style="margin:4px 0 8px;color:#f2c94c;font-weight:600">样本区间 ' + _dr + '（约 ' + _days + ' 天）——代表性有限，因子有效性请以下方「加权结果 · 回测ICIR120」为准</div>';
-        }
-      }
+    var history=d.factor_history || {},horizons=history.holding_horizons || [];
+    function renderHistory(horizon) {
+      var rows=(history.rows || []).filter(function(row){return row.holding_sessions===Number(horizon);});
+      var controls='<label class="mini">持有期 <select id="history-horizon">'+horizons.map(function(n){return '<option value="'+n+'"'+(Number(horizon)===n?' selected':'')+'>'+n+'个交易日</option>';}).join('')+'</select></label>';
+      var body=rows.length?'<table><thead><tr><th>因子</th><th>组合比例</th><th>净收益均值</th><th>超额均值</th><th>平均IC</th><th>成熟截面数</th><th>信号区间</th><th>用途</th></tr></thead><tbody>'+rows.map(function(r){return '<tr><td><b>'+esc(r.name_cn || r.factor)+'</b></td><td>前'+pv(r.top_fraction,0)+'</td><td class="td-num">'+rc(r.mean_top_net_return)+'</td><td class="td-num">'+rc(r.mean_top_excess)+'</td><td class="td-num">'+plainNumber(r.mean_ic,3)+'</td><td class="td-num">'+plainNumber(r.n_sections,0)+'</td><td>'+esc(r.first_signal_date || '—')+' ～ '+esc(r.last_signal_date || '—')+'</td><td>'+ (r.state==='diagnostic_only'?'停用 · 仅诊断':r.state==='evaluated'?'历史研究':'证据待补')+'</td></tr>';}).join('')+'</tbody></table>':'<div class="mini">'+esc(history.reason || '该持有期尚无可验证记录')+'</div>';
+      document.getElementById('bt-box').innerHTML=(horizons.length?controls:'')+body+'<div class="mini" style="opacity:.7;line-height:1.8;margin-top:6px">数据日 '+esc(history.data_date || '—')+' · '+esc(history.note || '')+'</div>';
+      var selector=document.getElementById('history-horizon');if(selector)selector.onchange=function(){renderHistory(this.value);};
     }
-    document.getElementById('bt-box').innerHTML = btHint + btHtml;
+    renderHistory(history.primary_horizon);
 
     // 加权结果（ranking）
     var rk = d.ranking || [];
@@ -160,14 +172,14 @@
       rk.slice(0, 30).map(function (x) {
         var live = (x.live_metric != null && !isNaN(x.live_metric)) ? '<b style="color:' + R.color(x.live_metric) + '">' + (x.live_metric > 0 ? '+' : '') + (x.live_metric * 100).toFixed(2) + '%</b>' : '<span style="opacity:.35">—</span>';
         var eff = x.live_eff > 0 ? '<span class="tag-st tag-new" style="font-size:10px;padding:1px 6px;border-radius:5px;background:rgba(94,106,210,.14);color:#5e6ad2;font-weight:600">实测 ' + Math.round(x.live_eff * 100) + '%</span>' : '<span style="opacity:.35">—</span>';
-        return '<tr><td class="td-num"><b>' + x.rank + '</b></td><td><b>' + R._f(x.factor) + '</b></td>' +
+        return '<tr><td class="td-num"><b>' + plainNumber(x.rank,0) + '</b></td><td><b>' + R._f(x.factor) + '</b></td>' +
           '<td class="td-num">' + (x.icir120 != null ? x.icir120.toFixed(2) : '—') + '</td>' +
-          '<td class="td-num">' + x.n_pitch + '</td>' +
+          '<td class="td-num">' + plainNumber(x.n_pitch,0) + '</td>' +
           '<td class="td-num">' + live + '</td>' +
           '<td class="td-num"><b>' + (x.composite != null ? x.composite.toFixed(1) : '—') + '</b></td>' +
           '<td>' + eff + '</td></tr>';
       }).join('') + '</tbody></table>' : '<div class="mini" style="opacity:.6">无排名数据</div>';
-    document.getElementById('rank-box').innerHTML = rkHtml;
+    document.getElementById('rank-box').innerHTML = rkHtml+'<div class="mini" style="opacity:.7;line-height:1.8;margin-top:6px">'+esc(history.icir_note || '')+'</div>';
 
     // factor_pitch 明细
     var fp = (d.tables && d.tables.factor_pitch) || {};
@@ -201,24 +213,24 @@
   // 表统计 + 资产 + 链路（data_assets）
   LW.api.get('/api/live/data_assets').then(function (d) {
     var tabs = (d.tables || []).map(function (t) {
-      return '<div class="dt-tab"><div class="n">' + (t.rows != null ? t.rows : '—') + '</div><div class="nm">' + R._f(t.name) + '</div></div>';
+      return '<div class="dt-tab"><div class="n">' + plainNumber(t.rows,0) + ' 行</div><div class="nm">' + R._f(t.name) + '</div>'+(t.note?'<div class="mini" style="max-width:240px;line-height:1.7;margin-top:5px">'+esc(t.note)+'</div>':'')+'</div>';
     }).join('');
     document.getElementById('tables-box').innerHTML = tabs || '<div class="mini" style="opacity:.6">无表数据</div>';
 
     var inv = (d.inventory || []).map(function (i) {
       return '<div class="dt-inv"><span class="nm">' + R._f(i.name) + '</span>' +
         '<span class="kd">' + R._f(i.kind) + '</span>' +
-        '<span class="sz">' + (i.size != null && i.size > 0 ? (i.size > 1024 ? (i.size/1024).toFixed(1) + 'GB' : i.size + 'MB') : '—') + '</span>' +
+        '<span class="sz">' + (i.size_unit==='rows'?plainNumber(i.row_count,0)+' 行':i.size_unit==='bytes'?formatBytes(i.size_bytes):'—') + '</span>' +
         '<span class="dt">' + R._f(i.detail).slice(0, 90) + '</span></div>';
     }).join('');
     document.getElementById('inventory-box').innerHTML = inv || '<div class="mini" style="opacity:.6">无资产清单</div>';
 
     var lin = (d.lineage || []).map(function (l) {
       return '<div class="dt-line"><span class="db">' + R._f(l.db_name) + '</span>' +
-        '<span class="cs">' + R._f(l.consumers).slice(0, 200) + '</span>' +
+        '<span class="cs">' + esc((l.consumer_paths || []).join(' · ') || l.consumers) + '</span>' +
         '<span class="mini" style="color:#a1a1aa;flex:none">' + R._f(l.updated) + '</span></div>';
     }).join('');
-    document.getElementById('lineage-box').innerHTML = lin || '<div class="mini" style="opacity:.6">无链路数据</div>';
+    document.getElementById('lineage-box').innerHTML = '<div class="mini" style="opacity:.7;line-height:1.8;margin:4px 0 8px">'+esc(d.lineage_note || '')+'</div>'+(lin || '<div class="mini" style="opacity:.6">无链路数据</div>');
   }).catch(function (e) {
     document.getElementById('tables-box').innerHTML = '<div class="mini" style="color:var(--red)"> ' + e + '</div>';
   });

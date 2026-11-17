@@ -427,7 +427,7 @@ async function liveRefresh(){
         if(_br && _br.batches && _br.batches.length){
           const _brows = _br.batches.map(function(b){
             const _ex = b.excess != null ? '<b style="color:' + (b.excess>=0?'var(--red)':'var(--green)') + '">' + (b.excess>=0?'+':'') + (b.excess*100).toFixed(1) + '%</b>' : '—';
-            const _mk = b.mkt_t1_median != null ? ((b.mkt_t1_median>=0?'+':'')+(b.mkt_t1_median*100).toFixed(1)+'%') : '—';
+            const _mk = b.mkt_t1_median != null ? ((b.mkt_t1_median>=0?'+':'')+(b.mkt_t1_median*100).toFixed(1)+'%') : (b.market_state==='probing' ? '核验中' : '—');
             const _t1 = b.t1_avg != null ? '<b style="color:' + (b.t1_avg>=0?'var(--red)':'var(--green)') + '">' + (b.t1_avg>=0?'+':'') + (b.t1_avg*100).toFixed(1) + '%</b>' : '—';
             const _t5 = b.t5_avg != null ? '<b style="color:' + (b.t5_avg>=0?'var(--red)':'var(--green)') + '">' + (b.t5_avg>=0?'+':'') + (b.t5_avg*100).toFixed(1) + '%</b>' : '<span style="opacity:.5">⏳</span>';
             // ★2026-08-13 #264：类型构成（批次双维度解读——类型归因 × 入池时点市场环境）
@@ -439,7 +439,7 @@ async function liveRefresh(){
             return '<span style="margin-right:10px">' + esc(p.name) + ' ' + p.n + ' 只' + (p.n_t5_done ? ' · T+5 ' + (p.t5_avg!=null?((p.t5_avg>=0?'+':'')+(p.t5_avg*100).toFixed(1)+'%'):'⏳') : '') + '</span>';
           }).join('');
           vb.innerHTML += '<div style="margin-top:8px;border-top:1px dashed #E5E9F0;padding-top:6px">' +
-            '<div class="mini" style="color:#1c4d8f">📦 <b>批次质量</b>（T+1 实盘 vs 市场基准——选股超额正=优于市场；08-14 T+5 自动填充）：</div>' +
+            '<div class="mini" style="color:#1c4d8f">📦 <b>批次质量</b>（真实入池样本 T+1 vs 市场基准；T+5 到期后自动统计）：</div>' +
             '<table style="width:100%;border-collapse:collapse;margin-top:6px"><thead><tr><th>批次</th><th>数量</th><th>T+1均</th><th>市场中位</th><th>选股超额</th><th>T+5</th><th>类型构成</th></tr></thead><tbody>'+_brows+'</tbody></table>' +
             (_ps ? '<div class="mini" style="margin-top:4px">三池：' + _ps + '</div>' : '') +
             '<div class="mini" style="margin-top:3px;opacity:.7">' + esc(_br.note||'') + '</div></div>';

@@ -1,0 +1,12 @@
+# Reviewed exact security identities; never prefix expansions or price-limit rules.
+schema_version: 1
+overrides:
+  302132.SZ:
+    board: CHINEXT
+    security_type: ordinary_a_share
+    name: 中航成飞
+    reason: 经发行人创业板公告核实的证券代码变更，300114改为302132；不改变上市年龄或持股数量。
+    reviewed_at: '2026-11-11'
+    sources:
+      - https://disc.static.szse.cn/disc/disk03/finalpage/2025-02-15/cedb693a-f5ee-4463-9682-ea33d406b569.PDF
+      - https://disc.static.szse.cn/disc/disk03/finalpage/2025-03-19/dd95a920-8b43-4643-9405-93047fcddf93.PDF

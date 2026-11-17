@@ -1,0 +1,9 @@
+enabled: true
+research_config: config/research.yaml
+runtime_dir: runtime/research
+earliest_close_check: '17:00'
+poll_seconds: 60
+retry_seconds: 300
+heartbeat_seconds: 15
+heartbeat_grace_seconds: 90
+calendar_lookback_days: 45

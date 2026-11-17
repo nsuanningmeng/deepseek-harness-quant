@@ -13,6 +13,7 @@
 """
 import os
 import time
+import threading
 from pathlib import Path
 
 os.environ.setdefault("NO_PROXY", "*")  # 数据抓取不走代理，防限频/握手问题
@@ -21,41 +22,48 @@ import pandas as pd
 
 _PRO = None
 _LAST_CALL = 0.0
-_MIN_INTERVAL = 0.05  # 主服务器宽松节流（实测单次 ~1s，此值仅防手滑打爆）
+_MIN_INTERVAL = 0.35
+_RATE_LOCK = threading.Lock()
 
 
 def _load_cfg():
     import yaml
-    cfg = yaml.safe_load((Path(__file__).resolve().parent.parent / "config" / "params.yaml")
-                         .read_text(encoding="utf-8"))
-    return cfg["data"]
+    path = Path(__file__).resolve().parent.parent / "config" / "params.yaml"
+    return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("data", {}) if path.exists() else {}
+
+
+class _OfficialPro:
+    """DataFrame adapter over the credential-safe, fixed-origin official client."""
+    def query(self, api_name, fields="", **params):
+        from paperlive.data_settings import tushare_connection
+        from paperlive.config import load_config
+        from autotrade.providers import TushareHttpClient, _NoRedirect
+        from urllib.request import build_opener, ProxyHandler
+        # Re-read local credentials per request; never duplicate them in params.yaml.
+        client = TushareHttpClient(tushare_connection(load_config()), 30,
+                                  opener=build_opener(ProxyHandler({}), _NoRedirect()))
+        result = client.query(api_name, fields=fields, **params)
+        return pd.DataFrame(result.to_dict("records"), columns=result.columns)
+
+    def __getattr__(self, endpoint):
+        return lambda fields="", **params: self.query(endpoint, fields, **params)
 
 
 def _pro():
-    """按 params.yaml 的 token + api_url 构造 Pro 对象（带自定义 HTTP 地址）
-    ★2026-08-14 超时 30s→10s：代理服务器 镜像间歇读超时（默认 30s 让单次失败等满 30s，
-      重试链累加 = 整链 100s+）；10s 快速失败 + _call 重试 5 次更稳更快。"""
+    """Use the Token saved on the local data settings page and official HTTPS."""
     global _PRO
     if _PRO is None:
-        import tushare as ts
-        cfg = _load_cfg()
-        p = ts.pro_api(cfg["tushare_token"])
-        p._DataApi__http_url = cfg.get("tushare_api_url", "https://api.tushare.pro")
-        try:
-            p._DataApi__timeout = 10
-        except Exception:
-            pass
-        _PRO = p
+        _PRO = _OfficialPro()
     return _PRO
 
 
 def _rate_limit():
     global _LAST_CALL
-    now = time.time()
-    wait = _MIN_INTERVAL - (now - _LAST_CALL)
-    if wait > 0:
-        time.sleep(wait)
-    _LAST_CALL = time.time()
+    with _RATE_LOCK:
+        wait = _MIN_INTERVAL - (time.monotonic() - _LAST_CALL)
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_CALL = time.monotonic()
 
 
 def _call(fn, *args, max_retry=5, **kwargs):
@@ -66,9 +74,12 @@ def _call(fn, *args, max_retry=5, **kwargs):
             _rate_limit()
             return fn(*args, **kwargs)
         except Exception as e:
-            last_err = str(e)
-            if "频率" in last_err or "每分钟" in last_err:
-                print(f"  [Tushare 限频] {last_err[:80]} → 等待 30s 重试")
+            from autotrade.providers import TushareRequestError
+            last_err = type(e).__name__
+            if isinstance(e, TushareRequestError) and e.category in {"permission_denied", "authentication", "outside_session"}:
+                raise
+            if isinstance(e, TushareRequestError) and e.category == "rate_limited":
+                print("  [Tushare 限频] 等待 30s 重试")
                 time.sleep(30.0)
                 continue
             if attempt == max_retry - 1:

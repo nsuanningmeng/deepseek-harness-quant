@@ -20,7 +20,11 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-CACHE = Path(r"data/cache")
+BASE = Path(__file__).resolve().parent.parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+from data.cache import CACHE_DIR
+CACHE = CACHE_DIR
 REPORT = Path(__file__).resolve().parent.parent / "report"
 
 # 冷数据阈值：最新修改 > N 天未动视为冷
@@ -77,7 +81,7 @@ def scan_db(name: str):
             # 最新日期（有 date 列的表）
             maxd = None
             cols = [r[1] for r in con.execute(f"PRAGMA table_info(\"{t}\")").fetchall()]
-            for c in ("date", "trade_date", "day", "dt"):
+            for c in ("date", "trade_date", "day", "dt", "period", "month", "trade_time"):
                 if c in cols:
                     try:
                         maxd = con.execute(f"SELECT MAX(\"{c}\") FROM \"{t}\"").fetchone()[0]
@@ -99,7 +103,7 @@ def main():
     cold = [f for f in files if now - f["mtime"] > COLD_DAYS * 86400 and f["size"] > 0]
 
     dbs = []
-    for name in PRIMARY_DBS:
+    for name in sorted(p.name for p in CACHE.glob("*.db")):
         r = scan_db(name)
         if r:
             dbs.append(r)
@@ -131,7 +135,7 @@ def main():
     jp.write_text(json.dumps(out, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
 
     # md 报告
-    lines = [f"# D 盘数据资产审计 {out['ts']}", "",
+    lines = [f"# 本机研究数据资产审计 {out['ts']}", "",
              f"- 文件总数: {out['total_files']} | 总大小: {out['total_size']/2**30:.2f} GB",
              f"- 冷文件候选（>30 天未动）: {len(out['cold_files'])} 个",
              f"- 增量库: {out['incr_dbs']['n']} 个 {out['incr_dbs']['size']/2**20:.0f} MB",

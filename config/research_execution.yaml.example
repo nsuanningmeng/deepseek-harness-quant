@@ -1,0 +1,59 @@
+# Research assumptions only; independent of paperlive orders and risk configuration.
+stock_fees: {commission_rate: 0.00026, sell_tax_rate: 0.0005, slippage_rate: 0.001}
+etf_fees: {commission_rate: 0.00026, sell_tax_rate: 0.0, slippage_rate: 0.001}
+# Stock tax is a constant research assumption; historical rate changes are not modeled.
+etf:
+  turnover_window: 20
+  rebalance_days: 40
+  top_n: 20
+  min_price: 1.5
+  start: '2019-01-01'
+  train_fraction: 0.75
+  min_etf_rows: 250
+  min_correlation_rows: 120
+  rolling_window: 60
+  min_oos_days: 60
+  liquidity_window: 20
+  redundancy_max: 0.85
+  min_correlation: 0.05
+  max_selected: 8
+  matrix_count: 14
+  report_count: 20
+  match_weight: 0.55
+  stability_weight: 0.20
+  liquidity_weight: 0.25
+  stability_scale: 0.6
+  liquidity_scale_yi: 300
+  liquidity_base: 40
+  liquidity_slope: 30
+  tier_a: 60
+  tier_b: 45
+sector:
+  horizon_sessions: 20
+  min_samples: 30
+  min_members: 5
+  min_history: 260
+  strong_count: 3
+  timing_fast: 20
+  timing_slow: 60
+  turnover_window: 20
+  crowd_window: 60
+  hot_share: 0.05
+  neutral_share: 0.02
+  holder_change_pct: 10
+tech:
+  top_n: 6
+  limup_days: 5
+  consec_days: 10
+  atr_n: 20
+  hot_turn_quantile: 0.97
+  board_proxies:
+    - {board: CHINEXT, name: 创业板, gain_pct: 19.5}
+    - {board: STAR, name: 科创板, gain_pct: 19.5}
+    - {board: MAIN, name: 主板, gain_pct: 9.5}
+  weights: {short_rule: 40, stop_rule: 30, emotion_rule: 20, dragon_tiger: 10}
+  short_rule: {one_price_base: 0.40, one_price_penalty: 0.15, single: 0.85, two: 0.75, multiple_base: 0.60, multiple_penalty: 0.05, hot_count: 3, hot_penalty: 0.20, floor: 0.05, ceiling: 0.95}
+  stop_rule: {atr_multiplier: 2, space_start: 0.03, space_scale: 0.10, floor: 0.05, ceiling: 0.95, low_price: 5, low_price_multiplier: 0.75, high_atr_fraction: 0.12, high_atr_multiplier: 0.80}
+  emotion_rule: {base: 0.30, gain_count_weight: 0.15, consecutive_weight: 0.05, consecutive_cap: 3, active_weight: 0.04, active_cap: 6, turn_scale: 5, floor: 0.10, ceiling: 0.95}
+  premium_trap_fraction: 0.05
+  premium_rule_multiplier: 0.7

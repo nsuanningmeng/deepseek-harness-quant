@@ -26,6 +26,22 @@
   .vtag-yx { background:rgba(39,174,96,.12); color:#4ade80; }
   .vtag-wx { background:rgba(235,87,87,.12); color:#eb5757; }
   .bt-filter { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0; align-items:center; }
+  .pitch-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,160px),1fr)); gap:10px 14px; margin:12px 0; }
+  .pitch-grid label { display:grid; gap:4px; }
+  .pitch-grid input { box-sizing:border-box; width:100%; min-width:0; margin-left:0; }
+  .pitch-actions { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+  .pitch-actions button { min-height:30px; }
+  .pitch-result { margin-top:14px; }
+  .pitch-scroll { overflow-x:auto; }
+  .pitch-table { font-variant-numeric:tabular-nums; }
+  .pitch-table th, .pitch-table td { white-space:nowrap; }
+  .pitch-result details { margin-top:12px; }
+  .pitch-result summary { cursor:pointer; font-size:12px; }
+  #pitch-forward .pitch-table { min-width: 420px; }
+  #pitch-forward .pitch-table th { padding:7px 10px; }
+  #pitch-forward .pitch-table tbody th { border-bottom:1px solid rgba(255,255,255,.08); color:#a1a1aa; font-weight:400; }
+  #pitch-forward .pitch-table th, #pitch-forward .pitch-table td { text-align:right; }
+  #pitch-forward .pitch-table th:first-child, #pitch-forward .pitch-table td:first-child { text-align:left; }
 </style>
 </head>
 <body style="background:var(--bg);margin:0">
@@ -59,6 +75,43 @@
     <div id="bt-result"><div class="mini" style="opacity:.6">选择参数后点「运行回测」（首次加载数据约 5-15s，重复跑 1-2s）</div></div>
   </div>
 
+  <section class="v2-card anim-fade-in-up d1" style="margin-top:14px" aria-labelledby="pitch-heading">
+    <h2 id="pitch-heading">短线 Pitch 参数扫描</h2>
+    <p class="mini">用较早的历史筛选参数，再把入选组合同基线放到之后的样本外区间比较。</p>
+    <form id="pitch-form">
+      <div class="bt-ctl pitch-grid">
+        <label>扫参目标
+          <select id="pitch-profile">
+            <option value="return">净收益优先</option>
+            <option value="drawdown" disabled>基线回撤约束</option>
+          </select>
+        </label>
+        <label>筛选期开始 <input id="pitch-train-start" type="date" required></label>
+        <label>样本外开始 <input id="pitch-test-start" type="date" required></label>
+        <label>数据截止（留空取最新） <input id="pitch-end" type="date"></label>
+      </div>
+      <div class="bt-ctl pitch-grid" aria-describedby="pitch-grid-help">
+        <label>选股数量（TopN） <input id="pitch-topn" required></label>
+        <label>最长持有（交易日） <input id="pitch-hold" required></label>
+        <label>止损（ATR 倍数） <input id="pitch-stop" required></label>
+        <label>止盈（ATR 倍数） <input id="pitch-target" required></label>
+        <label>仓位系数 <input id="pitch-size" required></label>
+      </div>
+      <p class="mini" id="pitch-grid-help">多个取值用逗号分隔。止损和止盈填 0 表示关闭。仓位系数 1 为原每批买入额度，0.9 为原额度的 90%。</p>
+      <div class="pitch-actions">
+        <button class="v2-btn" id="pitch-run" type="submit" disabled>运行扫参与样本外验证</button>
+        <span class="mini" id="pitch-status" role="status">正在读取扫描配置…</span>
+      </div>
+    </form>
+    <div class="pitch-result" id="pitch-result"></div>
+  </section>
+
+  <section id="pitch-forward" class="v2-card" style="margin-top:14px" aria-labelledby="pitch-forward-heading">
+    <h2 id="pitch-forward-heading">Pitch 前瞻模拟</h2>
+    <p class="mini" id="pitch-forward-status" role="status">正在读取前瞻模拟状态…</p>
+    <div id="pitch-forward-comparison"></div>
+  </section>
+
   <!-- 历史记录 -->
   <div class="v2-card anim-fade-in-up d1" style="margin-top:14px">
     <h2> 历史记录 <span class="tag" id="bt-count">…</span></h2>
@@ -76,6 +129,8 @@
 (function () {
   LW.sidebar.render('sidebar', {active: 'backtest'});
   var R = LW.render;
+  function escArchive(value) { return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  function evidenceLink(value) { try { var url=new URL(value,window.location.origin);return url.origin===window.location.origin?url.pathname+url.search:null; } catch(error) { return null; } }
 
   /* ---------- SVG 图 ---------- */
   function cummax(arr) { var m = -Infinity, o = []; arr.forEach(function (v) { m = Math.max(m, v); o.push(m); }); return o; }
@@ -119,8 +174,8 @@
 
   function renderResult(d) {
     var m = d.metrics || {};
-    var ann = m.annual_return || 0;
-    var annC = ann >= 0 ? '#eb5757' : '#27ae60';
+    var ann = m.annual_return;
+    var annC = ann == null ? '#a1a1aa' : ann >= 0 ? '#eb5757' : '#27ae60';
     var dd = drawdown(d.nav);
     var kpi =
       '<div class="bt-kpi">' +
@@ -239,6 +294,250 @@
     }).catch(function (e) { document.getElementById('bt-result').innerHTML = '<div class="mini" style="color:var(--red)">失败：' + e + '</div>'; });
   };
 
+  (function bindPitchScan() {
+    var url = '/api/live/pitch_scan';
+    var form = document.getElementById('pitch-form');
+    var button = document.getElementById('pitch-run');
+    var status = document.getElementById('pitch-status');
+    var result = document.getElementById('pitch-result');
+    var trainStart = document.getElementById('pitch-train-start');
+    var testStart = document.getElementById('pitch-test-start');
+    var dataEnd = document.getElementById('pitch-end');
+    var profile = document.getElementById('pitch-profile');
+    var gridFields = ['topn', 'hold', 'stop', 'target', 'size'];
+    var defaults;
+    var ready = false, busy = false, submitting = false, timer, lastResult, limits = {};
+
+    function fillGrid() {
+      var grid = profile.value === 'drawdown' ? defaults.drawdown_grid : defaults.grid;
+      gridFields.forEach(function (field) {
+        document.getElementById('pitch-' + field).value = (grid[field] || [1]).map(function (value) {
+          return value == null ? 0 : value;
+        }).join(', ');
+      });
+    }
+
+    profile.addEventListener('change', fillGrid);
+
+    function readGrid() {
+      var grid = {};
+      gridFields.forEach(function (field) {
+        var input = document.getElementById('pitch-' + field);
+        var label = input.labels[0].textContent.trim();
+        var integer = field === 'topn' || field === 'hold';
+        var limit = field === 'size' ? 1 : limits[integer ? field + '_max' : 'atr_max'];
+        var values = input.value.trim().split(/[,，\s]+/).map(function (value) {
+          if (!/^(\d+(\.\d*)?|\.\d+)$/.test(value)) throw new Error(label + '请输入有效数字。');
+          var number = Number(value);
+          if (!Number.isFinite(number)) throw new Error(label + '请输入有效数字。');
+          if (integer && (!Number.isSafeInteger(number) || number < 1)) throw new Error(label + '请输入正整数。');
+          if (field === 'size' && number <= 0) throw new Error('仓位系数须大于 0。');
+          if (Number.isFinite(limit) && number > limit) throw new Error(label + '取值上限为 ' + limit + '。');
+          return number;
+        });
+        grid[field] = Array.from(new Set(values));
+      });
+      var combinations = gridFields.reduce(function (count, field) { return count * grid[field].length; }, 1);
+      if (profile.value === 'drawdown' && (grid.topn.length !== 1 || grid.hold.length !== 1)) {
+        throw new Error('基线回撤约束须固定一个 TopN 和持有期。');
+      }
+      if (combinations > limits.max_combinations) throw new Error('共 ' + combinations + ' 组参数，最多可扫描 ' + limits.max_combinations + ' 组。');
+      return grid;
+    }
+
+    function number(value) { return Number.isFinite(value) ? String(value) : '—'; }
+    function points(value) {
+      return Number.isFinite(value) ? (value > 0 ? '+' : '') + (value * 100).toFixed(2) + ' 个百分点' : '—';
+    }
+    function multiple(value) { return value ? number(value) + '×' : '关闭'; }
+    function range(window) { return escArchive(window.start) + ' 至 ' + escArchive(window.end); }
+
+    function renderScan(data) {
+      var dataKey = data && (data.generated_at || JSON.stringify(data));
+      if (!data || dataKey === lastResult) return;
+      var selected = data.selected || [];
+      var rows = [{ name: '基线', model: data.baseline }];
+      if (data.reference) rows.push({ name: '原持有方案', model: data.reference });
+      var groups = { size: '只调仓位', exit: '只调退出', both: '仓位与退出' };
+      rows = rows.concat(selected.map(function (model, index) {
+        var group = groups[model.group];
+        return { name: group ? '入围 ' + (index + 1) + ' · ' + group : '筛选第 ' + (index + 1) + ' 名', model: model };
+      }));
+      var table = '<div class="pitch-scroll"><table class="bt-stat pitch-table"><thead><tr>' +
+        '<th scope="col">组合</th><th scope="col">TopN</th><th scope="col">最长持有</th><th scope="col">止损</th><th scope="col">止盈</th><th scope="col">仓位系数</th>' +
+        '<th scope="col">筛选期年化</th><th scope="col">样本外年化</th><th scope="col">样本外最大回撤</th><th scope="col">样本外夏普</th>' +
+        '<th scope="col">样本外成交笔数</th><th scope="col">样本外最差 5% 平均</th></tr></thead><tbody>' +
+        rows.map(function (row) {
+          var p = row.model.params, train = row.model.train, test = row.model.test;
+          return '<tr><td>' + row.name + '</td><td>' + number(p.topn) + '</td><td>' + number(p.hold) + ' 日</td>' +
+            '<td>' + multiple(p.stop) + '</td><td>' + multiple(p.target) + '</td><td>' + pct(p.size == null ? 1 : p.size) + '</td><td>' + pct(train.annual_return) + '</td>' +
+            '<td><strong>' + pct(test.annual_return) + '</strong></td><td>' + pct(test.max_drawdown) + '</td><td>' +
+            (Number.isFinite(test.sharpe) ? test.sharpe.toFixed(2) : '—') + '</td><td>' + number(test.n_trades) + '</td><td>' + pct(test.tail) + '</td></tr>';
+        }).join('') + '</tbody></table></div>';
+      var details = rows.map(function (row, index) {
+        var model = row.model, edge = model.edge || {}, ci = edge.ci || [], years = model.years || [];
+        return '<details' + (index === (data.reference ? 2 : 1) ? ' open' : '') + '><summary>' + row.name + '的样本外分年表现</summary>' +
+          (index > 0 ? '<p class="mini">相对基线日收益差 ' + points(edge.mean) +
+          (ci.every(Number.isFinite) && ci.length === 2 ? '（95% 区间 ' + points(ci[0]) + ' 至 ' + points(ci[1]) + '）' : '') + '</p>' : '') +
+          '<div class="pitch-scroll"><table class="bt-stat pitch-table"><thead><tr><th scope="col">年份</th><th scope="col">区间净收益</th>' +
+          '<th scope="col">最大回撤</th><th scope="col">区间较基线差</th><th scope="col">成交笔数</th></tr></thead><tbody>' +
+          years.map(function (year) {
+            return '<tr><td>' + escArchive(year.year) + '</td><td>' + pct(year.total_return) + '</td><td>' + pct(year.max_drawdown) +
+              '</td><td>' + points(year.total_edge) + '</td><td>' + number(year.n_trades) + '</td></tr>';
+          }).join('') + '</tbody></table></div></details>';
+      }).join('');
+      var windows = data.windows;
+      result.innerHTML = '<h3>最近一次扫描结果</h3><p class="mini">网格 ' + number(data.candidate_count) + ' 组 · 回测 ' + number(data.evaluated_count || data.candidate_count) + ' 组 · ' + escArchive(data.objective) +
+        ' · ' + escArchive(data.generated_at) + '</p><p class="mini">筛选期信号 ' + range(windows.train) + ' · 样本外信号 ' + range(windows.test) +
+        ' · 行情截止 ' + escArchive(windows.test.execution_end) + '</p>' + (data.verdict ? '<p>' + escArchive(data.verdict) + '</p>' : '') + table + details +
+        (data.notes && data.notes.length ? '<details><summary>成交口径与数据范围</summary><ul class="mini">' + data.notes.map(function (note) {
+          return '<li>' + escArchive(note) + '</li>';
+        }).join('') + '</ul></details>' : '');
+      lastResult = dataKey;
+    }
+
+    function syncButton() {
+      button.disabled = !ready || busy || submitting;
+    }
+
+    function setJob(job) {
+      busy = !!job && ['queued', 'running'].includes(job.status);
+      if (busy) status.textContent = '正在扫描历史并验证入选组合。可以离开此页，完成后回来查看结果。';
+      else if (job && job.error) status.textContent = '扫描未完成 · ' + job.error;
+      else status.textContent = lastResult ? '最近一次扫描已完成' : '等待运行';
+      syncButton();
+    }
+
+    function queueRefresh(delay) {
+      clearTimeout(timer);
+      timer = setTimeout(refresh, delay);
+    }
+
+    function refresh() {
+      return LW.api.get(url, { bypass: true, retry: 0, staleFallback: false }).then(function (data) {
+        if (!data.ok) throw new Error(data.error || '未返回扫描状态');
+        if (!ready) {
+          trainStart.value = data.defaults.train_start;
+          testStart.value = data.defaults.test_start;
+          dataEnd.value = data.defaults.end || '';
+          defaults = data.defaults;
+          limits = defaults.limits || {};
+          profile.options[1].disabled = !defaults.drawdown_grid;
+          if (defaults.drawdown_grid && data.latest && data.latest.request.profile === 'drawdown') profile.value = 'drawdown';
+          fillGrid();
+          ready = true;
+        }
+        renderScan(data.latest);
+        setJob(data.job);
+        if (busy) queueRefresh(2500);
+      }).catch(function (error) {
+        status.textContent = '暂时无法读取扫描状态 · ' + error.message;
+        queueRefresh(5000);
+      });
+    }
+
+    form.onsubmit = function (event) {
+      event.preventDefault();
+      if (button.disabled) return;
+      var payload;
+      try {
+        if (trainStart.value >= testStart.value || (dataEnd.value && testStart.value >= dataEnd.value)) {
+          throw new Error('日期顺序应为筛选期开始、样本外开始、数据截止。');
+        }
+        payload = { train_start: trainStart.value, test_start: testStart.value, end: dataEnd.value || null, grid: readGrid(), profile: profile.value };
+      } catch (error) {
+        status.textContent = error.message;
+        return;
+      }
+      clearTimeout(timer);
+      submitting = true;
+      syncButton();
+      status.textContent = '正在提交扫描请求…';
+      fetch(url, {
+        method: 'POST', cache: 'no-store', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+      }).then(function (response) {
+        return response.json().then(function (data) {
+          if (response.status === 409 && data.job) return data.job;
+          if (!response.ok || !data.ok) throw new Error(data.error || 'HTTP ' + response.status);
+          return data.job;
+        });
+      }).then(function (job) {
+        submitting = false;
+        setJob(job);
+        refresh();
+      }).catch(function (error) {
+        submitting = false;
+        syncButton();
+        status.textContent = '无法提交扫描 · ' + error.message;
+      });
+    };
+    refresh();
+  })();
+
+  (function bindPitchForward() {
+    var status = document.getElementById('pitch-forward-status');
+    var comparison = document.getElementById('pitch-forward-comparison');
+    var money = new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY' });
+    var labels = {
+      not_started: '尚未启动',
+      waiting_data: '等待行情数据',
+      ready: '数据已就绪',
+      running: '运行中'
+    };
+
+    function amount(value) { return Number.isFinite(value) ? money.format(value) : '—'; }
+    function count(value) { return Number.isInteger(value) ? String(value) : '—'; }
+
+    function renderForward(data) {
+      if (!data || !data.ok) throw new Error((data && data.message) || '未返回模拟状态');
+      status.textContent = [labels[data.status], data.message].filter(Boolean).join(' · ');
+      var readiness = data.readiness || {};
+      var closeDate = readiness.close_date || readiness.date;
+      var next = data.next_signal;
+      var timing = [
+        data.start_session && '首个拟成交日 ' + data.start_session,
+        data.last_session && '最近结算 ' + data.last_session,
+        !data.last_session && data.start_session && '尚无已结算交易日',
+        closeDate && '已核验收盘数据 ' + closeDate,
+        Number.isInteger(readiness.covered_symbols) && Number.isInteger(readiness.expected_symbols)
+          && '行情覆盖 ' + readiness.covered_symbols + '/' + readiness.expected_symbols,
+        next && '已锁定 ' + next.trade_date + ' 信号' + (Number.isInteger(next.count) ? '（' + next.count + ' 只）' : '')
+      ].filter(Boolean);
+      var accounts = data.accounts || {};
+      var a = accounts.challenger, b = accounts.baseline;
+      var meta = timing.length ? '<p class="mini">' + escArchive(timing.join(' · ')) + '</p>' : '';
+      if (!a || !b) {
+        comparison.innerHTML = meta;
+        return;
+      }
+      var metrics = [
+        ['起始虚拟资金', 'initial_cash', amount],
+        ['扣费后账户净值', 'equity', amount],
+        ['扣费后累计收益', 'net_return', pct],
+        ['最大回撤', 'max_drawdown', pct],
+        ['模拟成交笔数', 'fills', count],
+        ['累计已扣交易费用', 'fees_paid', amount]
+      ];
+      var rows = metrics.map(function (metric) {
+        var key = metric[1], format = metric[2];
+        return '<tr><th scope="row">' + metric[0] + '</th><td>' + format(a[key]) + '</td><td>' + format(b[key]) + '</td></tr>';
+      });
+      var note = a.fills === 0 && b.fills === 0 ? '两个账户均暂无模拟成交。' : '';
+      comparison.innerHTML = meta + '<div class="pitch-scroll"><table class="bt-stat pitch-table"><thead><tr>' +
+        '<th scope="col">指标</th><th scope="col">' + escArchive(a.label) + '</th><th scope="col">' +
+        escArchive(b.label) + '</th></tr></thead><tbody>' + rows.join('') +
+        '</tbody></table></div><p class="mini">按交易日收盘结算。' + note + '</p>';
+    }
+
+    function refreshForward() {
+      LW.api.get('/api/live/pitch_forward', { bypass: true, staleFallback: false })
+        .then(renderForward).catch(function (error) {
+          status.textContent = '暂时无法读取前瞻模拟 · ' + error.message;
+        }).finally(function () { setTimeout(refreshForward, document.hidden ? 300000 : 60000); });
+    }
+    refreshForward();
+  })();
+
   /* ---------- 历史记录（只看最新 + 类型 + 有效/无效 + 关键词） ---------- */
   var latest = [], history = [], afLatest = false, afCat = '全部', afVerd = '全部', afKw = '';
   function catColor(c) { return c === '复刻' ? '#8b5cf6' : c === '因子' ? '#2d9cdb' : c === '策略' ? '#27ae60' : '#a1a1aa'; }
@@ -249,7 +548,8 @@
     var annC = a.annual_return >= 0 ? '#eb5757' : '#27ae60';
     var facs = (a.factors || []).slice(0, 5).map(function (f) { return '<span class="tag-st tag-dim" style="margin-left:4px">' + R._f(f) + '</span>'; }).join('');
     function fname(p) { return String(p || '').split(/[\\/]/).pop(); }
-    var btn = a.has_html
+    var sourceUrl=a.evidence_url?evidenceLink(a.evidence_url):null;
+    var btn = sourceUrl ? '<a class="v2-btn" href="'+escArchive(sourceUrl)+'" target="_blank" rel="noopener">查看研究来源</a>' : a.has_html
       ? '<a class="v2-btn" href="/dl/backtest_archive/' + encodeURIComponent(fname(a.html)) + '" target="_blank">打开报告</a>'
       : '<a class="v2-btn" style="background:#16161a;color:var(--navy)" href="/dl/backtest_archive/' + encodeURIComponent(fname(a.json)) + '" target="_blank">查看JSON</a>';
     var latestBadge = a.is_latest ? '<span class="vtag" style="background:rgba(94,106,210,.14);color:#8b5cf6">最新</span>' : '';
@@ -261,10 +561,11 @@
         '</span>' +
         '<span class="mini" style="opacity:.6">' + R._f(a.generated_at || '') + '</span></div>' +
       '<div class="mini" style="margin:6px 0 4px;color:#a1a1aa">' + facs + '</div>' +
-      '<div class="mini" style="margin:6px 0;color:#a1a1aa">年化 <b style="color:' + annC + '">' + ann + '</b> · 回撤 <b style="color:#27ae60">' + dd + '</b> · 夏普 <b>' + shp + '</b></div>' + btn + '</div>';
+      (a.kind==='research_evidence' && a.annual_return==null?'':'<div class="mini" style="margin:6px 0;color:#a1a1aa">年化 <b style="color:' + annC + '">' + ann + '</b> · 回撤 <b style="color:#27ae60">' + dd + '</b> · 夏普 <b>' + shp + '</b></div>') +
+      '<div class="mini" style="line-height:1.9;opacity:.7">'+escArchive(a.evidence_summary||'')+(a.source?'<br>来源：'+escArchive(a.source):'')+(a.limitations&&a.limitations.length?'<br>'+a.limitations.map(escArchive).join('；'):'')+'</div>'+btn+'</div>';
   }
   function renderArchive() {
-    var src = afLatest ? latest : history;
+    var src = afLatest ? latest : latest.concat(history);
     var kw = afKw.trim().toLowerCase();
     var list = src.filter(function (a) {
       var catOk = afCat === '全部' || a.category === afCat;
@@ -284,14 +585,14 @@
       history = (d && d.history) || [];
       var all = latest.concat(history);
       var cats = ['全部'].concat(Array.from(new Set(all.map(function (a) { return a.category; }))));
-      var verds = ['全部', '有效', '无效'];
-      document.getElementById('bt-count').textContent = '最新 ' + latest.length + ' · 历史 ' + history.length;
+      var verds = ['全部'].concat(Array.from(new Set(all.map(function(a){return a.verdict;}).filter(Boolean))));
+      document.getElementById('bt-count').textContent = '当前研究/最新 ' + latest.length + ' · 历史归档 ' + history.length + (d.reason?' · '+d.reason:'');
       document.getElementById('bt-filter').innerHTML =
         '<label class="mini" style="display:flex;align-items:center;gap:4px;cursor:pointer">' +
           '<input type="checkbox" id="bt-latest"> 只看最新</label>' +
         '<span class="mini">类型</span>' +
         '<select id="bt-cat" class="lf-btn" style="cursor:pointer">' + cats.map(function (c) { return '<option>' + c + '</option>'; }).join('') + '</select>' +
-        '<span class="mini">有效</span>' +
+        '<span class="mini">验证层级</span>' +
         '<select id="bt-verd" class="lf-btn" style="cursor:pointer">' + verds.map(function (c) { return '<option>' + c + '</option>'; }).join('') + '</select>' +
         '<input id="bt-kw" placeholder="搜索名称/标题/因子" style="flex:1;min-width:160px;padding:6px 10px;border:1px solid #2a2a30;border-radius:8px;font-size:12px;outline:none">';
       document.getElementById('bt-latest').onchange = function () { afLatest = this.checked; renderArchive(); };

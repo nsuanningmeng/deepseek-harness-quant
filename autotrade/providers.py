@@ -37,6 +37,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError("Tushare API redirects are not accepted")
 
 
+class TushareRequestError(ValueError):
+    """Expose a fixed failure category, never the provider's credential-bearing text."""
+    def __init__(self, endpoint, category):
+        self.category = category if category in {'permission_denied', 'outside_session', 'rate_limited',
+                                                  'authentication', 'api_error'} else 'api_error'
+        super().__init__(f'Tushare {endpoint} request failed; check permission/network/response')
+
+
 class TushareHttpClient:
     """官方HTTP请求格式、固定HTTPS主机，令牌不写日志且禁止重定向。"""
     def __init__(self, token, timeout=30, opener=None):
@@ -62,8 +70,21 @@ class TushareHttpClient:
                 if len(raw) > 8_000_000:
                     raise ValueError("API response too large")
                 result = json.loads(raw)
-            if not isinstance(result, dict) or result.get("code") != 0:
+            if not isinstance(result, dict):
                 raise ValueError("API permission or request failure")
+            if result.get('code') != 0:
+                message = str(result.get('msg', ''))
+                if re.search(r'token|凭证|认证', message, re.I):
+                    category = 'authentication'
+                elif re.search(r'权限|未开通|未购买|permission', message, re.I):
+                    category = 'permission_denied'
+                elif re.search(r'频率|限频|每分钟|rate.limit', message, re.I):
+                    category = 'rate_limited'
+                elif re.search(r'交易时间|交易时段|休市|开盘', message):
+                    category = 'outside_session'
+                else:
+                    category = 'api_error'
+                raise TushareRequestError(endpoint, category)
             data = result["data"]
             columns, values = data["fields"], data["items"]
             if (not isinstance(columns, list) or any(not isinstance(c, str) for c in columns)
@@ -71,6 +92,8 @@ class TushareHttpClient:
                     or any(not isinstance(row, list) or len(row) != len(columns) for row in values)):
                 raise ValueError("invalid API response shape")
             return Records(columns, [dict(zip(columns, row)) for row in values])
+        except TushareRequestError:
+            raise
         except Exception:
             raise ValueError(f"Tushare {endpoint} request failed; check permission/network/response") from None
 

@@ -22,8 +22,9 @@ except Exception:
 
 import sys
 import json
+import math
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
@@ -45,17 +46,35 @@ def _read(p):
         return None
 
 
-def _trade_date():
-    """★#336 日报数据日：用 latest_trade_date（数据日）而非系统日期——
-    避免"当日收盘数据未到位就组出当日日报"的错位（数据日门槛 ≥4000 只完整性）"""
+def _trade_date(core_cfg=None, *, now=None):
+    """Use the official bootstrap's completed date without rescanning bar tables."""
+    from data.research_bootstrap import TZ, validate_close_cutoff
+    if core_cfg is None:
+        from data.research_bootstrap import load_config
+        core_cfg = load_config()
+    now = now or datetime.now(TZ)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError('日报日期核验需要带时区的真实时间')
+    now = now.astimezone(TZ)
+    cutoff = validate_close_cutoff(core_cfg.get('completed_session_cutoff', '18:00'))
+    eligible_end = (now.date() if now.strftime('%H:%M') >= cutoff else now.date() - timedelta(days=1)).isoformat()
+    manifest = _read(Path(core_cfg['runtime_dir'])/'bootstrap-manifest.json') or {}
+    candidate = (manifest.get('coverage', {}).get('daily') or {}).get('end')
+    checkpoint = (manifest.get('completed') or {}).get('daily:' + str(candidate)) or {}
     try:
-        from data.cache import DailyCache
-        d = DailyCache().latest_trade_date()
-        if d:
-            return str(d)
-    except Exception:
+        valid_date = datetime.strptime(candidate, '%Y-%m-%d').strftime('%Y-%m-%d') == candidate
+        valid = (valid_date and candidate <= eligible_end and manifest.get('source') == 'tushare-official'
+                 and manifest.get('target_end') == candidate
+                 and all(manifest.get('stages', {}).get(stage) == 'complete'
+                         and manifest.get('stage_dates', {}).get(stage) == candidate
+                         for stage in ('daily', 'finance', 'assets'))
+                 and type(checkpoint.get('rows')) is int
+                 and checkpoint['rows'] >= core_cfg['min_daily_rows'])
+        if valid:
+            return candidate
+    except (TypeError, ValueError, KeyError):
         pass
-    return datetime.now().strftime("%Y-%m-%d")
+    raise ValueError('日报没有同日完整验收的官方研究行情，不能使用系统日期或未验证缓存代替')
 
 
 def load_timing():
@@ -97,6 +116,78 @@ def load_factor_live():
     return {f.get("factor"): f for f in (d.get("factor_perf_top") or [])}
 
 
+def load_market_crowding(date, cfg=None):
+    """Use the same dated market-turnover percentile as the factor dashboard.
+
+    The legacy knowledge-base crowd_pctile can be an average of individual
+    factor ranks. It is not a substitute for this market statistic.
+    """
+    if cfg is None:
+        from data.research_factors import load_config
+        cfg = load_config()
+    output = Path(cfg['output_dir'])
+    if not output.is_absolute():
+        output = BASE / output
+    data = _read(output / f'crowding_{date}.json') or {}
+    value = data.get('crowding_pctile_252')
+    if data.get('ok') is not True or data.get('data_date') != date or isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        return None
+    sessions = cfg['crowding_sessions']
+    if data.get('n_history_sessions') != sessions:
+        return None
+    return {'percent': value, 'sessions': sessions, 'turnover_window': cfg['turnover_window']}
+
+
+def report_data_status_lines():
+    """Describe saved receipts and selected sources, never certify live readiness.
+
+    This runs inside the research pipeline lock. Only the selected worker's
+    lightweight metadata is read; the unified deep verifier remains independent.
+    """
+    lines = []
+    try:
+        from data.minute_readiness import selected_service
+        module = selected_service()
+        cfg = module.load_config()
+        status = module.public_status(cfg)
+        label = {'baostock': 'BaoStock', 'tushare': 'Tushare'}.get(cfg.get('provider', 'tushare'), '所选分钟源')
+        if any(str(source).startswith('sina:') for source in status.get('sources', [])):
+            label += '（含新浪分钟数据修补）'
+        done, total = status.get('completed_symbols'), status.get('expected_symbols')
+        if (status.get('database_path') and type(done) is int and type(total) is int
+                and 0 <= done <= total and total > 0 and status.get('start_date') and status.get('target_date')):
+            lines.append(f"- 历史5分钟来源：{label}；生成时下载回执 {done}/{total} 只，窗口 {status['start_date']} 至 {status['target_date']}。")
+        else:
+            lines.append(f'- 历史5分钟来源：{label}；生成时暂无可核对的下载回执。')
+    except (OSError, ValueError, KeyError, TypeError):
+        lines.append('- 生成时分钟来源或下载回执暂不可读。')
+    lines.append('- 下载回执数量不等于当前窗口已通过完整核验；完整核验与补齐进度见[数据页](/data)。')
+    try:
+        from paperlive.config import load_config
+        market = load_config()['market']
+        lines.append(f"- 当前配置的盘口来源：{market.get('source_label') or market['provider']}。静态日报不判定实时可交易性，请查看[实时模拟盘](/paperlive)。")
+        # A previous rt_k failure says nothing about a selected Tencent feed.
+        if market['provider'] == 'tushare':
+            probe = _read(BASE/'runtime/research/rt-permission-verification.json') or {}
+            if probe.get('endpoint') == 'rt_k' and type(probe.get('ok')) is bool and probe.get('checked_at'):
+                try:
+                    stamp = datetime.fromisoformat(probe['checked_at']).isoformat()
+                except (TypeError, ValueError):
+                    stamp = None
+                if stamp:
+                    result = '通过' if probe['ok'] else '未通过'
+                    lines.append(f'- Tushare rt_k 历史权限探测：{stamp} {result}；仅代表当次探测，不代表当前盘口可交易。')
+    except (OSError, ValueError, KeyError, TypeError):
+        lines.append('- 生成时盘口来源配置暂不可读；当前状态见[实时模拟盘](/paperlive)。')
+    return lines
+
+
 def _load_bars_1y(codes):
     """只读取候选近 1 年日线（牛散纪律用：当日/3日/一年涨幅）——尽力而为，失败返回 {}
     ★2026-08-13 超级牛散谨慎化：不追高（当日>7%/3日>15%）/ 涨多不看多（一年>150%）硬纪律"""
@@ -104,7 +195,9 @@ def _load_bars_1y(codes):
         from data.cache import DailyCache
         dc = DailyCache()
         # ★返回 {code.upper(): DataFrame(日期升序)}——dict of DataFrame，非 rows
-        data = dc.get_daily_batch(list(codes), start="2025-08-01")
+        asof = _trade_date()
+        start = (datetime.fromisoformat(asof) - timedelta(days=400)).date().isoformat()
+        data = dc.get_daily_batch(list(codes), start=start, end=asof)
         out = {}
         for code, df in data.items():
             if df is None or df.empty:
@@ -119,7 +212,9 @@ def _discipline(code, bars):
     """牛散纪律检查：返回 None（通过）或降级理由（触发纪律 → 不进池，日报标注观察）"""
     closes = bars.get(code)
     if not closes or len(closes) < 5:
-        return None  # 无行情/数据不足 → 不误杀（尽力而为）
+        return '近期行情不足，无法完成纪律检查，暂列观察'
+    if max(closes) != _trade_date():
+        return '个股行情未更新至本次数据日，暂列观察'
     ds = sorted(closes)
     last = closes[ds[-1]]
     pre = closes[ds[-2]]
@@ -245,6 +340,9 @@ def build_report(date, timing, picks, skip_reason, pitch_es, tech_es, dry_run):
     kb = _read(REPORT / "market_kb_dump.json") or {}
     md = (kb.get("market_daily_recent") or [{}])[0]
     fperf = kb.get("factor_perf_top") or []
+    crowd = load_market_crowding(date)
+    crowd_text = (f"{crowd['percent']:.1f}%（{crowd['turnover_window']}日平均换手的{crowd['sessions']}日历史分位）"
+                  if crowd else '尚无同日可验证数值')
 
     def _fmt_regime(rg):
         # ★#332 分 Regime 情景赔率（牛/震荡/熊 各胜率/均收益，1y 口径）
@@ -273,15 +371,15 @@ def build_report(date, timing, picks, skip_reason, pitch_es, tech_es, dry_run):
 
     lines = []
     lines.append(f"# DeepSeek HARNESS Quant日报 {date}")
-    lines.append(f"> 生成 {datetime.now():%Y-%m-%d %H:%M:%S} · {'干跑(未写池)' if dry_run else '已自动执行'}")
+    lines.append(f"> 生成 {datetime.now():%Y-%m-%d %H:%M:%S} · {'仅生成研究报告，未下单' if dry_run else '已更新观察池，未下单'}")
     lines.append("")
     lines.append("## 一、市场环境")
     d = timing["dims"]
     lines.append(f"- 择时：**{timing['level']} {timing['score']} 分** | 政策 {d.get('政策')} / 宏观 {d.get('宏观')} / 情绪 {d.get('情绪')} / 宽度 {d.get('宽度')}")
-    lines.append(f"- 宽度：涨 {md.get('n_up')} / 跌 {md.get('n_down')} | 成交额 {md.get('turnover_亿')} 亿 | 拥挤度分位 {md.get('crowd_pctile')}")
+    lines.append(f"- 宽度：涨 {md.get('n_up')} / 跌 {md.get('n_down')} | 成交额 {md.get('turnover_亿')} 亿 | 市场拥挤度 {crowd_text}")
     lines.append(f"- 择时理由：{str(timing['reason'])[:150]}")
     lines.append("")
-    lines.append("## 二、自动选股（超级牛散 · 宁缺毋滥 · 0-5 只，不硬凑）")
+    lines.append("## 二、当日研究筛选")
     if picks:
         for p in picks:
             if p.get("neg_live_factors") and p.get("raw_score") and p["raw_score"] >= 85:
@@ -296,7 +394,7 @@ def build_report(date, timing, picks, skip_reason, pitch_es, tech_es, dry_run):
             up = f"{p['upside_est']}%" if p.get("upside_est") is not None else "—"
             mech = p.get("mechanism") or ""
             sp = p.get("stop_plan") or ""
-            lines.append(f"  · 机制 {mech[:44]} · 胜率 {wr} 上行 {up} · 风控 {p.get('risk_level','—')}" + (f" · 止损 {sp[:36]}" if sp else ""))
+            lines.append(f"  · 机制 {mech} · 同类历史胜率 {wr} 规则估值空间 {up} · 风控 {p.get('risk_level','—')}" + (f" · 止损 {sp}" if sp else ""))
             # ★#332 因子归因 + 分 Regime 情景赔率（对齐决策页三问密度）
             fac_txt = _fmt_fac(p)
             if fac_txt:
@@ -317,7 +415,7 @@ def build_report(date, timing, picks, skip_reason, pitch_es, tech_es, dry_run):
         sp = (c.get("stop_plan") or {}).get("desc") or ""
         wr = f"{c['winrate_est']*100:.0f}%" if c.get("winrate_est") is not None else "—"
         up = f"{c['upside_est']}%" if c.get("upside_est") is not None else "—"
-        lines.append(f"  · 机制 {mech[:44]} · 胜率 {wr} 上行 {up} · 风控 {c.get('risk_level','—')}" + (f" · 止损 {sp[:36]}" if sp else ""))
+        lines.append(f"  · 机制 {mech} · 同类历史胜率 {wr} 规则估值空间 {up} · 风控 {c.get('risk_level','—')}" + (f" · 止损 {sp}" if sp else ""))
         # ★#332 因子归因 + 分 Regime 情景赔率（对齐决策页三问密度）
         facs = c.get("factors") or {}
         fam = c.get("signal_family") or ""
@@ -335,7 +433,7 @@ def build_report(date, timing, picks, skip_reason, pitch_es, tech_es, dry_run):
     if tech_es:
         for t in sorted(tech_es, key=lambda x: -(x.get("score") or 0)):
             td = t.get("add_date") or ""
-            lines.append(f"- {t.get('code')} {t.get('name')} | {t.get('otype_name') or t.get('otype')} | score {t.get('score')}" + (f" | Pitch {td}" if td else ""))
+            lines.append(f"- {t.get('code')} {t.get('name')} | {t.get('otype_name') or t.get('otype')} | score {t.get('score'):.1f}" + (f" | Pitch {td}" if td else ""))
             mech = t.get("mechanism") or ""
             if mech:
                 lines.append(f"  · 机制 {mech[:44]}")
@@ -345,7 +443,7 @@ def build_report(date, timing, picks, skip_reason, pitch_es, tech_es, dry_run):
             sp = t.get("stop_plan") or {}
             stop_parts = []
             if sp.get("atr_stop"):
-                stop_parts.append(f"ATR 止损 {sp['atr_stop']}")
+                stop_parts.append(f"ATR 观察线 {sp['atr_stop']:.2f}")
             if sp.get("stop_loss_pct") is not None:
                 stop_parts.append(f"硬止损 {sp['stop_loss_pct']*100:.0f}%")
             if t.get("risk_level"):
@@ -358,10 +456,17 @@ def build_report(date, timing, picks, skip_reason, pitch_es, tech_es, dry_run):
     lines.append("## 五、池状态")
     lines.append(f"- 机会池 {md.get('n_opp')} / Pitch {md.get('n_pitch')} / 短线 {md.get('n_tech')}")
     lines.append("")
-    lines.append("## 六、因子实测 Top（回测-实盘对照）")
+    lines.append("## 六、因子前向观察")
+    if not fperf:
+        lines.append('- 已初始化前向观察，尚无到期样本；不把历史回测冒充实盘收益。')
     for f in fperf[:5]:
         t1 = f"{f.get('t1_avg')*100:+.2f}%" if f.get("t1_avg") is not None else "—"
         lines.append(f"- {f.get('factor')}：pitch {f.get('n_pitch')} 次 | T+1 {t1}")
+    lines.extend(['', '## 七、研究口径与数据状态',
+        '- 股票研究使用当前沪深300成分股回看历史，存在成分股选择偏差；历史胜率不是个股未来上涨概率，规则估值空间不是经校准的收益预测。',
+        '- 换手类研究从2019年起；交易检验按下一交易日开盘及可成交条件处理，各模块成本假设保留在对应产物中；历史印花税税率变化未分段还原。',
+        '- 短线规则尚未校准，仅供观察；前向收益从本次真实登记日开始积累，未到期值保持空缺。'])
+    lines.extend(report_data_status_lines())
     report = REPORT / f"daily_report_{date}.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     return report
@@ -370,7 +475,12 @@ def build_report(date, timing, picks, skip_reason, pitch_es, tech_es, dry_run):
 def main():
     dry_run = "--dry-run" in sys.argv
     date = _trade_date()   # ★#336 数据日（非系统日期）
+    kb = _read(REPORT / 'market_kb_dump.json') or {}
+    if kb.get('data_date') != date:
+        raise ValueError('市场知识库与日报数据日期不一致')
     timing = load_timing()
+    if timing.get('score') is None:
+        raise ValueError('择时尚未就绪，不能生成完整日报')
     pitch_es = load_pitch_long()
     tech_es = load_tech()
     picks, skip_reason = auto_pick(timing, pitch_es, dry_run)

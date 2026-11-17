@@ -2,6 +2,52 @@
 // 来源：dsqq-1 动态插件 v13（牛散 persona 接入 + 会话/聊天桥接）
 // 部署：由 DSH_HOME/profiles/web/cordis.patch.yml 挂载为宿主组合插件行
 // inject：声明硬依赖，cordis 在 webServer 等服务就绪后才 apply（避免提前 return 导致路由不注册）
+const fs = require('node:fs')
+const path = require('node:path')
+const yaml = require('yaml')
+const PROJECT_ROOT = path.resolve(__dirname, '../../../../..')
+const CONFIG_ROOT = path.join(PROJECT_ROOT, 'config')
+const CATALOG_FILE = path.join(CONFIG_ROOT, 'niu_personas.yaml')
+
+function readYaml(filename, exampleFallback) {
+  const selected = exampleFallback && !fs.existsSync(filename) ? filename + '.example' : filename
+  const value = yaml.parse(fs.readFileSync(selected, 'utf8'))
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid configuration')
+  return value
+}
+
+function readPersonaCatalog() {
+  const config = readYaml(CATALOG_FILE, true)
+  if (config.schema_version !== 1 || !Array.isArray(config.personas) || !config.personas.length) throw new Error('invalid persona catalog')
+  const catalog = Object.create(null)
+  for (const item of config.personas) {
+    if (!item || typeof item.id !== 'string' || !/^[a-z][a-z0-9_]*$/.test(item.id) || catalog[item.id] ||
+        !['name', 'tag', 'style'].every(k => typeof item[k] === 'string' && item[k].trim()) ||
+        (item.skill !== undefined && typeof item.skill !== 'string')) throw new Error('invalid persona definition')
+    catalog[item.id] = { ...item, key: item.id }
+  }
+  return catalog
+}
+
+function configuredPaperRoles(catalog) {
+  try {
+    const paper = readYaml(path.join(CONFIG_ROOT, 'paperlive.yaml'), true)
+    if (!paper.council || paper.council.enabled !== true) return { configured: false, roles: {} }
+    const filename = path.resolve(PROJECT_ROOT, String(paper.council.config_file || ''))
+    if (!filename.startsWith(CONFIG_ROOT + path.sep)) throw new Error('invalid council configuration path')
+    const council = readYaml(filename, true)
+    if (council.enabled !== true) return { configured: false, roles: {} }
+    if (council.schema_version !== 1) throw new Error('invalid council version')
+    if (path.resolve(PROJECT_ROOT, String(council.catalog_file || '')) !== CATALOG_FILE ||
+        !catalog[council.analyst_id] || !catalog[council.reviewer_id] || council.analyst_id === council.reviewer_id) {
+      throw new Error('invalid council roles')
+    }
+    return { configured: true, roles: { [council.analyst_id]: 'analyst', [council.reviewer_id]: 'reviewer' } }
+  } catch (error) {
+    return { configured: false, roles: {}, error: '模拟盘角色配置暂不可读，请查看实时模拟盘状态' }
+  }
+}
+
 module.exports = {
   inject: ['webServer', 'sessions', 'agents', 'subagents', 'sessionTitle', 'sessionPersistence'],
   apply(ctx) {
@@ -22,6 +68,12 @@ module.exports = {
     function json(res, code, obj) {
       res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify(obj))
+    }
+    function requireMethod(req, res, method) {
+      if (req.method === method) return true
+      res.setHeader('Allow', method + ', OPTIONS')
+      json(res, 405, { ok: false, error: 'method not allowed' })
+      return false
     }
     async function readBody(req) {
       let body = ''
@@ -174,15 +226,7 @@ module.exports = {
         + '5. 决策结构化输出（必须遵守）：在回复【最后一行】输出一个纯 JSON 对象（不要 markdown 代码块），格式：{"niu_decisions":[{"code":"600519.SH","action":"buy","priority":"high","reason_short":"垄断成瘾质量"}]}。action 限 buy/hold/sell/watch；priority 限 high/mid/low；reason_short ≤15 字；只包含你在 Pitch 卡与当前持仓范围内明确给出的决策；本轮没有明确决策就输出 {"niu_decisions":[]}。\n'
         + '【约束】不调用任何工具、不读取文件、不联网——只基于对话中给出的数据作答。'
     }
-    const PERSONAS = {
-      linyuan: { key: 'linyuan', name: '林园', tag: '价值·集中', skill: 'niu-san-linyuan', style: '价值投资派：长线集中持有，偏好消费医药与垄断/成瘾性生意，高 ROE 高毛利，回调加仓（"被套=机会"），熊市布局。选股视角：高分卡中优先质量/垄断/现金流健康者；纯题材高评分卡不是你的菜；回调充分的优质卡你愿意越跌越买，但仍须守住卡上止损与离场规则。' },
-      fengliu: { key: 'fengliu', name: '冯柳', tag: '逆向·弱者体系', skill: 'niu-san-fengliu', style: '机构价值派"弱者体系"（高毅资产）：不预测市场、不预判拐点，只做能看懂且赔率足够高的机会；逆向布局、集中持股、逻辑先行（逻辑破坏即走）。选股视角：优先"低关注/低预期/深回撤但质量未坏"的高赔率标的；对已高关注、高热度的高分卡谨慎（人多的地方不去）；胜率不是第一变量，赔率与逻辑完整度优先；牢记抄作业陷阱（季报披露滞后）。' },
-      chaoguyangjia: { key: 'chaoguyangjia', name: '炒股养家', tag: '情绪周期·龙头', skill: 'niu-san-chaoguyangjia', style: '情绪周期派游资：冰点→启动→发酵→高潮→衰退分阶段定仓位，买在分歧、卖在一致，只做最强题材最强龙头。选股视角：识别题材/情绪阶段与龙头；"分歧转一致"形态的卡优先。但你必须承认：情绪聚合择时已实证证伪——你的情绪判断只能作为加减分项，不得替代量化评分；心法多为社区流传未核实，切勿神化。' },
-      chenxiaoqun: { key: 'chenxiaoqun', name: '陈小群', tag: '题材接力·排雷', skill: 'niu-san-chenxiaoqun', style: '游资席位派（银河证券大连黄河路）：题材驱动、人气接力、连板逻辑、快进快出，题材热度=第一驱动。选股视角：按题材热度与人气排序；但游资大额净买已实证为稳定负超额——你的核心价值是排雷：标出哪些高分卡实为情绪炒作/跟风盘，坚决反对追高；宁可错过，不接盘。' },
-      zhangmengzhu: { key: 'zhangmengzhu', name: '章盟主', tag: '大资金·龙头', skill: 'niu-san-zhangmengzhu', style: '游资大资金+牛散双属性（章建平）：景气主线权重龙头大额抢筹、关键位置封板、长短结合。选股视角：优先流动性好、景气主线、权重龙头（大资金容量与进出方便）；敢于重仓的前提是卡上风险可控；牢记监管处罚与"爆赚58亿"辟谣反例——传说不可信，只看数据与纪律，止损严格执行。' },
-      zhaolaoge: { key: 'zhaolaoge', name: '赵老哥', tag: '打板·情绪参考', skill: 'niu-san-zhaolaoge', style: '打板/妖股派游资：追涨停、题材龙头接力、快进快出、吃情绪溢价。选股视角：只看最强的打板/妖股候选，博弈情绪溢价；但打板族组合层已多次证伪、"八年一万倍"无法核实——你的打板视角仅作情绪参考，绝不把打板逻辑当成买入引擎；宁可错过妖股，不参与接力高位。' },
-      methodology: { key: 'methodology', name: '方法论·牛散蒸馏', tag: '防造神质检', skill: 'niu-san-distillation', style: '牛散蒸馏方法论分析师（总览框架）：用批判框架审视任何"牛散信号"——信息滞后、造神机制、幸存者偏差三重风险；把牛散行为转成可验证因子假设，过验证链才有效。选股视角：审查每张高分卡是否存在"造神污染"：媒体热度≠alpha、游资席位净买=负超额、披露滞后已定价。输出每卡排雷结论（✅可参考 / 🟡观察 / ❌排雷）+ 可转因子假设；你不做买入推荐，你做"防造神质检"。' }
-    }
+
 
     const personaChild = {}
     const personaSnap = {}
@@ -190,7 +234,7 @@ module.exports = {
     const niuBootLock = {}
 
     function fakeSignal() {
-      return { aborted: false, reason: undefined, onabort: null, addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () { return true }, throwIfAborted: function () {} }
+      return new AbortController().signal
     }
     async function discoverNiuChildren() {
       const out = {}
@@ -208,7 +252,7 @@ module.exports = {
       }
       return out
     }
-    function ensureNiuChild(key, snapshot) {
+    function ensureNiuChild(key, snapshot, definition) {
       if (personaChild[key]) return Promise.resolve(personaChild[key])
       if (niuBootLock[key]) return niuBootLock[key]
       niuBootLock[key] = (async function () {
@@ -219,7 +263,7 @@ module.exports = {
             if (snapshot) personaSnap[key] = snapshot
             return personaChild[key]
           }
-          const p = PERSONAS[key]
+          const p = definition
           const rootId = defaultAgentId()
           const rootAgent = rootId ? agents.get(rootId) : null
           if (!subagents || !rootAgent) return null
@@ -257,6 +301,7 @@ module.exports = {
       handler: async (req, res) => {
         cors(res)
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+        if (!requireMethod(req, res, 'GET')) return
         try {
           const roots = agents ? agents.roots() : []
           const list = []
@@ -269,13 +314,17 @@ module.exports = {
             list.push({
               id: id,
               title: sessionTitleOf(id) || ('会话 ' + (idx + 1)),
-              preview: last ? last.text : '',
+              preview: last ? last.text : '空会话，尚无消息',
+              empty: !last,
               role: last ? last.role : '',
               ts: Date.now(),
+              busy: a.status === 'running',
               current: idx === 0
             })
           }
-          json(res, 200, { ok: true, sessions: list })
+          json(res, 200, { ok: true, sessions: list, requiresSession: list.length === 0,
+            capabilities: { chat: true, sessionManagement: false },
+            createSessionUrl: 'http://127.0.0.1:3080/' })
         } catch (e) { json(res, 500, { ok: false, error: String((e && e.message) || e).slice(0, 200) }) }
       }
     }))
@@ -285,11 +334,14 @@ module.exports = {
       handler: async (req, res) => {
         cors(res)
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+        if (!requireMethod(req, res, 'GET')) return
         try {
           const found = await discoverNiuChildren()
+          const personas = readPersonaCatalog()
+          const paperCouncil = configuredPaperRoles(personas)
           const catalog = []
-          for (const k of Object.keys(PERSONAS)) {
-            const p = PERSONAS[k]
+          for (const k of Object.keys(personas)) {
+            const p = personas[k]
             const childId = personaChild[k] || found[k] || null
             let preview = ''
             if (childId) {
@@ -297,9 +349,9 @@ module.exports = {
               const last = recentTextOf(msgs.messages)
               preview = last ? last.text : ''
             }
-            catalog.push({ id: k, name: p.name, tag: p.tag, skill: p.skill, childId: childId, preview: preview })
+            catalog.push({ id: k, name: p.name, tag: p.tag, skill: p.skill, childId: childId, preview: preview, paper_decision_role: paperCouncil.roles[k] || null })
           }
-          json(res, 200, { ok: true, personas: catalog })
+          json(res, 200, { ok: true, personas: catalog, paper_council: { configured: paperCouncil.configured, error: paperCouncil.error || null } })
         } catch (e) { json(res, 500, { ok: false, error: String((e && e.message) || e).slice(0, 200) }) }
       }
     }))
@@ -309,6 +361,7 @@ module.exports = {
       handler: async (req, res) => {
         cors(res)
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+        if (!requireMethod(req, res, 'POST')) return
         let key = '', text = '', snapshot = ''
         try {
           const payload = JSON.parse((await readBody(req)) || '{}')
@@ -316,12 +369,15 @@ module.exports = {
           text = String(payload.text || '').trim()
           if (payload.snapshot) snapshot = String(payload.snapshot)
         } catch (e) { json(res, 400, { ok: false, error: 'bad json' }); return }
-        const p = PERSONAS[key]
+        let personas
+        try { personas = readPersonaCatalog() } catch (error) { json(res, 500, { ok: false, error: '角色目录暂不可读，请检查本机配置' }); return }
+        const p = personas[key]
         if (!p) { json(res, 404, { ok: false, error: 'unknown persona: ' + key }); return }
         if (!text) { json(res, 400, { ok: false, error: 'empty text' }); return }
+        if (!defaultAgentId()) { json(res, 409, { ok: false, error: '请先在 HARNESS 原生界面新建根会话', requiresSession: true }); return }
         try {
           const existed = !!personaChild[key]
-          const childId = await ensureNiuChild(key, snapshot || personaSnap[key] || '')
+          const childId = await ensureNiuChild(key, snapshot || personaSnap[key] || '', p)
           if (!childId) { json(res, 500, { ok: false, error: '牛散子代理创建失败（subagents 不可用？）', persona: key }); return }
           const rootId = defaultAgentId()
           const rootAgent = rootId ? agents.get(rootId) : null
@@ -329,7 +385,7 @@ module.exports = {
           let content = text
           if (existed) {
             if (snapshot) personaSnap[key] = snapshot
-            const extra = personaSnap[key] ? '\n\n【量化 Pitch 快照（最新）】\n' + personaSnap[key] : ''
+            let extra = personaSnap[key] ? '\n\n【量化 Pitch 快照（最新）】\n' + personaSnap[key] : ''
             if (!personaHinted[key]) {
               personaHinted[key] = true
               extra += '\n\n（系统提醒：请在你的回复最后一行输出纯 JSON 决策对象 {"niu_decisions":[...]}，action 限 buy/hold/sell/watch）'
@@ -348,10 +404,11 @@ module.exports = {
       handler: async (req, res) => {
         cors(res)
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+        if (!requireMethod(req, res, 'GET')) return
         try {
           const q = parseQuery(req.url)
           const key = String(q.persona || '').trim()
-          if (!PERSONAS[key]) { json(res, 404, { ok: false, error: 'unknown persona: ' + key }); return }
+          if (!readPersonaCatalog()[key]) { json(res, 404, { ok: false, error: 'unknown persona: ' + key }); return }
           let childId = personaChild[key]
           if (!childId) {
             const found = await discoverNiuChildren()
@@ -371,6 +428,7 @@ module.exports = {
       handler: async (req, res) => {
         cors(res)
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+        if (!requireMethod(req, res, 'POST')) return
         let text = '', sessionId = null
         try {
           const payload = JSON.parse((await readBody(req)) || '{}')
@@ -380,8 +438,9 @@ module.exports = {
         if (!text) { json(res, 400, { ok: false, error: 'empty text' }); return }
         try {
           const agent = resolveAgent(sessionId)
-          if (!agent) { json(res, 404, { ok: false, error: 'no agent', sessionId: sessionId || defaultAgentId() }); return }
-          const message = { role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' }, ts: Date.now() }
+          if (!agent) { json(res, 409, { ok: false, error: '请先在 HARNESS 原生界面新建根会话', requiresSession: true, sessionId: sessionId || defaultAgentId() }); return }
+          const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
+          const message = createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } })
           if (typeof agent.followup === 'function') agent.followup(message)
           else if (typeof agent.steer === 'function') agent.steer(message)
           else { json(res, 500, { ok: false, error: 'no followup/steer' }); return }
@@ -395,12 +454,15 @@ module.exports = {
       handler: async (req, res) => {
         cors(res)
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+        if (!requireMethod(req, res, 'GET')) return
         try {
           const q = parseQuery(req.url)
           const sessionId = q.sessionId || defaultAgentId()
+          if (!sessionId) { json(res, 200, { ok: true, sessionId: null, messages: [], busy: false, requiresSession: true }); return }
           const limit = Math.max(1, Math.min(50, parseInt(q.limit || '20', 10) || 20))
           const r = await messagesOf(sessionId, limit)
-          json(res, 200, { ok: true, sessionId: sessionId, messages: r.messages })
+          const agent = resolveAgent(sessionId)
+          json(res, 200, { ok: true, sessionId: sessionId, messages: r.messages, busy: !!agent && agent.status === 'running' })
         } catch (e) { json(res, 500, { ok: false, error: String((e && e.message) || e).slice(0, 200) }) }
       }
     }))
@@ -410,6 +472,7 @@ module.exports = {
       handler: async (req, res) => {
         cors(res)
         if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return }
+        if (!requireMethod(req, res, 'GET')) return
         try {
           const roots = agents ? agents.roots() : []
           json(res, 200, { ok: true, rootIds: roots.map(function (a) { return a && a.id ? String(a.id) : null }).filter(Boolean), ts: Date.now() })

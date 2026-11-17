@@ -18,6 +18,10 @@
 import argparse
 import os
 import sqlite3
+import math
+import re
+import io
+import json
 import ssl
 import sys
 import urllib.request
@@ -27,9 +31,11 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE))
 
-POLICY_DIR = BASE / "data" / "cache" / "policy"
+from data.cache import CACHE_DIR
+POLICY_DIR = CACHE_DIR / "policy"
 DB_PATH = POLICY_DIR / "epu.db"
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=CHNMAINLANDEPU"
+PUBLISHER_URL = "https://www.policyuncertainty.com/media/China_Mainland_Paper_EPU.xlsx"
 HL_FILES = {
     "epu_hl": "epu_hl_monthly.xlsx",
     "epu_hl_policy": "epu_hl_policy.xlsx",
@@ -41,8 +47,6 @@ def _ctx():
     global _CTX
     if _CTX is None:
         _CTX = ssl.create_default_context()
-        _CTX.check_hostname = False
-        _CTX.verify_mode = ssl.CERT_NONE
     return _CTX
 
 
@@ -74,8 +78,36 @@ def load_fred() -> list:
             v = float(parts[1])
         except ValueError:
             continue
-        rows.append((d, v))
+        if re.fullmatch(r'\d{4}-\d{2}', d) and math.isfinite(v) and v >= 0:
+            rows.append((d, v))
+    if len(rows) < 36:
+        raise ValueError('EPU 数据下载不完整，未发布成功状态')
     return rows
+
+
+def load_publisher() -> list:
+    """The original Davis-Liu-Sheng series behind FRED CHNMAINLANDEPU."""
+    import pandas as pd
+    raw = _download(PUBLISHER_URL)
+    book = pd.ExcelFile(io.BytesIO(raw))
+    rows = {}
+    for name in book.sheet_names:
+        if not name.startswith('EPU '):
+            continue
+        frame = pd.read_excel(book, sheet_name=name)
+        if not {'year', 'month', 'EPU'} <= set(frame.columns):
+            raise ValueError('EPU publisher schema changed')
+        for row in frame.to_dict('records'):
+            try:
+                month = f"{int(row['year']):04d}-{int(row['month']):02d}"
+                value = float(row['EPU'])
+            except (ValueError, TypeError):
+                continue
+            if 1 <= int(row['month']) <= 12 and math.isfinite(value) and value >= 0:
+                rows[month] = value
+    if len(rows) < 36:
+        raise ValueError('EPU publisher history incomplete')
+    return sorted(rows.items())
 
 
 def load_hl() -> dict:
@@ -115,7 +147,12 @@ def load_hl() -> dict:
 
 def sync(con: sqlite3.Connection) -> int:
     """FRED 全量 upsert（921 行很小，直接全量）+ H&L 补列"""
-    fred = load_fred()
+    try:
+        fred = load_publisher()
+        source = PUBLISHER_URL
+    except Exception:
+        fred = load_fred()
+        source = FRED_URL
     hl = load_hl()
     cur = con.cursor()
     n = 0
@@ -128,6 +165,12 @@ def sync(con: sqlite3.Connection) -> int:
             (rec.get("epu_hl"), rec.get("epu_fiscal"), rec.get("epu_monetary"),
              rec.get("epu_trade"), rec.get("epu_exr"), month))
     con.commit()
+    (POLICY_DIR / 'source.json').write_text(json.dumps({
+        'series': 'Davis-Liu-Sheng China Mainland EPU', 'source': source,
+        'first_month': min(x[0] for x in fred), 'latest_month': max(x[0] for x in fred),
+        'rows': len(fred), 'fetched_at': datetime.now().isoformat(),
+        'note': '当前公开版本；历史发布日期和修订版未留存，历史回测需披露宏观数据修订限制'
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
     return n
 
 

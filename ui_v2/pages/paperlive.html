@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>实时模拟盘 · Deepseek HARNESS Quant</title>
+<link rel="stylesheet" href="/v2/assets/ui_common.css">
+<link rel="stylesheet" href="/v2/assets/anim_common.css">
+<link rel="stylesheet" href="/v2/assets/app.css">
+<style>
+  .pl-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+  .pl-head .v2-h{margin:0}.pl-actions{display:flex;gap:10px;align-items:center}
+  .pl-badge{display:inline-flex;align-items:center;gap:7px;border:1px solid #3c3a65;background:#24223b;color:#c4b5fd;border-radius:20px;padding:6px 12px;font-size:12px;white-space:nowrap}
+  .pl-dot{width:7px;height:7px;background:currentColor;border-radius:50%;display:inline-block}
+  .pl-muted{color:#a1a1aa}.pl-error{color:var(--gold,#f2c94c)}.pl-up{color:var(--red,#eb5757)}.pl-down{color:var(--green,#27ae60)}
+  .pl-banner{margin-top:18px;background:linear-gradient(100deg,#22213c,#17171f);border:1px solid #37344e;border-radius:12px;padding:17px 20px;display:flex;justify-content:space-between;gap:20px;align-items:center}
+  .pl-market-title{font-size:17px;font-weight:700;color:#f4f4f5}.pl-market-detail{font-size:12px;color:#b5b5c5;margin-top:6px;line-height:1.8}.pl-market-meta{text-align:right;font-size:12px;line-height:1.9;color:#a1a1aa}
+  .pl-account-note{font-size:12px;margin:13px 0;color:#a1a1aa;line-height:1.8}
+  .pl-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:14px 0}
+  .pl-kpi{background:#131316;border:1px solid #2a2a30;border-radius:12px;padding:17px 18px;min-width:0}
+  .pl-kpi-label{font-size:12px;color:#a1a1aa}.pl-kpi-value{font-size:26px;font-weight:700;letter-spacing:-.5px;font-variant-numeric:tabular-nums;margin:8px 0 5px;overflow-wrap:anywhere}.pl-kpi-sub{font-size:11px;color:#a1a1aa;line-height:1.6}
+  .pl-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(280px,1fr);gap:14px;margin-top:14px}.pl-grid>.v2-card{min-width:0;margin:0}
+  .pl-kv{display:flex;justify-content:space-between;align-items:baseline;gap:14px;font-size:12px;padding:8px 0;border-bottom:1px solid #25252b;line-height:1.6}.pl-kv:last-child{border:0}.pl-kv>span{color:#a1a1aa}.pl-kv>b{text-align:right;font-weight:600;overflow-wrap:anywhere}
+  .pl-plan{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.8;color:#d4d4d8;background:#18181e;border:1px solid #292931;border-radius:9px;padding:12px;margin-top:12px;max-height:180px;overflow:auto}
+  .pl-council-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0}.pl-council-role{border:1px solid #30303b;border-radius:9px;padding:14px;min-width:0}.pl-council-role h3{margin:0 0 8px;font-size:14px}.pl-council-role p{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.8;margin:8px 0 0;color:#c4c4ce}.pl-council-note{font-size:12px;color:#a1a1aa;line-height:1.9;overflow-wrap:anywhere}.pl-risk-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:12px}.pl-risk-item{border:1px solid #292931;background:#18181e;border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.8}.pl-risk-item b{display:block;font-size:17px;color:#e4e4e7}
+  .pl-table-wrap{overflow:auto;max-height:430px}.pl-table{width:100%;border-collapse:collapse;font-size:12px;white-space:nowrap}.pl-table th{position:sticky;top:0;text-align:left;background:#1a1a20;color:#a1a1aa;font-weight:500;z-index:1}.pl-table th,.pl-table td{padding:11px 12px;border-bottom:1px solid #25252b;vertical-align:top}.pl-table td.pl-num{text-align:right;font-variant-numeric:tabular-nums}.pl-table th.pl-num{text-align:right}.pl-table tbody tr:hover{background:#191920}.pl-table td small{display:block;color:#71717a;margin-top:3px}.pl-table .pl-reason{max-width:260px;white-space:normal;overflow-wrap:anywhere}
+  .pl-empty{padding:32px 16px;color:#a1a1aa;text-align:center;font-size:12px;line-height:1.8}.pl-empty strong{color:#d4d4d8;display:block;font-weight:500;margin-bottom:5px}
+  .pl-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:13px}.pl-tab{border:1px solid #303038;border-radius:7px;background:#19191f;color:#a1a1aa;padding:7px 14px;cursor:pointer;font:inherit;font-size:12px}.pl-tab[aria-selected="true"]{background:#292746;border-color:#625bba;color:#d6d0ff}
+  .pl-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}.pl-toolbar h2{margin:0}.pl-input,.pl-select{box-sizing:border-box;background:#141419;border:1px solid #36363f;border-radius:7px;color:#e4e4e7;padding:9px 11px;font:inherit;font-size:12px;min-width:0}.pl-input:focus,.pl-select:focus{outline:1px solid #7c73d3;border-color:#7c73d3}.pl-input:disabled,.pl-select:disabled{opacity:.5}.pl-search{width:230px;max-width:100%}
+  .pl-manual{margin-top:14px}.pl-manual summary{cursor:pointer;font-size:13px;font-weight:600;line-height:1.8}.pl-manual-form{display:grid;grid-template-columns:1.5fr .7fr 1fr 1fr auto;gap:12px;align-items:end;margin-top:15px}.pl-field label{display:block;font-size:12px;color:#a1a1aa;margin-bottom:6px}.pl-field input,.pl-field select{width:100%}.pl-submit{height:36px;white-space:nowrap}.pl-command-status{font-size:12px;line-height:1.8;margin-top:10px;min-height:20px}.pl-cancel{font-size:11px;padding:3px 9px;cursor:pointer;border:1px solid #48405f;background:#242030;color:#cabff4;border-radius:5px}.pl-cancel:disabled{opacity:.45;cursor:wait}
+  .pl-chart{height:210px}.pl-chart svg{width:100%;height:100%;display:block}.pl-chart-meta{display:flex;justify-content:space-between;gap:14px;font-size:11px;color:#a1a1aa;flex-wrap:wrap;margin-top:7px}
+  .pl-limit{font-size:12px;color:#a1a1aa;line-height:1.9;margin-top:14px;border-top:1px solid #28282f;padding-top:12px}.pl-footer{margin:20px 0;font-size:11px;color:#71717a;line-height:1.8}
+  @media(max-width:1200px){.pl-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}.pl-grid{grid-template-columns:minmax(0,1fr)}}
+  @media(max-width:760px){.pl-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.pl-banner{display:block}.pl-market-meta{text-align:left;margin-top:9px}.pl-manual-form{grid-template-columns:1fr 1fr}.pl-field:first-child{grid-column:1/-1}.pl-submit{grid-column:1/-1}.pl-kpi-value{font-size:23px}.pl-council-grid{grid-template-columns:1fr}.pl-risk-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+</style>
+</head>
+<body style="background:var(--bg);margin:0">
+<div id="sidebar"></div>
+<main class="v2-wrap">
+  <div class="pl-head">
+    <div class="v2-h"><span class="bar"></span><h1 id="page-title">实时模拟盘</h1><span class="sub">真实报价 · 虚拟资金 · 从账户创建时刻开始</span></div>
+    <div class="pl-actions"><span class="pl-badge"><span class="pl-dot"></span>模拟账户</span><a class="v2-btn" href="/data-settings">数据源设置</a><button class="v2-btn" id="refresh-btn" type="button">刷新</button></div>
+  </div>
+
+  <section class="pl-banner" aria-live="polite">
+    <div><div class="pl-market-title" id="market-title">正在读取市场状态</div><div class="pl-market-detail" id="market-detail">连接实时行情与模拟账户…</div></div>
+    <div class="pl-market-meta" id="market-meta">报价时间与交易日历待确认</div>
+  </section>
+  <section id="activation-status" class="v2-card mini" style="display:none;line-height:1.9;margin-top:12px" aria-live="polite"></section>
+  <div class="pl-account-note" id="account-note">账户起点加载中；历史行情仅用于研究，不计入模拟账户收益。</div>
+  <div class="pl-kpis" id="account-kpis"></div>
+
+  <div class="pl-grid">
+    <section class="v2-card">
+      <h2>账户权益 <span class="tag">仅记录账户启动后的估值</span></h2>
+      <div class="pl-chart" id="equity-chart"><div class="pl-empty">等待账户估值记录</div></div>
+      <div class="pl-chart-meta" id="equity-meta"></div>
+    </section>
+    <section class="v2-card">
+      <h2>AI 交易计划 <span class="tag" id="ai-badge">状态待确认</span></h2>
+      <div id="ai-state"><div class="pl-empty">读取计划状态…</div></div>
+      <div class="pl-plan" id="ai-plan">尚无计划记录。</div>
+    </section>
+  </div>
+
+  <section class="v2-card" style="margin-top:14px" aria-live="polite">
+    <h2>双角色决策 <span class="tag" id="council-badge">读取配置</span></h2>
+    <div id="council-state"><div class="pl-empty">读取分析与复核状态…</div></div>
+    <div id="council-report"></div>
+    <div id="risk-policy"></div>
+  </section>
+
+  <section class="v2-card" style="margin-top:14px">
+    <div class="pl-tabs" role="tablist" aria-label="模拟账户记录">
+      <button class="pl-tab" type="button" role="tab" aria-selected="true" data-panel="positions">持仓 <span id="positions-count"></span></button>
+      <button class="pl-tab" type="button" role="tab" aria-selected="false" data-panel="orders">委托 <span id="orders-count"></span></button>
+      <button class="pl-tab" type="button" role="tab" aria-selected="false" data-panel="fills">成交 <span id="fills-count"></span></button>
+    </div>
+    <div class="pl-table-wrap" id="records-table"></div>
+    <div class="pl-council-note" id="match-coverage" style="display:none;margin-top:10px"></div>
+    <div class="pl-limit">AI 提交的是交易意图，程序通过独立风控后才接受模拟委托。成交只使用委托后的有效报价；当日买入的股票按 T+1 限制可卖数量。</div>
+  </section>
+
+  <section class="v2-card" style="margin-top:14px">
+    <div class="pl-toolbar"><h2>当前股票池与报价 <span class="tag" id="quote-count">读取中</span></h2><input class="pl-input pl-search" id="quote-filter" type="search" placeholder="筛选股票代码或名称" aria-label="筛选当前股票池"></div>
+    <div class="pl-table-wrap" id="quotes-table"><div class="pl-empty">正在读取当前成分股与行情</div></div>
+    <div class="pl-limit">使用公开供应商报价做简化的纸面撮合，成交价、盘口量和限价以当时收到的数据为准。未完整验证交易所停牌状态、排队顺序或实际成交能力；报价缺失、过期或条件不满足时不撮合。</div>
+  </section>
+
+  <details class="v2-card pl-manual">
+    <summary>人工模拟委托 <span class="pl-muted" style="font-weight:400">可选，使用同一套风控与虚拟账本</span></summary>
+    <form id="manual-order-form" class="pl-manual-form">
+      <div class="pl-field"><label for="order-symbol">股票</label><select class="pl-select" id="order-symbol" required><option value="">等待股票池</option></select></div>
+      <div class="pl-field"><label for="order-side">方向</label><select class="pl-select" id="order-side"><option value="BUY">模拟买入</option><option value="SELL">模拟卖出</option></select></div>
+      <div class="pl-field"><label for="order-quantity">数量（股）</label><input class="pl-input" id="order-quantity" type="number" min="1" step="1" required placeholder="按证券申报单位填写"></div>
+      <div class="pl-field"><label for="order-limit">委托限价（元）</label><input class="pl-input" id="order-limit" type="number" min="0" step="any" required placeholder="填入限价"></div>
+      <button class="v2-btn pl-submit" id="order-submit" type="submit" disabled>提交模拟委托</button>
+    </form>
+    <div class="pl-command-status" id="order-message" role="status">等待交易时段与账户状态确认。</div>
+  </details>
+  <div class="pl-footer">这是独立的盘中模拟账本。虚拟资金与历史研究回放分开记账，页面中的成交记录代表模拟结果。</div>
+</main>
+<script src="/v2/core/api.js"></script>
+<script src="/v2/core/render.js"></script>
+<script src="/v2/components/icons.js"></script>
+<script src="/v2/components/search.js"></script>
+<script src="/v2/components/sidebar.js"></script>
+<script>
+(function () {
+  'use strict';
+  LW.sidebar.render('sidebar', {active: 'paperlive'});
+  var R = LW.render, latest = null, panel = 'positions', timer = null, loading = false, commandBusy = false, poolKey = '';
+  var byId = function (id) { return document.getElementById(id); };
+  function esc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function number(value) { return value === null || value === undefined || value === '' ? null : (Number.isFinite(Number(value)) ? Number(value) : null); }
+  function amount(value, digits) { var v = number(value); return v === null ? '—' : v.toLocaleString('zh-CN', {minimumFractionDigits: digits == null ? 2 : digits, maximumFractionDigits: digits == null ? 2 : digits}); }
+  function moment(value) { if (!value) return '—'; var d = new Date(value); return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString('zh-CN', {timeZone:'Asia/Shanghai',hour12:false}); }
+  function time(value) { if (!value) return '—'; var d = new Date(value); return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleTimeString('zh-CN', {timeZone:'Asia/Shanghai',hour12:false}); }
+  function empty(title, detail) { return '<div class="pl-empty"><strong>' + esc(title) + '</strong>' + esc(detail || '') + '</div>'; }
+  function tone(value) { var v = number(value); return v > 0 ? 'pl-up' : v < 0 ? 'pl-down' : ''; }
+  function row(cells) { return '<tr>' + cells.map(function (cell) { return '<td' + (cell.num ? ' class="pl-num"' : cell.reason ? ' class="pl-reason"' : '') + '>' + cell.html + '</td>'; }).join('') + '</tr>'; }
+  function table(headings, rows) { return '<table class="pl-table"><thead><tr>' + headings.map(function (h) { return '<th' + (h.num ? ' class="pl-num"' : '') + '>' + esc(h.label || h) + '</th>'; }).join('') + '</tr></thead><tbody>' + rows + '</tbody></table>'; }
+  function cell(value, num) { return {html:esc(value == null ? '—' : value),num:!!num}; }
+  function labelSide(side) { return side === 'BUY' ? '买入' : side === 'SELL' ? '卖出' : side || '—'; }
+  function labelStatus(status) { return ({OPEN:'挂单中',PENDING:'待处理',PARTIAL:'部分成交',PARTIALLY_FILLED:'部分成交',PARTIALLY_FILLED_CANCELLED:'部分成交，余单已撤销',FILLED:'全部成交',CANCELLED:'已撤单',CANCELED:'已撤单',REJECTED:'已拒绝',EXPIRED:'已到期'})[status] || status || '—'; }
+  function labelReason(reason) {
+    var text = String(reason == null ? '' : reason);
+    return ({
+      max_symbol_weight:'超出单只股票仓位上限',max_total_weight:'超出组合仓位上限',max_positions:'超出持仓数量上限',
+      max_order_notional:'超出单笔委托金额上限',max_order_quantity:'超出单笔委托数量上限',max_daily_orders:'达到当日委托数量上限',
+      insufficient_available_cash:'可用虚拟资金不足',insufficient_equity_after_reserved_fees:'预留费用后账户权益不足',
+      insufficient_sellable_shares_t1:'可卖数量不足或受 T+1 限制',drawdown_buy_blocked:'达到回撤限制，暂停新增买入',
+      market_not_in_continuous_session:'当前不在连续竞价时段',kill_switch_active:'模拟盘已暂停交易',end_of_session:'交易时段结束，剩余委托已撤销',
+      stale_quote:'报价已过期',future_quote:'报价时间异常',quote_session_mismatch:'报价不属于当前交易日',
+      missing_actual_price_limits:'缺少供应商涨跌停价格',invalid_actual_price_limits:'供应商涨跌停价格无效',
+      missing_or_invalid_two_sided_book:'缺少有效的双边盘口',missing_visible_book_size:'缺少有效的盘口数量',
+      invalid_quote:'报价数据无效',invalid_quote_price:'报价价格无效',
+      reference_price_changed_requires_reconciliation:'参考价发生变化，需先完成对账',corporate_action_requires_reconciliation:'检测到除权除息等事项，需先完成对账',
+      invalid_instrument_identity:'证券代码与板块资料不一致',invalid_instrument_metadata:'证券基础资料不完整',unsupported_board:'暂不支持该证券板块',
+      risk_warning_stock_buy_blocked:'风险警示或退市相关股票暂停买入',listing_age_buy_blocked:'上市时间未满足买入条件',
+      quantity_must_be_positive_integer:'委托数量必须是正整数',invalid_lot_quantity:'委托数量不符合该证券申报单位',
+      invalid_limit_price_tick:'限价不符合该证券最小价格单位',invalid_limit_price:'委托限价无效',invalid_side:'委托方向无效',
+      ledger_reconciliation_failed:'模拟账本对账未通过',valuation_incomplete:'持仓估值不完整',paper_clock_moved_backwards:'系统时间发生回退，暂停交易',
+      unknown_order_id:'未找到该模拟委托'
+    })[text] || text || '未提供原因';
+  }
+  function cancellable(order) { return order.can_cancel === true || ['OPEN','PENDING','PARTIAL','PARTIALLY_FILLED'].indexOf(order.status) !== -1; }
+
+  function waitingForMarket(d) {
+    var activation=d.activation || {}, market=d.market || {}, checks=activation.checks;
+    var base=['paper','calendar','research_products','pipeline','universe','minute','ai','account'];
+    var live=['quotes','executable','session'], known=base.concat(live), indexed={};
+    if (activation.enabled!==true || activation.armed!==true || activation.ready!==false || activation.status!=='waiting_data' ||
+        market.open!==false || market.calendar_verified!==true || market.heartbeat_stale!==false || market.error ||
+        !Array.isArray(checks) || checks.length!==known.length) return false;
+    for (var i=0;i<checks.length;i++) {
+      var item=checks[i];
+      if (!item || known.indexOf(item.id)===-1 || indexed[item.id] || typeof item.ok!=='boolean') return false;
+      indexed[item.id]=item;
+    }
+    return base.every(function(id){return indexed[id] && indexed[id].ok===true;}) && indexed.session.ok===false;
+  }
+
+  function renderMarket(d) {
+    var m = d.market || {}, a = d.account || {}, paused = d.paused === true, activation=d.activation || {}, waiting=activation.enabled===true && activation.armed!==false && activation.status==='waiting_data', open = !paused && !waiting && m.open === true && m.calendar_verified === true;
+    var waitingMarket=waitingForMarket(d);
+    byId('page-title').textContent = (d.navigation && d.navigation.label) || '实时模拟盘';
+    var holding = !paused && m.open === true && m.heartbeat_stale !== true && (m.execution_hold || {}).active === true;
+    var phase = holding ? '行情暂缺，挂单保留，撮合暂停' : waitingMarket ? '数据已就绪，等待下一交易时段' : waiting ? '等待数据验收后自动启动' : paused ? '盘中模拟已暂停' : m.phase || (open ? '交易时段' : '等待市场状态确认');
+    byId('market-title').textContent = phase;
+    byId('market-title').style.color = open ? '#c4b5fd' : '#f4f4f5';
+    var detail = waiting ? '等待所需数据重新通过验收；当前不生成新计划或进行模拟撮合。既有交易记录保留。' : paused ? '已按当前选择暂停盘中撮合和AI交易计划。核心研究与分钟历史补齐继续运行。' : open ? '使用新鲜的逐股报价评估计划与撮合；检查条件不满足时暂停撮合。' : '当前不进行模拟撮合。';
+    if (waitingMarket) detail='研究、历史分钟、AI与账户检查均已通过。开市后继续核验新鲜报价、实际限价和可执行盘口，通过后自动运行。'+(m.next_open?' 下一交易时段：'+moment(m.next_open)+'。':'');
+    if (holding) detail='已有挂单与资金冻结保留，当前不撮合、不生成新AI计划。行情恢复并通过全部检查后，才使用订单后的新报价继续撮合；原限价和风控不变。';
+    if (!paused && !waiting) {
+      if (!m.calendar_verified) detail += ' 交易日历尚未验证，账户暂停交易。';
+      else if (!open && m.next_open) detail += ' 下一交易时段：' + moment(m.next_open) + '。';
+      if (m.error) detail += ' ' + m.error;
+    }
+    byId('market-detail').textContent = detail;
+    byId('market-meta').innerHTML = '行情来源：' + esc(m.source || '待连接') + '<br>报价覆盖 ' + esc(m.quote_count == null ? '—' : m.quote_count) + ' / ' + esc(m.universe_count == null ? '—' : m.universe_count) +
+      '<br>最近报价 ' + esc(moment(m.asof))+
+      ((paused || waiting) && m.error ? '<details style="margin-top:6px;text-align:left"><summary>最近保存的行情异常</summary><div>'+esc(m.error)+'</div></details>' : '');
+    var activationBox=byId('activation-status');
+    if (activation.enabled===true) {
+      var checks=Array.isArray(activation.checks)?activation.checks:[], passed=checks.filter(function(item){return item.ok===true;}).length;
+      activationBox.style.display='';
+      activationBox.innerHTML='<b>'+esc(waitingMarket?'基础数据与账户已通过，开市后核验行情':waiting?'自动启动条件验收':activation.status==='active'?'自动启动条件已通过':activation.status==='paused'?'自动启动已人工暂停':'自动启动状态待核验')+'</b> · '+passed+'/'+checks.length+' 项通过'+
+        (activation.target_date?' · 研究数据日 '+esc(activation.target_date):'')+
+        '<details style="margin-top:6px"><summary>查看逐项条件与未通过原因</summary>'+
+        checks.map(function(item){return '<div style="margin-top:6px"><b>'+esc(item.label || item.id)+'</b> · '+(item.ok===true?'已通过':waitingMarket?'待开市检查':'尚未通过')+'<div style="color:var(--muted)">'+esc(item.reason || '尚未返回原因')+'</div></div>';}).join('')+
+        (checks.length?'':'<div>条件清单尚未返回，不能视为已通过。</div>')+'</details>';
+    } else activationBox.style.display='none';
+    byId('account-note').textContent = '账户起点：' + moment(d.started_at || a.started_at) + ' · 初始虚拟资金：' + amount(a.initial_cash) + ' 元 · 页面每 5 秒更新' +
+      (a.valuation_complete === false ? ' · 部分持仓缺少有效估值，权益数据可能不完整' : '');
+    byId('account-note').className = 'pl-account-note' + (a.valuation_complete === false ? ' pl-error' : '');
+    var kpis = [
+      ['账户权益',a.equity,'现金与持仓市值合计'],
+      ['累计盈亏',a.profit,a.pnl_percent == null ? '自账户起点累计' : '累计收益率 ' + amount(a.pnl_percent) + '%'],
+      ['可用现金',a.available_cash,'可用于新委托的虚拟资金'],
+      ['冻结现金',a.frozen_cash,'未完成买单占用的资金'],
+      ['账户现金',a.cash,'包含当前冻结现金']
+    ];
+    R.mount('account-kpis', kpis.map(function (item, index) { return '<div class="pl-kpi"><div class="pl-kpi-label">' + esc(item[0]) + '</div><div class="pl-kpi-value ' + (index === 1 ? tone(item[1]) : '') + '">' + amount(item[1]) + '</div><div class="pl-kpi-sub">' + esc(item[2]) + '</div></div>'; }).join(''));
+    byId('order-submit').disabled = !open || !d.account || commandBusy;
+    if (!commandBusy && !byId('order-message').dataset.result) byId('order-message').textContent = waitingMarket ? '数据已就绪，等待开市后行情验收；当前不接受模拟委托。' : waiting ? '正在等待数据验收，尚未接受模拟委托。' : paused ? '盘中模拟已暂停，当前不接受模拟委托。' : open ? '委托会先经过风控，并等待委托后的有效报价。' : '当前不接受盘中模拟委托，请等待下一交易时段。';
+  }
+
+  function renderAi(ai, paused, waiting, waitingMarket) {
+    ai = ai || {};
+    byId('ai-badge').textContent = waitingMarket ? '等待开市验收' : waiting ? '等待自动启动' : paused ? '已暂停' : ai.enabled ? (ai.phase || '已启用') : '未启用';
+    if (ai.last_error && (waitingMarket || waiting || paused)) byId('ai-badge').textContent += ' · 最近计划未执行';
+    var interval = number(ai.interval_seconds);
+    var trace=(ai.council || {}).latest_trace || {};
+    var values = [['当前模型',ai.model || '—'],['计划状态',ai.phase || (ai.enabled ? '等待运行' : '未启用')],['最近已处理计划',moment(ai.last_plan_at)],['最近角色报告',moment(trace.asof)],['下次计划',moment(ai.next_run_at)],['计划间隔',interval === null ? '—' : (interval / 60).toLocaleString('zh-CN') + ' 分钟']];
+    if (waitingMarket) values[1][1]='等待开市后的新鲜行情验收';
+    R.mount('ai-state', values.map(function (item) { return '<div class="pl-kv"><span>' + esc(item[0]) + '</span><b>' + esc(item[1]) + '</b></div>'; }).join(''));
+    var planText = waiting ? '等待所需数据通过验收后自动运行；当前不生成新模拟交易计划。' : paused ? '盘中模拟已暂停，当前不生成交易计划。'+(ai.last_plan_summary?'\n\n历史最近计划：'+ai.last_plan_summary:'') : ai.last_error ? '最近一次计划未执行：' + labelReason(ai.last_error) : (ai.last_plan_summary || '尚无计划记录。闭市、行情未就绪或等待计划周期时不会生成模拟交易。');
+    if (waitingMarket) planText='基础数据和账户检查已通过，等待开市后的新鲜报价与盘口验收；当前不生成交易计划。';
+    if (ai.last_error && (waitingMarket || waiting || paused)) planText+='\n\n最近一次计划未执行：'+labelReason(ai.last_error);
+    var rejected = Array.isArray(ai.rejected) ? ai.rejected : [];
+    if (rejected.length) {
+      planText += '\n\n未执行的建议（' + rejected.length + '）：\n' + rejected.map(function (item) {
+        return String(item.symbol || '未指定股票') + '：' + labelReason(item.reason);
+      }).join('\n');
+    }
+    byId('ai-plan').textContent = planText;
+    byId('ai-plan').className = 'pl-plan' + (ai.last_error ? ' pl-error' : '');
+  }
+
+  function renderCouncil(d) {
+    var ai=d.ai || {}, council=ai.council || {}, trace=council.latest_trace;
+    var enabled=council.enabled===true, configured=council.configured===true;
+    var roles=Array.isArray(council.roles)?council.roles.filter(function(item){return item && typeof item==='object' && !Array.isArray(item);}):[], report=trace && typeof trace==='object' && !Array.isArray(trace)?trace:null;
+    var stages={analyst:'计划分析',analysis:'计划分析',reviewer:'独立复核',review:'独立复核'};
+    var historical=!!(report && (council.latest_trace_current_config===false || !report.config_fingerprint || !council.config_fingerprint || report.config_fingerprint!==council.config_fingerprint));
+    var verification=!!(report && report.verification_only===true);
+    var notExecuted=!!(report && report.execution_status==='not_executed'), riskProcessed=!!(report && report.execution_status==='risk_processed');
+    var badge=!enabled?'未启用':!configured?'配置待核对':!report?'已配置 · 等待盘中分析':verification?'连接验证 · 不参与交易':historical?'历史报告 · 当前配置已变化':notExecuted?'本轮未执行':report.status==='failed'?'本轮分析或复核未通过':report.status==='hold'?'本轮共同观望':report.status==='review_rejected'?'本轮建议被否决':report.status==='approved'?(riskProcessed?'本轮复核已完成':'复核完成 · 执行待核对'):'报告状态待核对';
+    byId('council-badge').textContent=badge;
+    var lead=!enabled?'双角色分析尚未启用。':!configured?(council.error || '双角色配置未通过检查，本轮不能提交双角色交易计划。'):roles.map(function(item){return (item.name || item.id || '未命名角色')+'（'+(stages[item.stage] || '研究角色')+'）';}).join(' → ');
+    if (enabled && configured) lead+=' → 程序风控 → 模拟委托';
+    var note=!report?'尚无盘中双角色报告。角色启用与连接验证不代表已产生交易分析；仅在有效交易时段、行情和账户检查通过后生成计划。':verification?'以下是连接与结构验证记录，不计入盘中分析、交易意图或收益。':historical?'以下保留历史报告；配置已变化，这份报告不能作为当前执行依据。':notExecuted?'这份计划本轮未执行。模型复核结果不代表已提交模拟委托。':'模型复核获批仅表示可进入程序风控。是否接受委托及是否成交，以本页实际委托和成交记录为准。';
+    R.mount('council-state','<div class="pl-council-note">'+esc(lead)+'</div><div class="pl-council-note">'+esc(note)+'</div>');
+    var content='';
+    if (report) {
+      content+='<div class="pl-council-note" style="margin-top:10px">报告时点 '+esc(moment(report.asof))+(number(report.elapsed_seconds)!==null?' · 用时 '+esc(amount(report.elapsed_seconds,1))+' 秒':'')+'</div>';
+      if (report.error) content+='<div class="pl-council-note pl-error">'+esc(report.error)+'</div>';
+      if (notExecuted) content+='<div class="pl-council-note pl-error">本轮未执行：'+esc(report.execution_error?labelReason(report.execution_error):'执行条件未通过，未提供详细原因。')+'</div>';
+      content+='<div class="pl-council-grid">'+['analyst','reviewer'].map(function(stage){
+        var item=report[stage] || {}, definition=roles.find(function(role){return role.stage===stage || role.stage===(stage==='analyst'?'analysis':'review');}) || {};
+        return '<div class="pl-council-role"><h3>'+esc(item.name || definition.name || stages[stage])+' <span class="tag">'+esc(stages[stage])+'</span></h3><p>'+esc(item.summary || (stage==='reviewer'?'本轮复核尚未完成，不构成批准。':'本轮分析尚未完成。'))+'</p></div>';
+      }).join('')+'</div>';
+      var proposals=Array.isArray((report.analyst || {}).proposals)?report.analyst.proposals.filter(function(item){return item && typeof item==='object' && !Array.isArray(item);}):[];
+      var reviews=Array.isArray((report.reviewer || {}).reviews)?report.reviewer.reviews:[], indexed=Object.create(null), duplicates=Object.create(null);
+      reviews.forEach(function(item){if(!item || typeof item.proposal_id!=='string')return;if(indexed[item.proposal_id])duplicates[item.proposal_id]=true;indexed[item.proposal_id]=item;});
+      var approved=Array.isArray(report.approved_proposal_ids)?report.approved_proposal_ids:[];
+      if(proposals.length) content+='<div class="pl-table-wrap">'+table(['提案','股票 / 方向',{label:'数量 / 限价',num:true},'复核结论','理由'],proposals.map(function(p){
+        var review=indexed[p.proposal_id], verdict='未完成复核';
+        if(duplicates[p.proposal_id])verdict='复核记录冲突';
+        else if(review && review.decision==='reject')verdict='否决';
+        else if(review && review.decision==='approve')verdict=verification?'验证记录，不执行':notExecuted?'复核批准，本轮未执行':historical?'历史复核批准':enabled && configured && report.status==='approved' && approved.indexOf(p.proposal_id)!==-1?(riskProcessed?'批准进入风控':'复核批准，执行待核对'):'未进入最终计划';
+        return row([cell(p.proposal_id),cell((p.symbol || '—')+' / '+labelSide(p.side)),cell(amount(p.quantity,0)+' 股 / '+amount(p.limit_price)+' 元',true),cell(verdict),{html:esc((review && review.reason) || p.reason || '尚无依据'),reason:true}]);
+      }).join(''))+'</div>';
+      else content+='<div class="pl-council-note">'+esc(report.status==='hold'?'本轮共同观望，没有交易提案。':'本轮未形成可执行提案；请以上方分析和复核状态为准。')+'</div>';
+    }
+    R.mount('council-report',content);
+    var risk=d.risk_policy || {}, fields=[['单股仓位上限','max_symbol_weight','percent'],['总仓位上限','max_total_weight','percent'],['单笔金额上限','max_order_notional','money'],['回撤保护触发线','max_drawdown','percent']];
+    var any=fields.some(function(item){return number(risk[item[1]])!==null;});
+    R.mount('risk-policy',any?'<div class="pl-limit">独立程序风控 · '+esc(risk.effective===true?'本轮已核对生效':'配置值，等待账本核对')+'</div><div class="pl-risk-grid">'+fields.map(function(item){var value=number(risk[item[1]]);return '<div class="pl-risk-item">'+esc(item[0])+'<b>'+esc(value===null?'—':item[2]==='percent'?amount(value*100,0)+'%':amount(value,0)+' 元')+'</b></div>';}).join('')+'</div><div class="pl-council-note" style="margin-top:9px">回撤保护触发线不是最大亏损保证；行情时效、T+1、现金、实际涨跌停与盘口检查仍独立执行。</div>':'');
+  }
+
+  function renderChart(curve) {
+    var points = (curve || []).map(function (p) { return {time:p.time || p.ts,value:number(p.equity)}; }).filter(function (p) { return p.time && p.value !== null; });
+    if (points.length < 2) {
+      R.mount('equity-chart', empty('净值记录从现在开始', points.length ? '已记录首个估值点，等待后续有效估值。' : '尚无有效估值记录，不展示历史模拟收益。'));
+      byId('equity-meta').textContent = points.length ? '首个记录：' + moment(points[0].time) : '';
+      return;
+    }
+    var W=880,H=190,L=83,T=16,Rp=18,B=25,values=points.map(function(p){return p.value;}),low=Math.min.apply(null,values),high=Math.max.apply(null,values);
+    var span=high-low,margin=span?span*.15:Math.max(Math.abs(high)*.001,1);low-=margin;high+=margin;
+    var minTime=new Date(points[0].time).getTime(),maxTime=new Date(points[points.length-1].time).getTime();
+    function x(p,i){var t=new Date(p.time).getTime();return L+(W-L-Rp)*(maxTime>minTime?(t-minTime)/(maxTime-minTime):i/(points.length-1));}
+    function y(v){return T+(H-T-B)*(1-(v-low)/(high-low));}
+    var grid='';for(var i=0;i<=3;i++){var v=high-(high-low)*i/3,gy=y(v);grid+='<line x1="'+L+'" y1="'+gy.toFixed(1)+'" x2="'+(W-Rp)+'" y2="'+gy.toFixed(1)+'" stroke="#292932"/><text x="'+(L-10)+'" y="'+(gy+3).toFixed(1)+'" text-anchor="end" fill="#8b8b99" font-size="10">'+esc(amount(v,0))+'</text>';}
+    var path=points.map(function(p,i){return x(p,i).toFixed(1)+','+y(p.value).toFixed(1);}).join(' ');
+    R.mount('equity-chart','<svg viewBox="0 0 '+W+' '+H+'" role="img" aria-label="账户创建后权益曲线">'+grid+'<polyline points="'+path+'" fill="none" stroke="#9b8bf1" stroke-width="2" stroke-linejoin="round"/><text x="'+L+'" y="'+(H-3)+'" fill="#8b8b99" font-size="10">'+esc(time(points[0].time))+'</text><text x="'+(W-Rp)+'" y="'+(H-3)+'" text-anchor="end" fill="#8b8b99" font-size="10">'+esc(time(points[points.length-1].time))+'</text></svg>');
+    byId('equity-meta').innerHTML='<span>记录起点 '+esc(moment(points[0].time))+'</span><span>最新权益 '+amount(points[points.length-1].value)+' 元 · '+points.length+' 个估值点</span>';
+  }
+
+  function renderMatchCheck(order) {
+    var market=(latest && latest.market) || {}, hold=market.execution_hold || {};
+    var held=!latest.paused && market.open===true && market.heartbeat_stale!==true && hold.active===true && Array.isArray(hold.order_ids) && hold.order_ids.indexOf(order.id)!==-1 && cancellable(order);
+    var prefix=held?'<b class="pl-error">行情暂缺，挂单保留，撮合暂停</b><br>':'';
+    var check=order.last_match_check;
+    if (!check || typeof check!=='object' || Array.isArray(check)) return prefix+'<small>无逐帧撮合记录，无法还原未成交原因。</small>';
+    return prefix+'<details><summary>'+esc((held?'暂停前最近检查：':'最近检查：')+(check.reason_label || check.reason || '未提供原因'))+'</summary>'+
+      '<div>检查时间 '+esc(moment(check.checked_at))+'<br>报价时间 '+esc(moment(check.quote_time))+'<br>接收时间 '+esc(moment(check.received_at))+
+      '<br>买一 / 卖一 '+esc(amount(check.bid)+' / '+amount(check.ask))+' 元'+
+      '<br>含滑点试算价 '+esc(amount(check.execution_price))+' 元 · 限价 '+esc(amount(check.limit_price))+' 元'+
+      '<br>滑点 '+esc(amount(check.slippage_bps,2))+' bps · 本帧可用量 '+esc(amount(check.capacity,0))+' 股'+
+      '<br>检查前剩余 '+esc(amount(check.remaining_before,0))+' 股 · 本次实际成交 '+esc(amount(check.filled_quantity,0))+' 股'+
+      (check.fill_id?'<br>成交编号 '+esc(check.fill_id):'')+'</div></details>';
+  }
+
+  function renderRecords() {
+    var a = (latest && latest.account) || {}, positions=a.positions || [], orders=a.orders || [], fills=a.fills || [];
+    var diagnostics=a.execution_diagnostics || {};
+    byId('match-coverage').style.display=panel==='orders'?'':'none';
+    byId('match-coverage').textContent=diagnostics.coverage || '撮合诊断从功能启用后开始记录；旧委托可能没有逐帧记录，不能根据当前报价反推过去的未成交原因。';
+    byId('positions-count').textContent='('+positions.length+')';byId('orders-count').textContent='('+orders.length+')';byId('fills-count').textContent='('+fills.length+')';
+    if (panel === 'positions') {
+      R.mount('records-table',positions.length?table(['股票',{label:'总持仓',num:true},{label:'可卖 / 冻结',num:true},{label:'成本价',num:true},{label:'最新价',num:true},{label:'市值',num:true},{label:'浮动盈亏',num:true},'报价时间'],positions.map(function(p){return row([{html:esc(p.name||p.symbol)+'<small>'+esc(p.symbol)+'</small>'},cell(amount(p.quantity,0),true),cell(amount(p.available,0)+' / '+amount(p.frozen,0),true),cell(amount(p.cost),true),cell(amount(p.last),true),cell(amount(p.market_value),true),{html:'<span class="'+tone(p.pnl)+'">'+amount(p.pnl)+'</span>',num:true},cell(moment(p.quote_time))]);}).join('')):empty('当前没有持仓','账户从启动时刻开始，不导入历史回放仓位。'));
+    } else if (panel === 'orders') {
+      R.mount('records-table',orders.length?table(['时间 / 编号','股票','方向',{label:'委托 / 已成交',num:true},{label:'限价',num:true},'状态 / 原因','撮合检查详情','操作'],orders.map(function(o){return row([{html:esc(moment(o.created_at))+'<small title="'+esc(o.id)+'">'+esc(String(o.id||'').slice(0,16))+'</small>'},cell(o.symbol),cell(labelSide(o.side)),cell(amount(o.quantity,0)+' / '+amount(o.filled,0),true),cell(amount(o.limit_price),true),{html:esc(labelStatus(o.status))+(o.reason?'<small>'+esc(labelReason(o.reason))+'</small>':''),reason:true},{html:renderMatchCheck(o),reason:true},{html:cancellable(o)?'<button class="pl-cancel" type="button" data-cancel="'+esc(o.id)+'">撤销模拟委托</button>':'—'}]);}).join('')):empty('尚无模拟委托','AI 计划通过风控后，委托才会出现在这里。'));
+    } else {
+      R.mount('records-table',fills.length?table(['成交时间','股票','方向',{label:'成交数量',num:true},{label:'成交价',num:true},{label:'费用',num:true}],fills.map(function(f){return row([cell(moment(f.time)),cell(f.symbol),cell(labelSide(f.side)),cell(amount(f.quantity,0),true),cell(amount(f.price),true),cell(amount(f.fee),true)]);}).join('')):empty('尚无模拟成交','有效报价、交易时段、委托限价和流动性条件满足后，才会记入成交。'));
+    }
+  }
+
+  function renderQuotes() {
+    var quotes=(latest && latest.quotes)||[],universe=(latest && latest.universe)||[],qmap={};quotes.forEach(function(q){qmap[q.symbol]=q;});
+    var pool=universe.length?universe:quotes,filter=byId('quote-filter').value.trim().toLowerCase();
+    var shown=pool.filter(function(p){return !filter || String(p.symbol||'').toLowerCase().indexOf(filter)!==-1 || String(p.name||'').toLowerCase().indexOf(filter)!==-1;});
+    byId('quote-count').textContent=quotes.length+' 个报价 / '+pool.length+' 个标的';
+    R.mount('quotes-table',shown.length?table(['股票',{label:'最新价',num:true},{label:'涨跌幅',num:true},{label:'买一 / 卖一',num:true},{label:'跌停 / 涨停',num:true},'报价时间'],shown.map(function(p){var q=qmap[p.symbol]||p,prev=number(q.previous_close),last=number(q.last),change=prev>0&&last!==null?(last/prev-1)*100:null;return row([{html:esc(p.name||q.name||p.symbol)+'<small>'+esc(p.symbol)+'</small>'},cell(amount(q.last),true),{html:'<span class="'+tone(change)+'">'+(change===null?'—':amount(change)+'%')+'</span>',num:true},cell(amount(q.bid)+' / '+amount(q.ask),true),cell(amount(q.limit_down)+' / '+amount(q.limit_up),true),cell(moment(q.timestamp))]);}).join('')):empty(pool.length?'没有匹配的股票':'股票池尚未就绪',pool.length?'请更换代码或名称筛选条件。':'等待当前成分股与证券资料加载。'));
+    var merged={};pool.forEach(function(p){merged[p.symbol]=p;});(((latest&&latest.account)||{}).positions||[]).forEach(function(p){if(!merged[p.symbol])merged[p.symbol]=p;});
+    var options=Object.keys(merged).sort(),key=options.map(function(s){return s+'|'+merged[s].name;}).join(',');
+    if(key!==poolKey){var select=byId('order-symbol'),saved=select.value;select.innerHTML='<option value="">选择股票</option>'+options.map(function(s){return '<option value="'+esc(s)+'">'+esc(s+' '+(merged[s].name||''))+'</option>';}).join('');if(merged[saved])select.value=saved;poolKey=key;}
+  }
+
+  function render(d) { latest=d;renderMarket(d);renderAi(d.ai,d.paused === true,!!(d.activation && d.activation.enabled && d.activation.armed!==false && d.activation.status==='waiting_data'),waitingForMarket(d));renderCouncil(d);renderChart((d.account||{}).curve);renderRecords();renderQuotes(); }
+  function load() {
+    if(loading)return Promise.resolve();loading=true;byId('refresh-btn').disabled=true;
+    return LW.api.get('/api/paperlive/state',{bypass:true,retry:0,staleFallback:false}).then(function(d){if(!d || d.ok===false)throw new Error((d&&d.error)||'模拟盘状态暂不可读');render(d);})
+      .catch(function(error){byId('market-title').textContent='暂时无法更新模拟盘状态';byId('market-detail').textContent=latest?'当前保留上次状态，不能据此判断任务仍在运行。 '+error.message:'请检查模拟盘服务。 '+error.message;byId('order-submit').disabled=true;})
+      .finally(function(){loading=false;byId('refresh-btn').disabled=false;clearTimeout(timer);timer=setTimeout(load,5000);});
+  }
+  function command(path,payload) {
+    return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',body:JSON.stringify(payload)}).then(function(res){return res.json().then(function(d){if(!res.ok || d.ok===false)throw new Error(d.error || d.reason || ('请求未接受（'+res.status+'）'));return d;});});
+  }
+  function message(text,error) {var el=byId('order-message');el.textContent=text;el.dataset.result='true';el.className='pl-command-status'+(error?' pl-error':'');}
+  function suggestLimit() {if(!latest)return;var q=(latest.quotes||[]).find(function(p){return p.symbol===byId('order-symbol').value;});if(q){var value=byId('order-side').value==='BUY'?q.ask:q.bid;if(number(value)>0)byId('order-limit').value=String(value);}}
+  byId('order-symbol').addEventListener('change',suggestLimit);byId('order-side').addEventListener('change',suggestLimit);
+  byId('quote-filter').addEventListener('input',renderQuotes);byId('refresh-btn').addEventListener('click',load);
+  document.querySelectorAll('.pl-tab').forEach(function(button){button.addEventListener('click',function(){panel=button.dataset.panel;document.querySelectorAll('.pl-tab').forEach(function(b){b.setAttribute('aria-selected',String(b===button));});renderRecords();});});
+  byId('manual-order-form').addEventListener('submit',function(event){event.preventDefault();if(commandBusy)return;var m=(latest&&latest.market)||{},waiting=!!(latest && latest.activation && latest.activation.enabled && latest.activation.armed!==false && latest.activation.status==='waiting_data');if(waiting || (latest && latest.paused) || !m.open || !m.calendar_verified){message(waiting?'等待数据验收，不能提交模拟委托。':latest && latest.paused?'盘中模拟已暂停，不能提交模拟委托。':'当前不在已验证的交易时段，不能提交模拟委托。',true);return;}var quantity=Number(byId('order-quantity').value),limit=Number(byId('order-limit').value);if(!Number.isInteger(quantity)||quantity<=0||!Number.isFinite(limit)||limit<=0){message('请填写有效的数量和委托限价。',true);return;}commandBusy=true;byId('order-submit').disabled=true;message('正在提交模拟委托…');command('/api/paperlive/order',{side:byId('order-side').value,symbol:byId('order-symbol').value,quantity:quantity,limit_price:String(byId('order-limit').value)}).then(function(){message('模拟委托已接受，等待后续有效报价撮合。');panel='orders';document.querySelectorAll('.pl-tab').forEach(function(b){b.setAttribute('aria-selected',String(b.dataset.panel===panel));});}).catch(function(error){message(error.message,true);}).finally(function(){commandBusy=false;load();});});
+  byId('records-table').addEventListener('click',function(event){var button=event.target.closest('[data-cancel]');if(!button || button.disabled)return;button.disabled=true;command('/api/paperlive/cancel',{order_id:button.dataset.cancel}).then(function(){message('模拟委托已撤销，剩余冻结资金或股票已释放。');load();}).catch(function(error){message(error.message,true);button.disabled=false;});});
+  load();
+})();
+</script>
+</body>
+</html>

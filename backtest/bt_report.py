@@ -203,10 +203,14 @@ def save_latest(key: str, returns: pd.Series, params: dict = None, metrics: dict
 def list_archives(out_dir: Path = None) -> dict:
     """列出回测存档 → {"latest": [...], "history": [...]}
     latest = 当前最新（latest_{key} 固定名，同参数覆盖）；history = 全部历史（时间戳）。"""
+    research = []
+    if out_dir is None:
+        from deck.research_views import research_archives
+        research = research_archives()
     out_dir = Path(out_dir) if out_dir else ARCHIVE_DIR
     if not out_dir.exists():
-        return {"latest": [], "history": []}
-    latest, history = [], []
+        return {"latest": research, "history": [], "research_count":len(research)}
+    latest, history = list(research), []
     for j in sorted(out_dir.glob("*.json"), reverse=True):
         try:
             d = json.loads(j.read_text(encoding="utf-8"))
@@ -217,7 +221,7 @@ def list_archives(out_dir: Path = None) -> dict:
                 "因子" if name.startswith("strong_") else
                 "复刻" if name.startswith("script1") else "策略")
             ann = d.get("metrics", {}).get("annual_return")
-            verdict = d.get("verdict") or ("有效" if (ann or 0) >= 0 else "无效")
+            verdict = d.get("verdict") or "未标注验证层级"
             item = {
                 "name": name, "title": d.get("title"), "category": category,
                 "verdict": verdict, "factors": d.get("factors") or [],
@@ -230,11 +234,13 @@ def list_archives(out_dir: Path = None) -> dict:
                 "has_html": j.with_suffix(".html").exists(),
                 "is_latest": j.name.startswith("latest_"),
                 "key": d.get("key", ""),
+                "validation_stage": d.get("validation_stage", "unspecified"),
+                "evidence_summary": d.get("note") or "执行、费用与样本内外口径以原始报告为准；没有仅凭正年化判定有效。",
             }
             (latest if item["is_latest"] else history).append(item)
         except Exception:
             continue
-    return {"latest": latest, "history": history}
+    return {"latest": latest, "history": history, "research_count":len(research)}
 
 
 def load_archive(path) -> dict:

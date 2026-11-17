@@ -121,29 +121,18 @@ class DataAuditor:
     # ---------------- 基础设施 ----------------
     @staticmethod
     def _resolve_cache_dir() -> Path:
-        env = os.environ.get("LWQUANT_CACHE_DIR")
-        if env:
-            return Path(env)
-        try:
-            import yaml
-            cfg = yaml.safe_load((BASE / "config" / "params.yaml").read_text(encoding="utf-8"))
-            d = (cfg or {}).get("data", {}).get("cache_dir")
-            if d:
-                p = Path(str(d))
-                return p if p.is_absolute() else BASE / p
-        except Exception:
-            pass
-        return BASE / "data" / "cache"
+        from factors.research_context import cache_dir
+        return cache_dir()
 
     def _conn(self, db: Path):
-        return sqlite3.connect(str(db))
+        return sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)
 
     def _q(self, cur, sql, args=()):
         """单值查询；异常返回 None 不抛"""
         try:
             return cur.execute(sql, args).fetchone()[0]
         except Exception as e:
-            return f"ERR:{type(e).__name__}:{e}"
+            raise ValueError("审计输入表或字段缺失，不能将查询失败按零缺陷处理") from e
 
     def _add(self, check_id, category, name, status, detail, suggestion=""):
         self.items.append(AuditItem(check_id, category, name, status, detail, suggestion))
@@ -179,7 +168,13 @@ class DataAuditor:
         # A3 退市股覆盖（集合一次比对，禁止逐只 LIKE）
         recent_delisted = set()
         n_delist = 0
-        if self.delisted_csv.exists():
+        metadata = self.bars_db.parent / 'stock_basic.db'
+        if metadata.exists():
+            with self._conn(metadata) as source:
+                rows = source.execute("SELECT code,out_date FROM stock_basic WHERE out_date >= '2019-01-01' AND (code LIKE '%.SH' OR code LIKE '%.SZ')").fetchall()
+            recent_delisted = {self._norm6(code) for code, _ in rows}
+            n_delist = len(rows)
+        elif self.delisted_csv.exists():
             with open(self.delisted_csv, encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
                     end = (row.get("终止上市日期") or "").strip()
@@ -191,23 +186,25 @@ class DataAuditor:
             rows = cur.execute("SELECT DISTINCT code FROM daily_bar").fetchall()
             cached6 = {self._norm6(r[0]) for r in rows}
         missing = recent_delisted - cached6
-        cov = (len(recent_delisted) - len(missing)) / len(recent_delisted) * 100 if recent_delisted else 100.0
-        status = "PASS" if cov >= self.th["delisted_coverage_min"] else "WARN"
+        cov = (len(recent_delisted) - len(missing)) / len(recent_delisted) * 100 if recent_delisted else None
+        status = "PASS" if cov is not None and cov >= self.th["delisted_coverage_min"] else "WARN"
         self._add("A3", "完整性", "退市股覆盖（幸存者偏差）", status,
-                  f"2019 后终止上市 {len(recent_delisted)} 只，缓存覆盖 {cov:.1f}%（缺 {len(missing)} 只，"
+                  f"2019后退市名单 {len(recent_delisted)}只，缓存覆盖 {str(round(cov,1))+chr(37) if cov is not None else '未知(名单缺失/空)'}（缺{len(missing)}只，"
                   f"样本: {sorted(list(missing))[:5]}）→ 回测收益虚高风险",
-                  "F-2: 补拉 148 只退市股（2019-退市日）后重跑 v3 验收")
+                  "补全真实退市名单和其历史日线后再验证历史回测的幸存者偏差")
 
         few = cur.execute("SELECT COUNT(*) FROM (SELECT code FROM daily_bar GROUP BY code HAVING COUNT(*)<?)",
                           (self.th["min_rows_per_stock"],)).fetchone()[0]
         self._add("A4", "完整性", "短数据股票", "WARN" if few > 5 else "PASS",
                   f"行数 <{self.th['min_rows_per_stock']} 的股票 {few} 只（多为次新股/退市边缘）")
 
-        y0 = self._q(cur, "SELECT COUNT(*) FROM (SELECT code, MIN(date) md FROM daily_bar GROUP BY code) WHERE md < '2019-01-01'") or 0
-        pct_pre2019 = y0 / n_codes * 100 if n_codes else 0
-        self._add("A5", "完整性", "数据起点覆盖", "PASS" if pct_pre2019 >= 90 else "WARN",
-                  f"起点早于 2019-01-01 的股票 {y0} 只（{pct_pre2019:.0f}%）→ 2010-2018 基本空转，"
-                  f"backtest.start 需与实际一致", self.cfg.get("data_start_note", ""))
+        from data.research_bootstrap import load_config
+        requested_start = load_config()['daily_start']
+        actual_start = self._q(cur, "SELECT MIN(date) FROM daily_bar WHERE adjust='qfq' AND (code LIKE '6%.SH' OR code LIKE '0%.SZ' OR code LIKE '3%.SZ')")
+        # Calendar holidays can separate the configured start from the first session.
+        gap = (datetime.fromisoformat(actual_start) - datetime.fromisoformat(requested_start)).days if actual_start else None
+        self._add("A5", "完整性", "研究起点覆盖", "PASS" if gap is not None and gap <= 10 else "FAIL",
+                  f"配置从 {requested_start} 开始，实际股票数据从 {actual_start} 开始；新上市股票从上市日起覆盖。2019年前换手研究不在本次范围。")
         con.close()
 
     # ---------------- B. 一致性 ----------------
@@ -278,13 +275,20 @@ class DataAuditor:
                   f"{n_none} 行（{n_none/n_total2*100:.2f}%）为停牌填充（量额=0、pct_chg=NULL/0.0）"
                   f"→ 因子计算需跳过 volume=0 的日子")
 
-        st = self._q(cur, "SELECT COUNT(*) FROM daily_bar WHERE is_st != 0") or 0
-        st_ratio = st / 8282007 if False else (st / (self._q(cur, "SELECT COUNT(*) FROM daily_bar") or 1))
-        status = "FAIL" if st_ratio < self.th["st_ratio_min"] else "PASS"
-        self._add("C5", "价格", "ST 标记有效性", status,
-                  f"is_st≠0 共 {st} 行（占比 {st_ratio*100:.4f}%，阈值 {self.th['st_ratio_min']*100:.0f}%）"
-                  f"→ ST 标记疑似失效，filter_st 形同虚设",
-                  "F-1: fetcher map 字典 bug 已修，待 data/fix_st_flags.py 全量重拉")
+        metadata = self.bars_db.parent / 'stock_basic.db'
+        predicate = "1=1"
+        if metadata.exists():
+            con.execute('ATTACH DATABASE ? AS meta', (str(metadata),))
+            predicate = 'code IN (SELECT code FROM meta.stock_basic)'
+        st = self._q(cur, f"SELECT COUNT(*) FROM daily_bar WHERE {predicate} AND is_st != 0") or 0
+        known = self._q(cur, f"SELECT COUNT(*) FROM daily_bar WHERE {predicate} AND is_st IS NOT NULL") or 0
+        total = self._q(cur, f"SELECT COUNT(*) FROM daily_bar WHERE {predicate}") or 0
+        st_ratio = st / known if known else None
+        status = "WARN" if known < total or not known else ("FAIL" if st_ratio < self.th["st_ratio_min"] else "PASS")
+        ratio_text = f"{st_ratio*100:.4f}%" if st_ratio is not None else "未知"
+        self._add("C5", "价格", "ST标记有效性", status,
+                  f"{known}/{total}行有已验证历史ST状态，ST占已知行{ratio_text}；阈值{self.th['st_ratio_min']*100:.0f}%。"
+                  "未知状态不当作非ST，历史回测保留ST不可验证限制", "补充真实历史ST状态；不可用当前名称回填历史")
         con.close()
 
     # ---------------- D. 量价一致性 ----------------
@@ -294,13 +298,14 @@ class DataAuditor:
         lo, hi = self.th["amount_ratio_range"]
         # 量价比受除权日影响（qfq 价×原始量≠amount）→ 过滤极端值(0.5~3)后求均值抗噪
         med = self._q(cur, """SELECT AVG(r) FROM (
-            SELECT amount/(volume*close) r FROM daily_bar
-            WHERE amount>0 AND volume>0 AND close>0 AND adjust='qfq'
-            AND date>='2024-01-01' AND amount/(volume*close) BETWEEN 0.5 AND 3.0)""")
+            SELECT CASE WHEN source IN ('tushare','tushare_backup')
+                        THEN amount*1000.0/(volume*100.0*close)
+                        ELSE amount/(volume*close) END r
+            FROM daily_bar WHERE amount>0 AND volume>0 AND close>0 AND adjust='none')""")
         status = "PASS" if med and lo <= float(med) <= hi else "WARN"
         self._add("D1", "量价", "amount 单位校验", status,
-                  f"近 3 年量价比均值 {float(med):.3f}（合理区间 {lo}~{hi}，超出即疑似单位幻觉）"
-                  f"→ amount 为元/volume 为股，v3 成交额过滤可用" if med else "无法计算")
+                  f"未复权原价及按source归一的量价比均值 {float(med):.3f}（合理区间 {lo}~{hi}，超出即疑似单位幻觉）"
+                  f"；统一为元/股后比较，原始Tushare手/千元未被误认单位错误" if med else "无法计算")
         con.close()
 
     # ---------------- E. 财报审计 ----------------
@@ -335,10 +340,13 @@ class DataAuditor:
         self._add("E5", "财报", "近5年报告期格式", "WARN" if bad5y else "PASS",
                   f"{bad5y} 行非季度末（2021+，历史 2002 前半年报已豁免）")
 
-        # E6 PIT 披露日提示（非阻断）
-        self._add("E6", "财报", "PIT 披露日", "WARN",
-                  "无 ann_date 披露日字段，用固定延迟近似（一季报4-30/中报8-31/三季报10-31/年报4-30）",
-                  "F-5: 切 tushare 源（含 ann_date）或维持近似并文档化")
+        columns = {r[1] for r in cur.execute("PRAGMA table_info(finance_report)")}
+        if "pub_date" in columns:
+            missing_pub = self._q(cur, "SELECT COUNT(*) FROM finance_report WHERE pub_date IS NULL OR pub_date=''") or 0
+            self._add("E6", "财报", "PIT公告日期", "WARN" if missing_pub else "PASS",
+                      f"{missing_pub}行缺公告日；最新修订兼容表仍未重建历史所有版本可得性")
+        else:
+            self._add("E6", "财报", "PIT公告日期", "WARN", "缺pub_date，不能确认历史时点可得性")
         con.close()
 
     # ---------------- F. PIT 状态 ----------------
@@ -349,16 +357,21 @@ class DataAuditor:
             n = self._q(cur, "SELECT COUNT(*) FROM hist_mv") or 0
             months = self._q(cur, "SELECT COUNT(DISTINCT month) FROM hist_mv") or 0
             con.close()
-            status = "WARN" if n == 0 else "PASS"
+            status = "WARN"  # Nonempty rows alone do not establish period/universe coverage.
             self._add("F1", "PIT", "历史市值", status,
-                      f"hist_mv {n} 行 / {months} 个月 → 拉取{'进行中，v3 仍为快照口径' if n==0 else '完成，可验收'}"
-                      if n == 0 else f"{n} 行 / {months} 个月")
+                      f"hist_mv {n}行/{months}个月；覆盖完整性和历史时点成分股尚未验证")
         else:
             self._add("F1", "PIT", "历史市值", "WARN", "hist_mv.db 不存在")
 
         cache_dir = self.bars_db.parent
-        mv = {p.name: p.stat().st_size for p in cache_dir.glob("circ_mv*.csv")}
-        self._add("F2", "PIT", "市值映射文件", "PASS" if mv else "WARN", f"{mv}")
+        mv = cache_dir / 'daily_basic.db'
+        if mv.exists():
+            with self._conn(mv) as source:
+                count, latest = source.execute('SELECT COUNT(*),MAX(date) FROM daily_basic WHERE total_mv>0 AND circ_mv>0').fetchone()
+            self._add('F2', 'PIT', '逐日市值', 'PASS' if count else 'FAIL',
+                      f'Tushare daily_basic 实际总市值/流通市值 {count} 行，最新 {latest}；不使用当前市值回填历史')
+        else:
+            self._add('F2', 'PIT', '逐日市值', 'FAIL', 'daily_basic.db 缺失')
 
     # ---------------- 主流程 ----------------
     def run(self, quick=False):
@@ -390,7 +403,11 @@ class DataAuditor:
             blocked = True
             reason = f"数据审计 WARN {n_warn} 项 ≥ 阈值 → 阻断"
 
+        from factors.research_context import scope_metadata
         result = {
+            "research_scope": scope_metadata(),
+            "status": "blocked" if blocked else ("limited" if n_warn else "ready"),
+            "limitations": ["当前成分股回看历史不是历史时点成分股回测", "财报修订版本时点尚未逐笔重建；退市/PIT缺失项见检查结果"],
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "elapsed_sec": round(time.time() - self._start_ts, 1),
             "quick": quick,

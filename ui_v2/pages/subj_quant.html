@@ -211,7 +211,7 @@
     }
     var sf = p.strong_factors || [];
     var sfChips = sf.map(function (f) {
-      return '<span class="badge ' + (f.winrate > 52 ? 'b-good' : 'b-wait') + '">' + f.name + ' ' + f.winrate + '%</span>';
+      return '<span class="badge ' + (f.winrate != null && f.winrate > 52 ? 'b-good' : 'b-wait') + '">' + R._f(f.name) + ' ' + (f.winrate == null ? '历史待验证' : f.winrate + '%') + '</span>';
     }).join(' ');
     box.innerHTML =
       '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">' +
@@ -369,12 +369,12 @@
       var rows = (d.hits || []).map(function (h) {
         var cls = h.met ? 'sq-hit met' : 'sq-hit not';
         var badge = h.met
-          ? '<span class="badge ' + (h.neg ? 'b-bad' : (h.winrate > 55 ? 'b-good' : 'b-wait')) + '">命中率 ' + h.winrate + '%</span>'
+          ? (h.evidence_ready !== false && h.winrate != null ? '<span class="badge ' + (h.neg ? 'b-bad' : (h.winrate > 55 ? 'b-good' : 'b-wait')) + '">历史命中率 ' + h.winrate + '%</span>' : '<span class="badge b-wait">当前规则命中 · 历史待验证</span>')
           : '<span class="badge b-wait">未命中</span>';
         return '<div class="sq-factor ' + cls + '"><span class="name">' + R._f(h.name) + '</span>' +
           '<span class="mini" style="color:#a1a1aa">' + R._f(h.note) + '</span>' +
           '<span style="margin-left:auto;display:flex;gap:8px;align-items:center">' + badge +
-          (h.met && h.excess != null ? '<span class="mini" style="color:#a1a1aa">6月超额 ' + (h.excess > 0 ? '+' : '') + h.excess + '%</span>' : '') + '</span></div>';
+          (h.met && h.excess != null ? '<span class="mini" style="color:#a1a1aa">研究超额 ' + (h.excess > 0 ? '+' : '') + h.excess + '%</span>' : '') + (h.n != null ? '<span class="mini">' + h.n + ' 个样本</span>' : '') + '</span></div>';
       }).join('');
       box.innerHTML =
         '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px">' +

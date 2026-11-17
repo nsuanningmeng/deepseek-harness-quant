@@ -24,6 +24,7 @@ UI：Pitch 页顶部一行式状态条（live_patch /api/live/timing 消费）
 import glob
 import json
 import math
+import pandas as pd
 import os
 import sqlite3
 import sys
@@ -33,8 +34,10 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent.parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
-BARS_DB = r"data/cache/bars.db"
+from factors.research_context import cache_dir, connect as research_connect, config as research_config
+BARS_DB = str(cache_dir() / "bars.db")
 OUT_DIR = BASE / "output"
 
 
@@ -126,32 +129,43 @@ def _snapshot_fresh() -> dict:
     return {"snap": None, "fresh": False, "lag_days": 999, "file": ""}
 
 
+def _require_macro_fresh(month):
+    text = str(month)
+    if len(text) == 6 and text.isdigit():
+        text = text[:4] + "-" + text[4:]
+    lag = pd.Period(datetime.now().strftime("%Y-%m"), freq="M").ordinal - pd.Period(text[:7], freq="M").ordinal
+    if lag < 0 or lag > int(research_config()["timing"]["max_macro_lag_months"]):
+        raise ValueError("宏观源数据超过配置时效或日期在未来")
+
+
 def policy_score() -> dict:
     """政策分 0-100：★2026-08-12 百轮#91 升级——优先读四因子政策综合评分
     （EPU+社融同比+利差，回测师宏观政策传导研究交付；policy_hook 12h 缓存）
     映射 score→0-100：进攻区 +0.5→92 / 中性 0→70 / 防守 -0.65→41
     失败/缺失 → 回退 EPU 单因子（z12 + 3 月趋势，原逻辑）"""
     try:
-        from data.policy_hook import load as _ph_load
-        _d = _ph_load()
-        if _d and _d.get("score") is not None:
-            _sc4 = float(_d["score"])
-            _sc = round(max(25.0, min(98.0, 70 + _sc4 * 45)), 1)
-            _bk = _d.get("bucket", "中性区")
-            _feel = "政策暖" if _sc4 > 0.5 else ("中性" if _sc4 >= -0.5 else "政策冷")
-            # ★#351 精简 note：结论式（公式细节 EPU+社融+利差 → 说明页），reason 用 short
-            _note = f"{_feel}（{_bk} {_d.get('month','')}）"
-            return {"score": _sc, "note": _note, "short": _feel}
+        from factors.policy.policy_score import load_panel, compute_score
+        panel = compute_score(load_panel())
+        latest = panel.dropna(subset=["score"]).tail(1)
+        if latest.empty:
+            raise ValueError("四因子政策评分缺完整历史")
+        row = latest.iloc[0]
+        _require_macro_fresh(row["month"])
+        value = float(row["score"])
+        return {"score": round(max(25., min(98., 70 + value * 45)), 1), "ready": True,
+                "source": "EPU+social_finance+bond_yield", "asof": row["month"],
+                "note": f"真实本地四因子政策评分({row['month']})", "short": row["bucket"]}
     except Exception:
         pass
     try:
         from factors.policy.epu_factors import load_epu_monthly
         df = load_epu_monthly()
         if df is None or df.empty:
-            return {"score": 50, "note": "EPU 无数据（中性）", "short": "中性"}
+            return {"score": None, "ready": False, "note": "EPU无数据，未生成政策分"}
         s = df["epu"].dropna()
         if len(s) < 12:
-            return {"score": 50, "note": f"EPU 样本不足（{len(s)}月）", "short": "中性"}
+            return {"score": None, "ready": False, "note": f"EPU样本不足({len(s)}月)，未生成政策分"}
+        _require_macro_fresh(str(s.index[-1]))
         cur = float(s.iloc[-1])
         z12 = (cur - s.iloc[-12:].mean()) / (s.iloc[-12:].std() + 1e-9)
         # 3 月趋势：cur 相对 3 月前变化（下降=改善）
@@ -163,9 +177,10 @@ def policy_score() -> dict:
         sc = round(max(10, min(100, base + bonus)), 1)
         _trend_txt = "改善" if trend == -1 else ("收紧" if trend == 1 else "持平")
         note = f"EPU={cur:.0f}（z12={z12:+.2f}，{_trend_txt}）[EPU 兜底]"
-        return {"score": sc, "note": note, "short": "政策" + _trend_txt if trend != 0 else "政策中性"}
+        return {"score": sc, "ready": True, "limited": True, "source": "EPU_only", "asof": str(s.index[-1]),
+                "note": note, "short": "政策" + _trend_txt if trend != 0 else "政策中性"}
     except Exception as e:
-        return {"score": 50, "note": f"政策分异常（{str(e)[:40]}，中性）", "short": "中性"}
+        return {"score": None, "ready": False, "note": "政策源缺失、陈旧或计算失败，未生成中性兜底分"}
 
 
 def macro_score() -> dict:
@@ -175,25 +190,27 @@ def macro_score() -> dict:
     - y10 近5日 vs 前5日：下行(宽松) +4 / 上行(收紧) -4
     失败回退 regime 代理（原逻辑）。★H27 等权口径修正保留（#66）。"""
     try:
-        fs = sorted(glob.glob(str(OUT_DIR / "daily_signal_*.json")), key=os.path.getmtime)
-        if not fs:
-            return {"score": 50, "note": "无择时信号（中性）"}
-        d = json.loads(Path(fs[-1]).read_text(encoding="utf-8"))
-        rl = d.get("regime_label", "")
-        mapping = {"strong_uptrend": 90, "uptrend": 75, "choppy": 55,
-                   "downtrend": 30, "strong_downtrend": 15}
-        sc = mapping.get(rl, 50)
-        _rl_cn = {"strong_uptrend": "强势上行", "uptrend": "上行", "choppy": "震荡",
-                  "downtrend": "下行", "strong_downtrend": "弱势下行"}.get(rl, "中性")
-        note = f"Regime={rl}"
+        regime = json.loads((OUT_DIR / "dynamic_regime.json").read_text(encoding="utf-8"))
+        asof = _merged_max_date()
+        d = regime.get(asof[:7]) or {}
+        rl = d.get("level")
+        mapping = {"full": 90, "half": 55, "exit": 30}
+        if rl not in mapping or str(d.get("signal_month", "9999")) >= asof[:7]:
+            raise ValueError("缺少当前生效regime")
+        sc = mapping[rl]
+        _rl_cn = {"full": "均线向上", "half": "均线观望", "exit": "均线向下"}[rl]
+        note = f"生效Regime={rl}({asof[:7]})"
         # ★#105 真实宏观库修正（macro.db immutable）
         try:
             import sqlite3 as _sq
-            _con = _sq.connect("file:data/cache/macro.db?mode=ro&immutable=1",
-                               uri=True, timeout=3)
+            _con = research_connect(cache_dir() / "macro.db")
             # 社融趋势（近3月均 vs 近6月均；1 月季节性冲高用 6 月整体基准平滑）
+            _last_sf = _con.execute("SELECT MAX(month) FROM social_finance").fetchone()[0]
+            _require_macro_fresh(_last_sf)
             _sf = [r[0] for r in _con.execute(
                 "SELECT sf_increment FROM social_finance ORDER BY month DESC LIMIT 6").fetchall()]
+            if len(_sf) < 6:
+                raise ValueError("社融历史不足")
             if len(_sf) >= 6:
                 _r3 = sum(_sf[:3]) / 3
                 _a6 = sum(_sf) / 6
@@ -208,7 +225,11 @@ def macro_score() -> dict:
             # 利率趋势（y10 近5日 vs 前5日；下行=宽松）
             _y = [r[0] for r in _con.execute(
                 "SELECT y10 FROM bond_yield ORDER BY date DESC LIMIT 20").fetchall()]
+            _last_y = _con.execute("SELECT MAX(date) FROM bond_yield").fetchone()[0]
             _con.close()
+            _require_macro_fresh(_last_y)
+            if len(_y) < 20:
+                raise ValueError("国债历史不足")
             if len(_y) >= 20:
                 _yr = sum(_y[:5]) / 5
                 _yp = sum(_y[15:20]) / 5
@@ -221,7 +242,7 @@ def macro_score() -> dict:
                 else:
                     note += "｜利率持平"
         except Exception:
-            note += "（宏观库不可用，纯 regime 代理）"
+            return {"score": None, "ready": False, "note": "社融或国债数据缺失/陈旧，未生成宏观兜底分"}
         # ★H27 等权口径修正（★#135 加快照新鲜度防护：内容滞后>3 交易日跳过并标注）
         try:
             _sf = _snapshot_fresh()
@@ -240,7 +261,7 @@ def macro_score() -> dict:
         sc = max(5, min(100, sc))
         return {"score": sc, "note": note, "short": _rl_cn}
     except Exception as e:
-        return {"score": 50, "note": f"宏观分异常（{str(e)[:40]}）"}
+        return {"score": None, "ready": False, "note": "宏观源或生效regime不可用"}
 
 
 def sentiment_score() -> dict:
@@ -280,25 +301,25 @@ def sentiment_score() -> dict:
         con = _bars_conn()
         mx = _merged_max_date()   # ★#135 双库合并探测（增量库可能含更新日）
         rows = con.execute(
-            "SELECT close, preclose, volume, amount FROM daily_bar WHERE date=?", (mx,)).fetchall()
+            "SELECT close, preclose, volume, amount FROM daily_bar WHERE date=? AND adjust='none' AND code NOT LIKE 'SH.%' AND code NOT LIKE 'SZ.%'", (mx,)).fetchall()
         con.close()
         if not rows:
-            return {"score": 50, "note": "bars 无数据（中性）"}
+            return {"score": None, "ready": False, "note": "没有真实当日行情，未生成中性分"}
         n = len(rows)
         lu = sum(1 for r in rows if r[0] and r[1] and r[0] / r[1] >= 1.097)
         lu_pct = lu / n * 100
         if lu_pct >= 4:
             sc = max(20, 75 - (lu_pct - 4) * 15)
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）过热降温"
+            note = f"涨幅≥9.7%代理 {lu}只（{lu_pct:.1f}%）过热降温"
         elif lu_pct >= 1.5:
             sc = min(85, 55 + lu_pct * 8)
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪活跃"
+            note = f"涨幅≥9.7%代理 {lu}只（{lu_pct:.1f}%）情绪活跃"
         elif lu_pct >= 0.5:
             sc = 45
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪平淡"
+            note = f"涨幅≥9.7%代理 {lu}只（{lu_pct:.1f}%）情绪平淡"
         else:
             sc = 25
-            note = f"涨停 {lu} 只（{lu_pct:.1f}%）情绪冰点"
+            note = f"涨幅≥9.7%代理 {lu}只（{lu_pct:.1f}%）情绪冰点"
         vols = [r[2] for r in rows if r[2]]
         if vols:
             import statistics
@@ -307,9 +328,9 @@ def sentiment_score() -> dict:
             temp = "量能适中" if 0.8 < vs / (vm + 1e-9) < 1.3 else ("量能放大" if vs / (vm + 1e-9) >= 1.3 else "量能萎缩")
             note += f"｜{temp}"
         note += "（bars 兜底）"
-        return {"score": round(sc, 1), "note": note, "short": "涨停情绪"}
+        return {"score": round(sc, 1), "note": note, "short": "大涨家数代理"}
     except Exception as e:
-        return {"score": 50, "note": f"情绪分异常（{str(e)[:40]}）"}
+        return {"score": None, "ready": False, "note": "情绪行情源或计算不可用"}
 
 
 def breadth_score() -> dict:
@@ -361,76 +382,35 @@ def breadth_score() -> dict:
     # bars 兜底（外包快照缺失）：当日上涨家数占比
     try:
         con = _bars_conn()
-        mx = _merged_max_date()   # ★#135 双库合并探测
-        rows = con.execute(
-            "SELECT close, preclose FROM daily_bar WHERE date=?", (mx,)).fetchall()
-        con.close()
-        if not rows:
-            return {"score": 50, "note": "bars 无数据（中性）"}
-        n = len(rows)
-        up = sum(1 for r in rows if r[0] and r[1] and r[0] > r[1])
+        mx = _merged_max_date()
+        try:
+            con.execute('ATTACH DATABASE ? AS metadata', ((cache_dir()/'stock_basic.db').resolve().as_uri()+'?mode=ro',))
+            row = con.execute(
+                "SELECT COUNT(*),SUM(CASE WHEN pct_chg>0 THEN 1 ELSE 0 END),"
+                "SUM(CASE WHEN pct_chg<0 THEN 1 ELSE 0 END),"
+                "SUM(CASE WHEN pct_chg=0 THEN 1 ELSE 0 END) FROM daily_bar "
+                "WHERE date=? AND adjust='none' AND code IN "
+                "(SELECT code FROM metadata.stock_basic WHERE code LIKE '%.SH' OR code LIKE '%.SZ')", (mx,)).fetchone()
+        finally:
+            con.close()
+        total_rows, up, down, flat = (int(value or 0) for value in row)
+        n = up+down+flat
+        if not n:
+            return {"score": None, "ready": False, "note": "没有真实沪深A股涨跌幅观测，未生成中性分"}
         pct = up / n
         sc = max(10, min(95, pct * 100 * 1.1))   # 50% 宽度 → 55 分
         state = "普涨" if pct >= 0.6 else ("涨多跌少" if pct >= 0.5 else ("跌多涨少" if pct >= 0.4 else "普跌"))
-        return {"score": round(sc, 1), "note": f"上涨 {up}/{n}（{pct:.0%}）{state}（bars 兜底）"}
+        return {"score": round(sc, 1), "note": f"上涨 {up}/{n}（{pct:.0%}）{state}（沪深A股·未复权）",
+                "source": "bars:none+stock_basic", "scope": "all_sh_sz_a_shares", "asof": mx,
+                "up": up, "down": down, "flat": flat, "total": n, "unknown": total_rows-n}
     except Exception as e:
-        return {"score": 50, "note": f"宽度分异常（{str(e)[:40]}）"}
+        return {"score": None, "ready": False, "note": "市场宽度源或计算不可用"}
 
 
 def _style_state() -> dict:
-    """★2026-08-12 百轮后#127：风格状态（外包 C8 建议落地——风格门控输入）。
-    综合外包 market_snapshot_ext 两维：ind_breadth_60（行业轮动强度，H30 实证）+
-    divergence_60（大小盘分化，H27 实证）→ 三态风格：
-      小盘反转行情（ind_breadth 冰点 <0.2 + 小盘相对强）→ 反转/短线类适配 +
-      核心资产行情（ind_breadth 高位 >0.5 + 大盘相对强）→ 反转/短线类适配 --（C8：2020-2022
-        核心资产期低换手/反转因子系统性失效 -1.69~-3.72pp）
-      均衡 → 中性
-    外包缺失 → 未知（不叠加适配，回归纯环境档）。
-    """
-    try:
-        _sf = _snapshot_fresh()   # ★#135 快照内容日期新鲜度检查（复用，统一读取点）
-        d = _sf.get("snap")
-        if not d:
-            return {"style": "未知", "note": "外包快照缺失", "divergence_60": None, "ind_breadth_60": None,
-                    "fresh": False}
-        if not _sf.get("fresh"):
-            return {"style": "未知", "note": f"外包快照内容滞后 {_sf.get('lag_days')} 天（{d.get('date')}），风格暂不判定",
-                    "divergence_60": _f(d.get("divergence_60")), "ind_breadth_60": _f(d.get("ind_breadth_60")),
-                    "fresh": False, "snap_file": _sf.get("file")}
-        ib = _f(d.get("ind_breadth_60"))
-        dv = _f(d.get("divergence_60"))
-        # ★2026-08-12 C-10 量化拥挤度（外包 crowding_signal → market_snapshot_ext 字段）：
-        #   crowding_pctile>0.8=市场过热（C-10 实证：拥挤度 Q5 未来20日仅 +0.19% vs Q1 +2.45%）
-        cp = _f(d.get("crowding_pctile"))
-        if ib is None and dv is None and cp is None:
-            return {"style": "未知", "note": "外包快照无风格字段", "divergence_60": dv, "ind_breadth_60": ib}
-        # 判小盘/大盘相对强弱：divergence_60>0 = 大盘强（前50>等权），<0 = 小盘强
-        small_strong = (dv is not None and dv < -0.02)
-        big_strong = (dv is not None and dv > 0.02)
-        # C8 风格判定（基于 H30 行业宽度 + H27 分化）
-        if ib is not None and ib < 0.2 and not big_strong:
-            style = "小盘反转行情"
-            note = f"行业宽度 {ib:.1%} 冰点（H30 恐慌底部 +23.7%）" + (" + 小盘相对强" if small_strong else "")
-        elif ib is not None and ib >= 0.5 and big_strong:
-            style = "核心资产行情"
-            note = f"行业宽度 {ib:.1%} 活跃 + 大盘相对强（C8：2020-2022 反转因子失效期特征）"
-        else:
-            style = "均衡"
-            note = f"行业宽度 {ib:.1%} 分化 {dv:+.0%}" if ib is not None and dv is not None else "风格中性"
-        # ★C-10 过热叠加：拥挤度分位 >0.8 → 过热预警（独立于风格的市场情绪温度）
-        if cp is not None and cp > 0.8:
-            if style != "核心资产行情":
-                style = "过热预警"
-            note = (note + f"；拥挤度分位 {cp:.0%} 过热（C-10：Q5 未来20日仅 +0.19%）")
-        elif cp is not None and cp > 0.6:
-            note = (note + f"；拥挤度分位 {cp:.0%} 偏高")
-        return {"style": style, "note": note,
-                "divergence_60": dv, "ind_breadth_60": ib, "crowding_pctile": cp,
-                "fresh": True, "snap_file": _sf.get("file"),
-                "evidence": "H30 行业轮动 + H27 大小盘分化 + C-10 量化拥挤（外包快照）"}
-    except Exception:
-        pass
-    return {"style": "未知", "note": "快照读取失败"}
+    """Read the real current-scope size diagnostic; never invent old external evidence."""
+    from data.style_diagnostic import public_state
+    return public_state()
 
 
 def _style_adjust(fit: dict, style: str) -> dict:
@@ -460,6 +440,13 @@ def evaluate() -> dict:
         "情绪": sentiment_score(),
         "宽度": breadth_score(),
     }
+    missing = [k for k, v in dims.items() if v.get("score") is None]
+    if missing:
+        return {"ts": datetime.now().isoformat(timespec="seconds"), "date": _latest_trade_date(),
+                "status": "unavailable", "ready": False, "level": "数据未就绪", "score": None,
+                "emoji": "⚪", "reason": "；".join(f"{k}:{dims[k]['note']}" for k in missing),
+                "dims": dims, "regime_fit": {"map": {}, "note": "源未齐备，不做适配判断"},
+                "style_state": {"style": "未知"}}
     w = {"政策": 0.40, "宏观": 0.25, "情绪": 0.20, "宽度": 0.15}
     total = round(sum(dims[k]["score"] * w[k] for k in w), 1)
     if total >= 60:
@@ -489,19 +476,21 @@ def evaluate() -> dict:
     # ★2026-08-12 百轮后#127：风格状态（C8 建议落地）——外包快照 H30 行业宽度 + H27 分化
     #   叠加修正 regime_fit（核心资产行情降反转类 / 小盘反转行情升反转类）
     _style = _style_state()
-    _fit_map = _style_adjust(fit, _style.get("style", "未知"))
+    _fit_map = (_style_adjust(fit, _style.get("style", "未知"))
+                if _style.get('calibrated') is True and _style.get('weights_enabled') is True else dict(fit))
     _style_tag = f"｜风格：{_style['style']}（{_style['note']}）" if _style.get("style") != "未知" else ""
     return {
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "date": _latest_trade_date(),
         "level": level,
         "emoji": emoji,
-        "score": total,
+        "score": total, "ready": True,
+        "status": "limited" if any(v.get("limited") for v in dims.values()) else "ready",
         "reason": reason[:300],
         "dims": dims,
         "regime_fit": {"map": _fit_map, "note": fit_note + _style_tag},   # ★2026-08-11 环境-类型适配（Pitch 卡片参考）/#127 风格叠加
         "style_state": _style,   # ★2026-08-12 百轮后#127 风格状态（C8 门控输入）
-        "formula": "政策40%+宏观25%+情绪20%+宽度15%；v3（08-12）：政策=四因子综合评分（EPU+社融+利差，#91）、情绪=外包温度计（越低越恐慌=买入区）、宽度=width5+行业宽度（H5b/H30 反向，行业优先）、宏观=regime+H27 等权降档；外包缺失自动回退 bars；#127 风格门控（H30+H27）叠加 regime_fit",
+        "formula": "政策40%+宏观25%+情绪20%+宽度15%；缺失维度不生成兜底分数；市值风格仅作未校准诊断，不修改类型适配。",
     }
 
 
@@ -513,10 +502,10 @@ def write_outputs(r: dict) -> Path:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     p = OUT_DIR / f"timing_system_{ts}.json"
-    p.write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
+    p.write_text(json.dumps(json_safe(r), ensure_ascii=False, indent=1), encoding="utf-8")
     try:
         (OUT_DIR / "timing_system.json").write_text(
-            json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
+            json.dumps(json_safe(r), ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception:
         pass
     return p

@@ -1,0 +1,231 @@
+# These research algorithms consume daily prices and financial statements.
+# Historical minute coverage is audited independently and is never implied complete.
+required_inputs: [daily, finance, assets]
+steps:
+- id: macro
+  label: 宏观真实数据
+  module: data.research_macro
+  outputs:
+  - path: runtime/research/macro-manifest.json
+  depends: []
+- id: traffic_light
+  label: 月度择时及仓位信号
+  module: data.traffic_light
+  outputs:
+  - path: output/traffic_light.json
+    kind: traffic_light
+  - path: output/dynamic_regime.json
+    kind: regime
+  depends: []
+- id: audit
+  label: 研究数据审计
+  module: risk.data_audit
+  outputs:
+  - path: report/data_audit_report_*.json
+    kind: audit
+  depends: []
+- id: calibration
+  label: 机会类型真实历史检验
+  module: factors.opportunities.backtest_winrate
+  args:
+  - --start
+  - auto
+  outputs:
+  - path: logs/opportunity_winrates.json
+  depends:
+  - audit
+- id: beneish
+  label: 财务风险分析
+  module: risk.beneish_full
+  args:
+  - --scan
+  outputs:
+  - path: logs/beneish_report*.json
+    kind: beneish
+  depends:
+  - audit
+- id: stock_risk
+  label: 个股风险扫描
+  module: risk.stock_risk
+  args:
+  - --scan
+  outputs:
+  - path: logs/stock_risk_map*.json
+  depends:
+  - beneish
+- id: factor_pool
+  label: 因子计算及历史验证
+  module: data.research_factors
+  outputs:
+  - path: report/factor_pool_report.json
+    kind: factor_pool
+  depends:
+  - audit
+- id: sectors
+  label: 板块研究及历史证据
+  module: data.sector_research
+  args: [--build]
+  outputs:
+  - path: output/sector_evidence.json
+  depends: [audit, calibration]
+- id: opp_pool
+  label: 机会池扫描
+  module: factors.opportunities.scan
+  args:
+  - --pitch
+  outputs:
+  - path: logs/opp_pool_*.json
+    kind: opp_pool
+  depends:
+  - calibration
+  - beneish
+  - factor_pool
+- id: pitch_v2
+  label: 决策卡及持有期证据
+  module: factors.opportunities.pitch_v2
+  outputs:
+  - path: logs/pitch_v2_*.json
+    kind: pitch_v2
+  depends:
+  - opp_pool
+- id: sim_tracks
+  label: 历史策略对照
+  module: strategy.sim_tracks
+  args:
+  - --start
+  - auto
+  outputs:
+  - path: logs/sim_tracks*.json
+    kind: sim_tracks
+  depends:
+  - calibration
+  - traffic_light
+- id: pool_layers
+  label: 观察候选决策分层
+  module: strategy.pool_layers
+  args:
+  - --n
+  - '100'
+  - --capital
+  - $capital
+  outputs:
+  - path: output/pool_layers_*.json
+    kind: pool_layers
+  depends:
+  - audit
+  - traffic_light
+- id: signal
+  label: 当日研究信号
+  module: report.daily_signal
+  outputs:
+  - path: output/daily_signal_*.json
+    kind: signal
+  depends:
+  - audit
+  - traffic_light
+  - pool_layers
+  - opp_pool
+  - pitch_v2
+- id: global_rotation
+  label: 全球ETF代理轮动研究
+  module: data.global_rotation
+  outputs:
+  - path: output/global_rotation.json
+  depends: [audit]
+- id: style_diagnostic
+  label: 沪深300市值风格诊断
+  module: data.style_diagnostic
+  outputs:
+  - path: output/style_diagnostic.json
+  - path: data/factorpool/output/ui_data/factor_style_rotation_*.json
+  depends: [audit]
+- id: timing
+  label: 市场择时面板
+  module: factors.policy.timing_system
+  outputs:
+  - path: output/timing_system_*.json
+  depends:
+  - macro
+  - traffic_light
+  - factor_pool
+  - style_diagnostic
+- id: tech
+  label: 科技机会分析
+  module: factors.opportunities.tech_pitch_v3
+  outputs:
+  - path: logs/tech_pitch*.json
+  depends:
+  - opp_pool
+- id: pitch_track
+  label: 登记真实前向观察起点
+  module: factors.opportunities.pitch_track
+  args:
+  - --append
+  - $latest_pitch
+  - --update
+  outputs:
+  - path: logs/pitch_track_pool_*.json
+    kind: pitch_track
+  depends:
+  - pitch_v2
+- id: market_env
+  label: 市场环境快照
+  module: data.market_env
+  args:
+  - --force
+  outputs:
+  - path: report/market_env_*.json
+  depends:
+  - opp_pool
+- id: etf
+  label: ETF关联研究
+  module: etf.etf_map
+  outputs:
+  - path: output/etf_map.json
+  depends:
+  - audit
+- id: forward_attribution
+  label: 前向因子归因库初始化
+  module: data.build_factor_pitch_db
+  depends:
+  - pitch_track
+  outputs:
+  - path: data/cache/factor_pitch_perf.db
+- id: assets_audit
+  label: 数据资产清点
+  module: data.audit_data_assets
+  outputs:
+  - path: report/data_asset_audit_*.json
+  depends: []
+- id: unified
+  label: 统一研究库与血缘
+  module: data.build_unified_db
+  outputs:
+  - path: runtime/research/unified-manifest.json
+  depends:
+  - assets_audit
+  - forward_attribution
+- id: market_kb
+  label: 市场知识库
+  module: data.build_market_kb
+  args:
+  - --dump
+  outputs:
+  - path: report/market_kb_dump.json
+  depends:
+  - unified
+  - timing
+  - factor_pool
+- id: daily_report
+  label: 研究日报
+  module: data.daily_report_auto
+  args:
+  - --dry-run
+  outputs:
+  - path: report/daily_report_*.md
+  depends:
+  - signal
+  - timing
+  - pitch_v2
+  - market_kb
+  - global_rotation

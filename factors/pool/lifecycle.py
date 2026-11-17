@@ -28,6 +28,7 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
 from factors.pool.registry import FactorRegistry
 from factors.pool.eval_ts import evaluate_time_series, market_monthly_returns, THRESHOLDS
@@ -82,6 +83,8 @@ def evaluate_factor(reg: FactorRegistry, f: dict) -> dict:
         [sys.executable, "-X", "utf8", str(BASE / "validation" / "factor_evaluator.py"),
          "--factors", f["name"]],
         capture_output=True, text=True, timeout=1800, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        raise ValueError("横截面因子评估失败，不修改其历史状态")
     out = (r.stdout or "")[-1500:]
     # 从输出解析评分（factor_evaluator 输出格式为评分卡；宽松解析 score 行）
     score = None
@@ -92,6 +95,8 @@ def evaluate_factor(reg: FactorRegistry, f: dict) -> dict:
                 break
             except ValueError:
                 continue
+    if score is None:
+        raise ValueError("评估没有返回真实分数，不将缺数据误判淘汰")
     status = "active" if score and score >= 65 else ("candidate" if score and score >= 40 else "retired")
     detail = {"stdout_tail": out, "score_parsed": score}
     reg.update_score(f["name"], score, status=status, detail=detail)
@@ -124,6 +129,9 @@ def write_report(reg: FactorRegistry, evaluate_results: list = None):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     factors = reg.list_factors()
     stats = reg.stats()
+    if not factors:
+        raise ValueError("因子池尚未注册，拒绝生成空成功报告")
+    evaluated = [f for f in factors if f.get("score") is not None and f.get("last_eval_at")]
     lines = [f"# 因子池报告 · {datetime.now():%Y-%m-%d %H:%M:%S}", "",
              f"**池规模**：{stats['total']} 个因子（{stats['by_kind']}）",
              f"**状态分布**：{stats['by_status']}", "",
@@ -142,6 +150,8 @@ def write_report(reg: FactorRegistry, evaluate_results: list = None):
     json_path = OUT_DIR / "factor_pool_report.json"
     json_path.write_text(json.dumps(
         {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "stats": stats,
+         "status": "ready" if len(evaluated) == len(factors) else "limited",
+         "n_evaluated": len(evaluated), "n_pending": len(factors) - len(evaluated),
          "factors": [{k: f[k] for k in ("name", "family", "kind", "status", "score", "source", "note")} for f in factors]},
         ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"报告: {md_path}\n      {json_path}")

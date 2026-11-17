@@ -1,0 +1,41 @@
+cache_dir: data/cache
+data_exchanges: [SSE, SZSE]
+runtime_dir: runtime/research
+finance_parquet_dir: data/research/financials
+daily_start: '2019-01-01'
+index_start: '2010-01-01'
+finance_start: '2019-01-01'
+finance_scope: all_market
+finance_use_vip: true
+end: latest
+completed_session_cutoff: '17:00'
+minute_months: 3
+request_timeout: 30
+min_call_interval_seconds: 0.35
+request_attempts: 3
+retry_seconds: 3
+min_daily_rows: 2000
+historical_st: optional
+index_code: 000300.SH
+index_max_age_days: 45
+index_symbols: [000300.SH, 399106.SZ, 399006.SZ, 000510.SH]
+etf_pool_file: config/etf_pool.yaml
+analysis:
+  scope: hs300
+  universe_file: runtime/research/universe.json
+  cache_dir: data/cache
+  finance_parquet_dir: data/research/financials
+  min_history_days: 300
+  calibration_min_samples: 30
+  min_price: 1.5
+  beneish: {excluded_industries: [银行, 保险, 证券, 多元金融]}
+  timing: {max_macro_lag_months: 3}
+  sim_tracks: {start: auto, hold_months: 6, top_n: 5}
+  pool_layers:
+    above_ma50: true
+    max_dist_high52_pct: -20
+    min_vol_ratio: 0.8
+    industry_cap: 3
+    defensive_cash: 0.5
+    capital_bands: [{below: 100000, count: 5}, {below: 300000, count: 10}, {below: 1000000, count: 15}]
+    max_holdings: 20

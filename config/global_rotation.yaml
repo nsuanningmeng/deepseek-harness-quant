@@ -1,0 +1,30 @@
+research_config: config/research.yaml
+cache_database: data/cache/global_rotation.db
+identity_file: runtime/research/global-asset-identities.json
+output_file: output/global_rotation.json
+history_start: '2019-01-01'
+request_interval_seconds: 0.35
+maximum_source_rows: 5000
+momentum_window: 25
+return_windows: [20, 60]
+annualization_sessions: 252
+weight_start: 1.0
+weight_end: 2.0
+moving_average_window: 10
+weak_votes_required: 3
+r2_minimum: 0.4
+indices:
+  - {symbol: '000300.SH', name: 沪深300}
+  - {symbol: '399106.SZ', name: 深证综指}
+  - {symbol: '399006.SZ', name: 创业板指}
+  - {symbol: '000510.SH', name: 中证A500}
+assets:
+  - {symbol: '518880.SH', name: 黄金ETF, identity_contains: 黄金, category: 黄金, core_cache: true}
+  - {symbol: '513100.SH', name: 纳指ETF, identity_contains: 纳斯达克, category: 美国股票, core_cache: true}
+  - {symbol: '513500.SH', name: 标普500ETF, identity_contains: 标普, category: 美国股票, core_cache: true}
+  - {symbol: '513520.SH', name: 日经ETF, identity_contains: 日经, category: 日本股票, core_cache: false}
+  - {symbol: '513030.SH', name: 德国ETF, identity_contains: DAX, category: 德国股票, core_cache: false}
+  - {symbol: '512400.SH', name: 有色金属ETF, identity_contains: 有色, category: 有色金属股票, core_cache: false}
+  - {symbol: '159985.SZ', name: 豆粕ETF, identity_contains: 豆粕, category: 豆粕期货, core_cache: false}
+  - {symbol: '518800.SH', name: 黄金ETF2, identity_contains: 黄金, category: 黄金, core_cache: true}
+  - {symbol: '510300.SH', name: 沪深300ETF, identity_contains: 沪深300, category: 中国股票, core_cache: true}

@@ -11,6 +11,7 @@ import glob
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -56,63 +57,58 @@ def _read(pattern: str, subdir: str = "logs") -> dict:
     return {}
 
 
-def _bars_version() -> float:
-    """数据源版本 = bars.db + 增量库的最新 mtime（★0.01s；MAX(date) 全表扫 900 万行要 1s+）"""
+def _bars_version() -> tuple:
+    """Physical version only invalidates snapshots; readiness requires actual content queries."""
     try:
-        import glob as _g
-        fs = [r"data\cache\bars.db"] + _g.glob(r"data\cache\bars_incr_*.db")
-        mt = [os.path.getmtime(f) for f in fs if os.path.exists(f)]
-        return max(mt) if mt else 0.0
+        from deck.daily_status import source_version
+        return source_version()
     except Exception:
-        return 0.0
+        return ()
+
+
+def _complete_daily_status(*, wait=False):
+    from deck.daily_status import latest_complete_status
+    minimum = int(_health_config().get("daily_complete_min_symbols", 4000))
+    if minimum < 1:
+        return {"ready": False, "state": "failed", "date": None, "reason": "日线完整性门槛配置无效"}
+    return latest_complete_status(minimum, wait=wait)
+
+
+def _research_signal_view(signal):
+    """Research layers are observations, never an account, order or implicit hold plan."""
+    research = signal.get("kind") == "research_summary"
+    return {"kind": signal.get("kind"), "research_only": research,
+            "auto_trade_allowed": False if research else None,
+            "has_hold_plan": isinstance(signal.get("hold_plan"), list) and not research,
+            "has_buy_plan": isinstance(signal.get("buy_plan"), list) and not research,
+            "counts": {name: len(signal[name]) if isinstance(signal.get(name), list) else None for name in ("watch", "candidate", "decision", "pitch")},
+            "date": signal.get("date"), "regime": signal.get("regime") or {},
+            "source_files": signal.get("source_files") or [],
+            "note": signal.get("note") or ("当前产物只汇总研究层，不代表持仓、委托或成交" if research else "本项为历史研究记录，实时账户另见实时模拟盘")}
 
 
 def live_forward(force: bool = False) -> dict:
-    """远期池实时：update_fwd 重算（无变化不写文件）+ 数据源状态
+    """只读已落盘远期池及数据源状态；收益更新仅由研究管道负责。
     ★2026-08-10 性能优化：缓存键 = 数据文件版本（mtime）——数据源不变则 1h 内直接命中
     （重算 2.3s 只发生一次；命中 0ms 不查库）"""
     now = time.time()
-    ver = _bars_version()
+    pool_file = _latest_file("pitch_track_pool_*.json")
+    proof_file = BASE / "runtime/research/pipeline-state.json"
+    ver = (_bars_version(), pool_file.name if pool_file else None,
+           pool_file.stat().st_mtime if pool_file else None,
+           proof_file.stat().st_mtime if proof_file.is_file() else None)
     if not force and _fwd_cache["data"] is not None \
             and _fwd_cache.get("ver") == ver \
             and now - _fwd_cache["ts"] < 3600:
         return _fwd_cache["data"]
     try:
-        from factors.opportunities.pitch_track import update_fwd, summary
-        pool = update_fwd()
+        from factors.opportunities.pitch_track import load_latest, summary
+        pool = load_latest()
         s = summary()
     except Exception as e:
         return {"ok": False, "error": str(e)[:120]}
-    # 数据源状态（仅在重算时查一次——★#102 双库合并探测最新交易日）
-    # ★2026-08-13 #218：改用 DailyCache.latest_trade_date()（≥4000 只完整性门槛，
-    #   残缺占位日回退上一完整日）——原裸 MAX(date) 会虚标 08-12（183 只 baostock 残缺）
-    mx = None
-    try:
-        import sys as _sp4
-        if str(BASE) not in _sp4.path:
-            _sp4.path.insert(0, str(BASE))
-        from data.cache import DailyCache
-        mx = DailyCache().latest_trade_date()
-    except Exception:
-        mx = None
-    if not mx:
-        mx = None
-        try:
-            import sqlite3 as _sq2
-            from pathlib import Path as _P3
-            for _p in (["data/cache/bars.db"] +
-                       [str(p) for p in sorted(_P3("data/cache").glob("bars_incr_*.db"))[-3:]]):
-                try:
-                    con = _sq2.connect(_P3(_p).as_uri() + "?mode=ro&immutable=1",
-                                       uri=True, timeout=3)
-                    _m = con.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
-                    con.close()
-                    if _m and (_m > (mx or "")):
-                        mx = _m
-                except Exception:
-                    continue
-        except Exception:
-            pass
+    daily_status = _complete_daily_status()
+    mx = daily_status.get("date") if daily_status.get("ready") else None
     out = {
         "ok": True,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -121,9 +117,20 @@ def live_forward(force: bool = False) -> dict:
         "entries": pool.get("entries", []),
         "summary": s,
         "bars_latest": mx,
+        "daily_status": daily_status,
         "note": f"数据源（bars.db）最新 {mx}；下一交易日收盘后 T+1 自动填充" if mx else "",
     }
-    _fwd_cache.update({"ts": now, "data": out, "ver": ver})
+    from deck.research_views import verified_artifact, unavailable
+    verified = verified_artifact(pool_file)
+    mature = any(any(isinstance(value,dict) and value.get("ret") is not None for key,value in (entry.get("fwd") or {}).items() if key in ("t1","t5","t20","t60")) for entry in pool.get("entries",[]))
+    if not verified:
+        out.update(unavailable("远期观察产物尚未经过本轮算法及来源校验"))
+    else:
+        state="ready" if mature else "pending_history"
+        reason="已读取实际到期样本" if mature else "真实观察起点已登记，等待下一实际交易日和持有窗口成熟；没有补造未来收益"
+        out.update(state=state,initialized=True,ready=mature,reason=reason)
+    if daily_status.get("state") != "probing":
+        _fwd_cache.update({"ts": now, "data": out, "ver": ver})
     return out
 
 
@@ -276,21 +283,22 @@ def live_opp() -> dict:
         af = _latest_file("data_audit_report_*.json", "report")
         da = json.loads(af.read_text(encoding="utf-8")) if af else {}
         overview = {
-            "gate_ok": ds.get("gate", {}).get("ok", True),
-            "gate_reason": ds.get("gate", {}).get("reason", ""),
-            "audit_blocked": da.get("blocked", False),
+            "gate_ok": ds.get("gate", {}).get("ok"),
+            "gate_reason": ds.get("gate", {}).get("reason") or ("研究汇总不提供交易闸门结论" if ds.get("kind")=="research_summary" else ""),
+            "audit_blocked": da.get("blocked"),
             "audit_block_reason": da.get("block_reason", ""),
-            "audit_health": da.get("health", 0),
-            "audit_pass": da.get("n_pass", 0),
-            "audit_fail": da.get("n_fail", 0),
+            "audit_health": da.get("health"),
+            "audit_pass": da.get("n_pass"),
+            "audit_fail": da.get("n_fail"),
             "regime_cn": {"strong_uptrend": "强势上行", "uptrend": "上行", "choppy": "震荡",
                           "downtrend": "下行", "strong_downtrend": "深度下行"}.get(
                               ds.get("regime_label", ""), ds.get("regime_label", "—")),
             "regime_level": {"full": "满仓", "half": "减仓", "exit": "离场"}.get(
                 ds.get("regime_level", ""), "—"),
-            "regime_cash": ds.get("regime_cash_ratio", 0),
-            "n_passed": ds.get("n_passed", "—"),
-            "advice": str(ds.get("advice", "—"))[:60],
+            "regime_cash": ds.get("regime_cash_ratio"),
+            "n_passed": ds.get("n_passed"),
+            "advice": str(ds.get("note") or ds.get("advice") or "尚无结论")[:100],
+            "signal_summary": _research_signal_view(ds),
         }
     except Exception:
         pass
@@ -306,10 +314,11 @@ def live_opp() -> dict:
     # ★2026-08-12 用户需求#180：系统建议标记 + 补位——daily_signal 的 hold_plan（策略决策池 20 只）
     #   与 scan 触发信号（196 只）是两条管线，建议里不在机会池的补进来（📌 建议标记），
     #   用户机会池一屏看全系统建议
-    n_suggested = 0
+    n_suggested = None
     try:
         _sdg = _read("daily_signal_*.json", "output")
-        _holds = _sdg.get("hold_plan") or []
+        _holds = _sdg.get("hold_plan") if _sdg.get("kind")!="research_summary" else None
+        n_suggested = 0 if isinstance(_holds,list) else None
         if _holds:
             _hmap = {x.get("code"): x for x in _holds}
             _have = {o.get("code") for o in ops}
@@ -381,11 +390,13 @@ def live_holdings() -> dict:
     tp = _read("take_profit_signals_*.json")      # ★2026-08-11 止盈引擎（持仓止盈状态）
     sa = _read("stop_alerts_*.json")              # ★2026-08-11 止损预警（池级监测）
     pf = {}
+    portfolio_recorded = False
     try:
         import sys as _s
         if str(BASE) not in _s.path:
             _s.path.insert(0, str(BASE))
-        from strategy.portfolio import _load
+        from strategy.portfolio import _load, _latest_glob, PORTFOLIO_JSON
+        portfolio_recorded = _latest_glob("portfolio_*.json",PORTFOLIO_JSON).is_file()
         pf = _load()
     except Exception:
         pass
@@ -478,8 +489,8 @@ def live_holdings() -> dict:
     _over = [p for p in pf.get("positions", []) if p.get("status") == "over_limit"]
     pf["_held"] = _held
     pf["_over"] = _over
-    pf["n_holding"] = len(_held)
-    pf["n_over_limit"] = len(_over)
+    pf["n_holding"] = len(_held) if portfolio_recorded else None
+    pf["n_over_limit"] = len(_over) if portfolio_recorded else None
     # ★2026-08-14 效率优化：stop_alerts 全池监测（114 条）仅持仓页使用其中持仓相关几条——
     #   裁剪为持仓相关条目（前端只用这些），payload 130KB→小，且语义聚焦"我的持仓预警"
     try:
@@ -498,6 +509,8 @@ def live_holdings() -> dict:
         "position_risk": pr,
         "sim_tracks": st,
         "daily_signal": ds,
+        "signal_summary": _research_signal_view(ds),
+        "portfolio_recorded": portfolio_recorded,
         "portfolio": pf,
         "pnl": pnl,           # ★2026-08-11 百轮#38 持仓盈亏总览（组合/个股）
         "industry_exposure": _ind_expo,   # ★2026-08-12 百轮后#119 行业敞口（持仓分布）
@@ -508,77 +521,57 @@ def live_holdings() -> dict:
 
 
 def portfolio_pnl() -> dict:
-    """★2026-08-11 百轮#38：持仓盈亏总览——每只持仓现价/成本/收益率/盈亏 + 组合汇总
-    entry_price 缺失（历史审批未记价）→ 尝试回填审批日收盘价并落盘"""
-    import sys as _s
-    if str(BASE) not in _s.path:
-        _s.path.insert(0, str(BASE))
+    """Read-only valuation. Missing recorded cost stays unknown; no historical price is written as a fill."""
+    import math
+    def positive(value):
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+        except (TypeError, ValueError):
+            return None
     try:
-        from strategy.portfolio import _load, _save, _entry_price_of, _latest_close_of
+        from strategy.portfolio import _load, _latest_close_of
         pf = _load()
     except Exception:
-        return {"ok": False, "error": "portfolio 加载失败"}
-    positions = [p for p in pf.get("positions", [])
-                 if p.get("status") == "holding"]
-    changed = False
-    # ★2026-08-14 持仓页实时收益：盘中用新浪实时价（live_realtime 60s 缓存，0 成本），
-    #   非交易时段/拉取失败自动回落日线最新收盘——解决"盘中持仓收益恒 0%（用昨日收盘 vs 昨收买入）"
-    _rt = None
+        return {"ok":False,"error":"portfolio加载失败"}
+    positions = [p for p in pf.get("positions",[]) if p.get("status")=="holding"]
+    realtime = None
     try:
-        _rt = live_realtime()
+        realtime = live_realtime() if positions else None
     except Exception:
-        _rt = None
-    _quotes = (_rt or {}).get("quotes") if (_rt or {}).get("ok") else None
-    _rt_active = bool(_quotes) and (_rt or {}).get("market_open") is True
-    rows, total_cost, total_val = [], 0.0, 0.0
-    for p in positions:
-        code = p.get("code", "")
-        entry = p.get("entry_price")
-        if entry is None:
-            entry = _entry_price_of(code, p.get("entry_date", ""))
-            if entry is not None:
-                p["entry_price"] = entry
-                changed = True
-        # 实时价优先（盘中），否则日线最新收盘
-        last = None
-        _px_src = "daily"
-        if _rt_active and _quotes:
-            _q = _quotes.get(code)
-            if _q and _q.get("price"):
-                last = _q["price"]
-                _px_src = "realtime"
+        pass
+    quotes = (realtime or {}).get("quotes") if (realtime or {}).get("ok") and (realtime or {}).get("market_open") is True else {}
+    if isinstance(quotes,list):
+        quotes = {q.get("symbol") or q.get("code"):q for q in quotes if isinstance(q,dict)}
+    if not isinstance(quotes,dict):
+        quotes = {}
+    rows = []
+    for position in positions:
+        code = position.get("code","")
+        entry = positive(position.get("entry_price"))
+        quote = quotes.get(code) or {}
+        last = positive(quote.get("price") if quote.get("price") is not None else quote.get("last"))
+        price_source = "realtime" if last is not None else "daily"
         if last is None:
-            last = _latest_close_of(code)
-        ret = (last / entry - 1) if (entry and last) else None
-        # 收益率基准：无股数 → 按 1 股等权展示（收益率即可，金额按 cost 或现值）
-        cost = (p.get("cost") or entry) if entry else None
-        val = cost * (1 + ret) if (cost and ret is not None) else None
-        if cost:
-            total_cost += cost
-        if val:
-            total_val += val
-        rows.append({
-            "code": code, "name": p.get("name", code),
-            "entry_date": p.get("entry_date"), "entry_price": entry,
-            "last_price": last, "ret": ret,
-            "status": p.get("status"),
-            "price_src": _px_src,   # ★2026-08-14 价格来源标注（realtime/daily）
-        })
-    if changed:
-        try:
-            _save(pf)
-        except Exception:
-            pass
-    total_ret = (total_val / total_cost - 1) if total_cost else None
-    return {
-        "ok": True,
-        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "n_holdings": len(rows),
-        "total_cost": round(total_cost, 2) if total_cost else None,
-        "total_value": round(total_val, 2) if total_val else None,
-        "total_ret": round(total_ret, 4) if total_ret is not None else None,
-        "rows": rows,
-    }
+            last = positive(_latest_close_of(code))
+        quantity = positive(position.get("quantity") if position.get("quantity") is not None else position.get("shares"))
+        cost = positive(position.get("cost"))
+        if cost is None and entry is not None and quantity is not None:
+            cost = entry * quantity
+        value = last * quantity if last is not None and quantity is not None else cost * last / entry if cost is not None and last is not None and entry is not None else None
+        ret = last / entry - 1 if last is not None and entry is not None else None
+        reason = "缺少已记录的真实成交成本，未用市场价格或历史价格补写" if entry is None else "缺少实际股数或成本金额，金额估值不可核验" if cost is None or value is None else "按已记录成本与实际行情估值"
+        rows.append({"code":code,"name":position.get("name",code),"entry_date":position.get("entry_date"),
+                     "entry_price":entry,"last_price":last,"ret":ret,"quantity":quantity,"cost":cost,"market_value":value,
+                     "status":position.get("status"),"price_src":price_source,"reason":reason})
+    complete = bool(rows) and all(row["cost"] is not None and row["market_value"] is not None and row["entry_price"] is not None for row in rows)
+    total_cost = sum(row["cost"] for row in rows) if complete else None
+    total_value = sum(row["market_value"] for row in rows) if complete else None
+    return {"ok":True,"ts":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"n_holdings":len(rows),
+            "valuation_complete":complete,"total_cost":round(total_cost,2) if total_cost is not None else None,
+            "total_value":round(total_value,2) if total_value is not None else None,
+            "total_ret":round(total_value/total_cost-1,4) if total_cost else None,"rows":rows,
+            "reason":"真实持仓金额与成本已核验" if complete else "当前无持仓" if not rows else "部分持仓缺少实际成本或数量，组合金额收益保持未知"}
 
 
 def live_tech() -> dict:
@@ -587,9 +580,10 @@ def live_tech() -> dict:
     if not d:
         return {"ok": False, "error": "tech_pitch 未生成"}
     return {
+        **d,
         "ok": True,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "threshold": d.get("threshold", 62),
+        "threshold": d.get("threshold"),
         "pool_date": d.get("pool_date", ""),
         "entries": d.get("entries", []),
         "new_codes": d.get("new_codes", []),
@@ -606,16 +600,21 @@ def live_pools() -> dict:
     track = _read("pitch_track_pool_*.json")
     # ★#347 持仓止损预警：只统计真实持仓（holding）的临近/触发——远期池全量监测（monitored 86 只）
     #   不是"我的持仓预警"，门户 KPI 应显示持仓维度（机器池/自动池自动止损止盈不在此提醒，#340 精神）
-    held_trig = held_near = held_n = 0
+    held_trig = held_near = held_n = None
+    portfolio_recorded = False
     try:
         # ★2026-08-14 口径修复：只算真实持仓（holding），排除 over_limit（超 5 只纪律拒绝非持仓）
         #   （原 positions() 含 over_limit → 门户 KPI"持仓 6"与实际 5 不符）
-        from strategy.portfolio import _load as _pl
+        from strategy.portfolio import _load as _pl, _latest_glob, PORTFOLIO_JSON
+        portfolio_recorded = _latest_glob("portfolio_*.json",PORTFOLIO_JSON).is_file()
         _pos_codes = {p["code"] for p in _pl().get("positions", [])
                       if p.get("status") == "holding"}
-        held_n = len(_pos_codes)
+        if portfolio_recorded:
+            held_n = len(_pos_codes)
+            if not _pos_codes or isinstance(stop.get("entries"),list):
+                held_trig = held_near = 0
         for _e in (stop.get("entries") or []):
-            if _e.get("code") in _pos_codes:
+            if portfolio_recorded and held_trig is not None and _e.get("code") in _pos_codes:
                 if _e.get("status") == "TRIGGERED":
                     held_trig += 1
                 elif _e.get("status") == "NEAR":
@@ -640,8 +639,10 @@ def live_pools() -> dict:
         "tech_pitch": {"n": len(tech.get("entries", [])), "new": len(tech.get("new_codes", [])),
                        "date": tech.get("pool_date", ""),
                        "types": _otype_dist(tech.get("entries", []), key="otype")},
-        "stop_alerts": {"triggered": stop.get("triggered", 0), "near": stop.get("near", 0),
-                        "monitored": stop.get("monitored", 0), "ts": stop.get("ts", ""),
+        "stop_alerts": {"triggered": stop.get("triggered"), "near": stop.get("near"),
+                        "monitored": stop.get("monitored"), "ts": stop.get("ts", ""),
+                        "portfolio_recorded":portfolio_recorded,
+                        "reason":"尚无历史审批组合记录，持仓预警数量未知" if not portfolio_recorded else "已读取实际审批持仓及预警记录" if held_trig is not None else "持仓存在，但预警产物尚未生成",
                         "held_triggered": held_trig, "held_near": held_near, "held_n": held_n},
         "forward_track": {"n": len(track.get("entries", [])), "ts": track.get("ts", "")},
     }
@@ -718,6 +719,11 @@ def live_alerts() -> dict:
     try:
         chain = live_chain().get("chain", [])
         for n in chain:
+            if n.get("state") in ("optional_unconfigured","pending_history"):
+                continue  # Expected history/extensions remain visible in the chain, not a broken pipeline alarm.
+            if not n.get("ok") and n.get("state") in ("rate_limited","permission_blocked","probing","initializing"):
+                alerts.append({"level":"mid","cat":"数据核验","msg":n["name"]+"："+(n.get("note") or n.get("state"))})
+                continue
             if not n.get("ok") and not ("内容滞后" in (n.get("note") or "") or "供应商" in (n.get("note") or "")):
                 alerts.append({"level": "high", "cat": "数据",
                                "msg": f"{n['name']} 数据断链（{n.get('file') or '无文件'}）"})
@@ -753,7 +759,6 @@ def live_alerts() -> dict:
                 alerts.append({"level": "mid", "cat": "数据",
                                "msg": f"因子池五强覆盖偏低：{'、'.join(_cov_low)}（<75% → 决策链共识降级，待外包重生成）"})
         for _pat, _label, _dir in (("market_snapshot_ext*.json", "市场快照", None),
-                                   ("market_emotion_temp*.json", "情绪温度计", None),
                                    ("risk_multiplier_*.json", "FRC 风控系数", "risk")):
             _sd = "data/factorpool/output"
             _base = (_P(_sd).parent / _dir) if _dir else _P(_sd)   # risk 在 因子池/risk/（output 的父级）
@@ -928,21 +933,26 @@ def live_funnel() -> dict:
             pass
     pitch_total = pitch_n + tech_n
     # ★2026-08-15 全流程漏斗扩展（说明页动态决策流）：源头 → 硬过滤 → 机会池 → Pitch → 待审批 → 持仓 → 远期池
-    #   1) 源头：bars.db 全市场行数（qfq）
+    # Source inventory is already produced by the full offline audit. Do not scan
+    # millions of bars again on each UI/endpoint-monitor request.
     bars_rows = None
     try:
-        import sqlite3 as _sq
-        _c = _sq.connect("file:data/cache/bars.db?mode=ro&immutable=1", uri=True, timeout=3)
-        bars_rows = _c.execute("SELECT COUNT(*) FROM daily_bar WHERE adjust='qfq' AND code != 'SH.000300'").fetchone()[0]
-        _c.close()
+        from deck.research_views import verified_artifact
+        inventory_path=_latest_file("data_asset_audit_*.json","report")
+        if verified_artifact(inventory_path):
+            inventory=json.loads(inventory_path.read_text(encoding="utf-8"))
+            bars=next((db for db in inventory.get("dbs",[]) if db.get("name")=="bars.db"),{})
+            bars_rows=next((table.get("rows") for table in bars.get("tables",[]) if table.get("name")=="daily_bar"),None)
     except Exception:
         pass
     #   2) 硬过滤通过（daily_signal n_passed）
     n_passed = None
+    research_signal = {}
     _ds = _latest("daily_signal_*.json", "output")
     if _ds:
         try:
-            n_passed = json.loads(_ds.read_text(encoding="utf-8")).get("n_passed")
+            research_signal = json.loads(_ds.read_text(encoding="utf-8"))
+            n_passed = research_signal.get("n_passed")
         except Exception:
             pass
     #   3) 待审批（pitch_v2 + tech 中未 buy/drop 的）
@@ -983,17 +993,10 @@ def live_funnel() -> dict:
     #   5) 因子数（manifest）
     n_factors = None
     try:
-        import glob as _gf
-        _mf = sorted(_gf.glob(str(BASE / "logs" / "factor_manifest*.json")), key=_os.path.getmtime)
-        if not _mf:
-            _mf = sorted(_gf.glob(r"data\factorpool\output\factor_manifest_*.json"),
-                         key=_os.path.getmtime)
-        if _mf:
-            _md = json.load(open(_mf[-1], encoding="utf-8"))
-            _lst = _md.get("factors") if isinstance(_md.get("factors"), list) else _md.get("manifest")
-            if _lst is None and isinstance(_md, dict):
-                _lst = [k for k in _md if k not in ("date", "n_factors", "health_date", "note")]
-            n_factors = len(_lst) if _lst else _md.get("n_factors")
+        from deck.research_views import factor_inputs
+        _md = factor_inputs()[2]
+        if isinstance(_md.get("factors"),list):
+            n_factors = len(_md["factors"])
     except Exception as _e:
         print(f"[live_funnel] manifest 读取失败: {_e}", flush=True)
         pass
@@ -1001,15 +1004,16 @@ def live_funnel() -> dict:
         "ok": True,
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "opp_date": opp_date,
+        "signal_summary": _research_signal_view(research_signal),
         "funnel": [
-            {"name": "源头数据", "n": bars_rows, "desc": "bars.db qfq 全市场日线行数（2010-2026，5818 只）"},
-            {"name": "因子库", "n": n_factors, "desc": "因子池 manifest（123 因子）"},
-            {"name": "硬过滤通过", "n": n_passed, "desc": "非ST/退市/市值≥50亿/流动性≥0.1亿（daily_signal）"},
-            {"name": "机会池", "n": opp_n, "desc": "全市场信号机会（长线）"},
+            {"name": "主库行情", "n": bars_rows, "desc": "真实离线资产审计记录的主库日线总行数（各复权口径合计）；覆盖日期另见数据健康" if bars_rows is not None else "尚无通过来源及文件哈希核验的日线资产清点，行数保持未知"},
+            {"name": "实际支持因子", "n": n_factors, "desc": "当前真实因子清单，不沿用旧的静态因子总数"},
+            {"name": "候选研究层" if research_signal.get("kind")=="research_summary" else "硬过滤通过", "n": len(research_signal["candidate"]) if research_signal.get("kind")=="research_summary" and isinstance(research_signal.get("candidate"),list) else n_passed, "desc": "研究汇总候选数量，不代表持仓或通过交易风控" if research_signal.get("kind")=="research_summary" else "历史信号明确记录的过滤结果；缺值保持未知"},
+            {"name": "机会池", "n": opp_n, "desc": "本次实际研究股票池中的信号机会"},
             {"name": "Pitch 候选", "n": pitch_total, "desc": f"长线 {pitch_n} + 短线 {tech_n}，通过门槛/直通/共识"},
             {"name": "待审批", "n": n_pending, "desc": "Pitch 候选 - 已 buy/drop（决策台待你审批）"},
-            {"name": "持仓", "n": n_held, "desc": "真实持仓（≤5 纪律）"},
-            {"name": "远期池", "n": n_forward, "desc": "入池后追踪 T+1/5/20/60 实盘验证"},
+            {"name": "研究审批持仓", "n": n_held, "desc": "历史审批记录，实时AI账户另见实时模拟盘"},
+            {"name": "远期池", "n": n_forward, "desc": "入池后等待真实交易日窗口成熟的前向观察"},
         ],
         "ratio_pitch": round(pitch_total / opp_n, 3) if opp_n else None,
         "elimination": elim,        # ★#71 淘汰原因（为什么 443 → 10）
@@ -1018,41 +1022,8 @@ def live_funnel() -> dict:
 
 
 def live_turnlow_top(top_n: int = 20) -> dict:
-    """★2026-08-15 turn_low 防守主力参考：daily_scores 最新 CSV 的 turnover_rank topN（rank 大=低换手）
-    定位：L1 参考（主力组合候选，非买入指令）；40日调仓、T+1、无止损无择时（定稿形态）。
-    数据边界：turn 2019+ 唯一可验证；当前文件覆盖 88.9%（周一 19:15 链后 100%）。"""
-    import glob as _g
-    import os as _os
-    import sqlite3 as _sq
-    fs = sorted(_g.glob(r"data\factorpool\output\daily_scores\daily_*.csv"),
-                key=os.path.getmtime)
-    if not fs:
-        return {"ok": False, "error": "无 daily_scores 文件"}
-    try:
-        import pandas as pd
-        d = pd.read_csv(fs[-1])
-        date = str(d.iloc[0, 0]) if len(d) else ""
-        tr = [c for c in d.columns if "turnover_rank" in str(c).lower()]
-        if not tr:
-            return {"ok": False, "error": "无 turnover_rank 列", "file": os.path.basename(fs[-1])}
-        col = tr[0]
-        cov = float(d[col].notna().mean())
-        top = d.nlargest(top_n, col)[["code", col]].dropna(subset=[col])
-        # 名字映射
-        names = {}
-        try:
-            con = _sq.connect("file:data/cache/stock_basic.db?mode=ro&immutable=1", uri=True)
-            names = dict(con.execute("SELECT code, name FROM stock_basic").fetchall())
-            con.close()
-        except Exception:
-            pass
-        items = [{"code": str(row["code"]), "name": names.get(str(row["code"]), ""),
-                  "rank": float(row[col])} for _, row in top.iterrows()]
-        return {"ok": True, "date": date, "file": os.path.basename(fs[-1]),
-                "coverage_pct": round(cov * 100, 1), "top_n": len(items), "items": items,
-                "note": "turn_low 防守主力参考：40日调仓 top20、T+1、无止损无择时（+15.9%/-8.7%/1.11 · 2019+ 唯一可验证）"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:120]}
+    from deck.research_views import turnlow_top
+    return turnlow_top(top_n)
 
 
 def portfolio_perf() -> dict:
@@ -1503,7 +1474,9 @@ def live_validation() -> dict:
     _pool_ver = _pool.stat().st_mtime if _pool else 0.0
     if _validation_cache["data"] is not None and _validation_cache.get("ver") == _pool_ver \
             and time.time() - _validation_cache["ts"] < 120:
-        return _validation_cache["data"]
+        cached = dict(_validation_cache["data"])
+        cached["batches_review"] = _batch_review_payload(entries)
+        return _validation_comparison_readiness(cached)
     # ★#80 实际（双 horizon）
     act = {h: defaultdict(list) for h in ("t1", "t5")}
     for e in entries:
@@ -1724,26 +1697,23 @@ def live_validation() -> dict:
             #   数据底座 = #114 verdict_snapshot 每日落盘）
             "history": _verdict_history(),
             }
+    _validation_comparison_readiness(_res)
     _validation_cache.update({"ver": _pool_ver, "ts": time.time(), "data": _res})
     return _res
 
 
-# ★2026-08-13 #308：市场基准中位数缓存（_mkt_median 结果确定，跨请求复用——
-#   原 JOIN daily_bar 自连接 1866 万行全表扫 1.5s/次，_batch_review_payload 6 次 = 9s 是 portal_dash 慢的根源）
-_mkt_median_cache = {}
-# 磁盘持久化：跨重启复用（deck_server 重启后冷启动免 6 次全表扫 ≈17s）
-_MKT_CACHE_FILE = BASE / "logs" / "mkt_median_cache.json"
-try:
-    if _MKT_CACHE_FILE.exists():
-        _loaded = json.loads(_MKT_CACHE_FILE.read_text(encoding="utf-8"))
-        for _k, _v in _loaded.items():
-            _parts = str(_k).split("|")
-            if len(_parts) == 2:
-                _mkt_median_cache[(_parts[0], _parts[1])] = _v
-except Exception:
-    pass
 # live_validation 缓存（键 = pitch_track_pool mtime，消除 live_brief 内 2 次重复计算）
 _validation_cache = {"ver": None, "ts": 0.0, "data": None}
+
+
+def _validation_comparison_readiness(result):
+    """The pending market comparison must not be counted as a ready API check."""
+    comparison = (result.get('batches_review') or {}).get('market_comparison') or {}
+    state = comparison.get('state', 'unknown')
+    result['readiness'] = {'scope': 'market_comparison', 'ready': comparison.get('ready') is True,
+                           'state': 'initializing' if state == 'waiting_core_update' else state,
+                           'reason': comparison.get('reason') or '市场对照尚未核验'}
+    return result
 
 
 def _batch_review_payload(entries: list) -> dict:
@@ -1753,38 +1723,20 @@ def _batch_review_payload(entries: list) -> dict:
     out = {"batches": [], "pool_stats": {}, "note": ""}
     try:
         from collections import defaultdict, Counter
-        import sqlite3 as _sq4
-        import statistics as _st4
+        from deck.market_benchmark import public_state as market_comparison
         groups = defaultdict(list)
         for e in entries:
             d = str(e.get("entry_date") or "")[:10]
             if d:
                 groups[d].append(e)
-        def _mkt_median(d0: str, d1: str):
-            """全市场 入池日→次交易日 收益中位数（★#308：两子查询+dict 对齐替代 JOIN 全表扫 + 模块缓存）"""
-            _key = (d0, d1)
-            if _key in _mkt_median_cache:
-                return _mkt_median_cache[_key]
-            try:
-                _c4 = _sq4.connect("file:data/cache/bars.db?mode=ro&immutable=1",
-                                   uri=True, timeout=3)
-                _a = dict(_c4.execute(
-                    "SELECT code, close FROM daily_bar WHERE date=? AND adjust='qfq'", (d0,)).fetchall())
-                _b = dict(_c4.execute(
-                    "SELECT code, close FROM daily_bar WHERE date=? AND adjust='qfq'", (d1,)).fetchall())
-                _c4.close()
-                _v = sorted((_b[c] / _a[c] - 1) for c in _a.keys() & _b.keys() if _a[c])
-                _res = round(_st4.median(_v), 4) if _v else None
-            except Exception:
-                _res = None
-            _mkt_median_cache[_key] = _res
-            # 落盘（历史 (d0,d1) 收益中位数永久确定，追加复用；异常不阻断）
-            try:
-                _MKT_CACHE_FILE.write_text(json.dumps({f"{k[0]}|{k[1]}": v for k, v in _mkt_median_cache.items()},
-                                                      ensure_ascii=False), encoding="utf-8")
-            except Exception:
-                pass
-            return _res
+        pairs = []
+        for d0, group in groups.items():
+            dates = [((e.get("fwd") or {}).get("t1") or {}).get("date") for e in group]
+            d1 = next((day for day in dates if day and day > d0), None)
+            if d1:
+                pairs.append((d0, d1))
+        comparison = market_comparison(pairs)
+        out["market_comparison"] = comparison
         for d0 in sorted(groups):
             ents = groups[d0]
             t1s = [(e.get("fwd") or {}).get("t1") for e in ents if (e.get("fwd") or {}).get("t1")]
@@ -1792,7 +1744,8 @@ def _batch_review_payload(entries: list) -> dict:
             r1 = [v["ret"] for v in t1s] if t1s else []
             r5 = [v["ret"] for v in t5s] if t5s else []
             _d1 = t1s[0].get("date") if t1s else None
-            _mkt = _mkt_median(d0, _d1) if _d1 and _d1 > d0 else None
+            _comparison = comparison.get("values", {}).get(d0+"|"+str(_d1), {})
+            _mkt = _comparison.get("value")
             out["batches"].append({
                 "batch": d0, "n": len(ents),
                 "t1_avg": round(sum(r1) / len(r1), 4) if r1 else None,
@@ -1801,6 +1754,8 @@ def _batch_review_payload(entries: list) -> dict:
                 "t5_win": round(sum(1 for r in r5 if r > 0) / len(r5), 4) if r5 else None,
                 "n_t5_done": len(r5),
                 "mkt_t1_median": _mkt,
+                "market_state": comparison["state"] if _d1 else "pending_history",
+                "market_matched_symbols": _comparison.get("matched_symbols"),
                 "excess": round(round(sum(r1) / len(r1), 4) - _mkt, 4) if r1 and _mkt is not None else None,
                 # ★2026-08-13 #264：类型构成（otype Counter）——批次双维度解读（类型归因 × 入池时点市场环境）
                 "types": dict(Counter(str(e.get("otype") or "?") for e in ents)),
@@ -1820,7 +1775,7 @@ def _batch_review_payload(entries: list) -> dict:
                 "t5_avg": round(sum(r5) / len(r5), 4) if r5 else None,
                 "t5_win": round(sum(1 for r in r5 if r > 0) / len(r5), 4) if r5 else None,
             }
-        out["note"] = "选股超额 = 批次 T+1 平均 − 全市场中位（正=选股优于市场）；08-14 首批 T+5 到期自动填充"
+        out["note"] = "选股超额 = 批次 T+1 平均 − 全市场中位；T+5 待真实交易日样本到期。" + comparison["reason"]
     except Exception as e:
         out["note"] = f"批次复核暂不可用（{str(e)[:60]}）"
     return out
@@ -1952,95 +1907,21 @@ _minute_meta_cache = {"ts": 0, "k5": "", "i1": ""}
 
 
 def _minute_node() -> dict:
-    """★#341 分钟数据环节自检（修复"花架子"）：如实反映 5 分钟因子 + 1 分钟因子状态
-    - 5 分钟因子：kline5m_factors.parquet（baostock 当日管道，覆盖至最新交易日）
-    - 1 分钟因子：intraday_factors_v2.parquet（数据交付，滞后 3-5 天）
-    ★关键：内容日期检查（读 parquet date max，10min 缓存）——只靠 mtime 会误判"文件新鲜但内容滞后"（#123 竞价信号教训）
-    旧实现检查 incr_parquet/*.parquet（08-10 的 1 分钟原始数据）已过时，分钟因子早已落盘到根目录。"""
-    from pathlib import Path as _P
-    _md = "data/minute"
-    _k5 = _P(_md) / "kline5m_factors.parquet"
-    _i1 = _P(_md) / "intraday_factors_v2.parquet"
-    # 最新交易日（完整交易日门槛 ≥4000 只，双库合并——与 live_chain 同基准）
-    _latest_td = None
-    try:
-        from data.cache import DailyCache
-        _latest_td = str(DailyCache().latest_trade_date() or "") or None
-    except Exception:
-        pass
-    # 内容日期缓存（10min）；★#347 性能：pyarrow 读 parquet statistics 秒级（0.1s），
-    #   替代 pandas read_parquet 全读单列（689w/1443w 行 → 3.3s）——门户冷启动 6s 主凶
-    _now = time.time()
-    if _now - _minute_meta_cache["ts"] < 600:
-        _k5cov, _i1cov = _minute_meta_cache["k5"], _minute_meta_cache["i1"]
-    else:
-        _k5cov, _i1cov = "", ""
+    """Actual 5-minute history, independent of unavailable 1-minute auction inputs."""
+    from deck.research_views import minute_snapshot
+    data = minute_snapshot(1)
+    return {"name":"5分钟历史行情", "ok":data.get("ready") is True,
+            "required_for_core":False,
+            "initialized":data.get("initialized",False), "state":data.get("state"),
+            "date":data.get("data_date", ""), "file":Path(data.get("database_path") or "minute.db").name+"/minute_5m",
+            "frequency":data.get("frequency"), "rows":data.get("rows",0),
+            "note":data.get("reason"), "age_h":None}
 
-        def _parquet_max_date(path):
-            try:
-                import pyarrow.parquet as _pq
-                _pf = _pq.ParquetFile(str(path))
-                _md = _pf.metadata
-                # ★#358 只扫最后一个 row group（date 按时间升序分块，最大值在最后一块），
-                #   避免遍历全部 row group（172MB 全市场 5min 因子有数百 row group → 2.4s 慢点）
-                _date_col = None
-                for _j in range(_md.schema.num_columns if hasattr(_md.schema, 'num_columns') else 0):
-                    if _md.schema.column(_j).name == "date":
-                        _date_col = _j
-                        break
-                if _date_col is None:
-                    # 回退：从 row group 0 的列名找
-                    _rg0 = _md.row_group(0)
-                    for _j in range(_rg0.num_columns):
-                        if _rg0.column(_j).path_in_schema == "date":
-                            _date_col = _j
-                            break
-                _last_rg = _md.row_group(_md.num_row_groups - 1)
-                if _date_col is not None and _date_col < _last_rg.num_columns:
-                    _col = _last_rg.column(_date_col)
-                    if _col.statistics and _col.statistics.max is not None:
-                        return str(_col.statistics.max)
-                # 兜底：全扫（极少触发）
-                _maxes = []
-                for _i in range(_md.num_row_groups):
-                    _rg = _md.row_group(_i)
-                    for _j in range(_rg.num_columns):
-                        _col = _rg.column(_j)
-                        if _col.path_in_schema == "date" and _col.statistics and _col.statistics.max is not None:
-                            _maxes.append(str(_col.statistics.max))
-                return max(_maxes) if _maxes else ""
-            except Exception:
-                return ""
-        try:
-            if _k5.exists():
-                _k5cov = _parquet_max_date(_k5)
-            if _i1.exists():
-                _i1cov = _parquet_max_date(_i1)
-            _minute_meta_cache.update({"ts": _now, "k5": _k5cov, "i1": _i1cov})
-        except Exception:
-            pass
-    # 统一日期格式（8 位 YYYYMMDD → YYYY-MM-DD，与 bars.db / DailyCache 对齐比较）
-    def _fmt8(s):
-        s = str(s or "")
-        return f"{s[:4]}-{s[4:6]}-{s[6:]}" if len(s) == 8 and s.isdigit() else s
-    _k5cov, _i1cov = _fmt8(_k5cov), _fmt8(_i1cov)
-    _note, _ok, _age = [], False, None
-    if _k5.exists():
-        _age = round((datetime.now().timestamp() - os.path.getmtime(_k5)) / 3600, 1)
-        _ok5 = bool(_k5cov) and (not _latest_td or _k5cov >= _latest_td)
-        _ok = _ok5
-        _note.append(("5m因子至%s（当日✓）" % _k5cov) if _ok5
-                     else ("5m因子至%s（最新交易日%s，滞后）" % (_k5cov, _latest_td)))
-    else:
-        _note.append("5m因子缺失")
-    if _i1.exists():
-        _note.append(("1m因子至%s（数据，滞后3-5天）" % _i1cov) if _i1cov else "1m因子（数据）")
-    else:
-        _note.append("1m因子缺失")
-    return {"name": "分钟数据", "ok": _ok, "age_h": _age,
-            "file": _k5.name if _k5.exists() else None,
-            "date": _k5cov,
-            "note": "；".join(_note)}
+
+def live_minute() -> dict:
+    """Read-only sample of downloaded 5-minute history; no real-time or auction substitution."""
+    from deck.research_views import minute_snapshot
+    return minute_snapshot()
 
 
 def _extract_content_date(name: str, data) -> str:
@@ -2050,6 +1931,11 @@ def _extract_content_date(name: str, data) -> str:
     if not isinstance(data, dict):
         return ""
     try:
+        if name in ("远期池", "实盘裁决"):
+            # A review may be generated the next morning from the prior close.
+            # Its wall-clock timestamp is never the observed market date.
+            from deck.system_live import _content_date
+            return _content_date(data.get("data_date"))
         if name == "竞价信号":
             keys = [k for k in data.keys() if isinstance(k, str) and k.isdigit() and len(k) == 8]
             if keys:
@@ -2065,7 +1951,33 @@ def _extract_content_date(name: str, data) -> str:
     return ""
 
 
-def live_chain() -> dict:
+def _forward_chain_readiness(path, data, pipeline, target):
+    """Use the same schema, content hash and mature-sample proof as system health."""
+    from deck.system_live import _product_schema, _pipeline_evidence, _has_forward_observation, _content_date
+    result = {"ok": False, "initialized": False, "state": "unknown", "date": ""}
+    if not isinstance(data, dict):
+        return {**result, "state": "failed", "note": "前向产物不是有效业务对象"}
+    valid, rows, reason = _product_schema("pitch_track", data)
+    proof = _pipeline_evidence(pipeline, path)
+    declared = _extract_content_date("远期池", data)
+    date = declared or _content_date(proof.get("data_date"))
+    result.update(date=date, rows=rows)
+    if not valid:
+        return {**result, "state": "failed", "note": reason}
+    if not proof:
+        return {**result, "note": "当前前向产物缺少匹配内容哈希的成功运行证据"}
+    if not date or (declared and declared != _content_date(proof.get("data_date"))):
+        return {**result, "note": "前向内容日期与运行证据不一致"}
+    if not target or date != target:
+        return {**result, "state": "stale" if target and date < target else "unknown",
+                "note": f"前向内容至 {date}，已核验收盘日为 {target or '未知'}"}
+    result["initialized"] = True
+    if not _has_forward_observation(data):
+        return {**result, "state": "pending_history", "note": "前向观察已初始化，尚无到期收益样本；不据此判定交易效果"}
+    return {**result, "ok": True, "state": "ready", "note": "前向结构、同日内容、运行哈希及实际到期样本已核验"}
+
+
+def live_chain(_date_status=None) -> dict:
     """★2026-08-11 百轮#16 决策链状态：数据管道 → 各环节最新数据日期/新鲜度（一条链看全系统）
     环节：观察池 → 择时 → 今日信号 → 机会池 → Pitch 长线/短线 → 持仓 → 止盈 → 风控 → 远期池
     ★2026-08-12 #150 性能：数据源 mtime 版本缓存（原每次 1.9s → 命中 5ms）
@@ -2075,17 +1987,22 @@ def live_chain() -> dict:
     import os as _os
     from pathlib import Path as _P
     _now = time.time()
-    _ver = _bars_version()
+    _date_status = _complete_daily_status() if _date_status is None else _date_status
+    _optional_inputs = _health_config().get("chain_optional_inputs") or {}
+    from deck.research_views import _minute_background_job
+    _minute_job=_minute_background_job()
+    _pipeline_state = BASE / "runtime/research/pipeline-state.json"
+    _forward_file = _latest_file("pitch_track_pool_*.json")
+    _forward_version = (str(_forward_file), _forward_file.stat().st_mtime_ns, _forward_file.stat().st_size) if _forward_file else None
+    _ver = (_bars_version(), _pipeline_state.stat().st_mtime if _pipeline_state.is_file() else None,
+            _forward_version,
+            _date_status.get("state"), _date_status.get("date"), json.dumps(_optional_inputs,sort_keys=True,ensure_ascii=False),
+            _minute_job.get("job_id"),_minute_job.get("status"),_minute_job.get("completed_symbols"),
+            _minute_job.get("cache_verified"),_minute_job.get("current_date_ready"))
     if _chain_cache["data"] is not None and _chain_cache.get("ver") == _ver \
             and _now - _chain_cache["ts"] < 120:
         return _chain_cache["data"]
-    # ★#345 最新交易日（完整交易日门槛 ≥4000 只，双库合并）——统一各环节对照基准
-    _latest_td = ""
-    try:
-        from data.cache import DailyCache
-        _latest_td = str(DailyCache().latest_trade_date() or "")
-    except Exception:
-        pass
+    _latest_td = str(_date_status.get("date") or "") if _date_status.get("ready") else ""
     CHAIN = [
         ("观察池", "output", "pool_layers_*.json"),
         ("新择时", "output", "timing_system_*.json"),
@@ -2111,7 +2028,10 @@ def live_chain() -> dict:
             except Exception:
                 nodes.append({"name": "分钟数据", "ok": False, "age_h": None, "file": None, "date": ""})
         if not fs:
-            nodes.append({"name": name, "ok": False, "age_h": None, "file": None, "date": ""})
+            optional = _optional_inputs.get(name) or {}
+            nodes.append({"name": name, "ok": False, "initialized": False, "age_h": None, "file": None, "date": "",
+                          "state": optional.get("state") or "missing_data",
+                          "note": optional.get("reason") or "尚无本环节实际产物"})
             continue
         f = fs[-1]
         try:
@@ -2119,17 +2039,30 @@ def live_chain() -> dict:
         except Exception:
             mt = None
         age_h = round((datetime.now().timestamp() - mt) / 3600, 1) if mt else None
-        # ★#345 内容日期（数据覆盖到哪天）；读不到 → 回退文件新鲜度（age_h < 48）
+        # Content dates are required; file mtime alone never makes a node healthy.
         _cdate = ""
+        _chain_data = None
         try:
-            _cdate = _extract_content_date(name, json.loads(f.read_text(encoding="utf-8")))
+            _chain_data = json.loads(f.read_text(encoding="utf-8"))
+            _cdate = _extract_content_date(name, _chain_data)
         except Exception:
             pass
         if _cdate and _latest_td:
-            _ok = _cdate >= _latest_td
+            _ok = _cdate == _latest_td
         else:
-            _ok = age_h is not None and age_h < 48
-        _nd = {"name": name, "ok": _ok, "age_h": age_h, "file": f.name, "date": _cdate}
+            _ok = False
+        _nd = {"name": name, "ok": _ok, "age_h": age_h, "file": f.name, "date": _cdate,
+               "state": "ready" if _ok else _date_status.get("state") if not _latest_td else "stale" if _cdate and _cdate<_latest_td else "unknown"}
+        if not _latest_td:
+            _nd["note"] = _date_status.get("reason") or "完整行情日期尚未核验"
+        elif not _cdate:
+            _nd["note"] = "产物缺少可核验的内容日期，文件时间不能替代"
+        if name in ("远期池", "实盘裁决") and _latest_td:
+            try:
+                _pipeline = json.loads(_pipeline_state.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                _pipeline = {}
+            _nd.update(_forward_chain_readiness(f, _chain_data, _pipeline, _latest_td))
         # ★#123 → #345 竞价信号：内容日期 < 最新交易日 → 明确滞后（1 分钟竞价数据未更新）
         #   ★#381 note 加"供应商"关键词——check_consistency 按"内容滞后/供应商"过滤判定 supplier-lag（非系统断链），
         #   原"1分钟竞价数据未更新"不含关键词被误判 hard failure → 每晚 health_scan 假 ❌
@@ -2137,7 +2070,7 @@ def live_chain() -> dict:
             _nd["ok"] = False
             _nd["note"] = f"数据至 {_cdate}，滞后于最新交易日 {_latest_td}（供应商1分钟竞价数据未交付，需数据新版或 Tushare 分钟权限）"
         # ★2026-08-12 百轮#97：实盘裁决环节附降权状态（门户/Pitch 决策链直接看到裁决结论）
-        if name == "实盘裁决":
+        if name == "实盘裁决" and _nd.get("ok"):
             try:
                 _dw = (live_validation().get("diagnosis") or {}).get("down_warn") or []
                 if _dw:
@@ -2150,7 +2083,18 @@ def live_chain() -> dict:
                 pass
         nodes.append(_nd)
     _out = {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "latest_td": _latest_td, "chain": nodes}
+            "latest_td": _latest_td, "chain": nodes, "daily_status": _date_status,
+            "ready": bool(_date_status.get("ready") and nodes and all(node.get("ok") for node in nodes)),
+            "state": _date_status.get("state") if not _date_status.get("ready") else "ready" if nodes and all(node.get("ok") for node in nodes) else "incomplete"}
+    unresolved=[node for node in nodes if not node.get("ok")]
+    if unresolved and _date_status.get("ready"):
+        severe=[node for node in unresolved if node.get("required_for_core") is not False and node.get("state") not in ("optional_unconfigured","pending_history","rate_limited","permission_blocked")]
+        if not severe:
+            independent=next((node for node in unresolved if node.get("required_for_core") is False),None)
+            _out["state"] = independent.get("state","unknown") if independent else "rate_limited" if any(node.get("state")=="rate_limited" for node in unresolved) else "permission_blocked" if any(node.get("state")=="permission_blocked" for node in unresolved) else "pending_history" if any(node.get("state")=="pending_history" for node in unresolved) else "optional_unconfigured"
+    core_nodes=[node for node in nodes if node.get("required_for_core") is not False and node.get("state") not in ("optional_unconfigured","pending_history")]
+    _out["core_ready"]=bool(_date_status.get("ready") and core_nodes and all(node.get("ok") for node in core_nodes))
+    _out["reason"] = "；".join(node["name"]+"："+(node.get("note") or node.get("state") or "尚未核验") for node in unresolved) if unresolved else "各环节内容日期已读取；不表示自动交易放行"
     _chain_cache.update({"ts": _now, "data": _out, "ver": _ver})
     return _out
 
@@ -2163,43 +2107,13 @@ def live_chain_refresh() -> dict:
     _chain_cache["ts"] = 0.0
     _pd_cache["data"] = None
     _pd_cache["ts"] = 0.0
+    _portal_snapshot.invalidate()
     return live_chain()
 
 
 def live_factor_perf() -> dict:
-    """★2026-08-13 用户需求#272/#273：因子归因业绩（unified.db factor_agg + factor_pitch）
-    因子推荐质量：每个因子参与过多少 pitch + 这些 pitch 的 T+1/T+5 实际业绩。
-    数据源 unified.db（dev_auto 8.67/8.68 每日重建）。"""
-    import time as _t
-    _c = getattr(live_factor_perf, "_cache", None)
-    if _c and _t.time() - _c[0] < 300:
-        return _c[1]
-    out = {"ok": False, "err": "unified.db 未建成"}
-    db = Path(r"data/cache/unified.db")
-    if not db.exists():
-        return out
-    try:
-        import sqlite3 as _sq
-        con = _sq.connect(f"file:{db}?mode=ro&immutable=1", uri=True, timeout=3)
-        aggs = [{"factor": r[0], "n_pitch": r[1], "n_done_t5": r[2],
-                 "t1_avg": r[3], "t5_avg": r[4], "t5_win": r[5], "excess_avg": r[6]}
-                for r in con.execute(
-                    "SELECT factor, n_pitch, n_done_t5, t1_avg, t5_avg, t5_win, excess_avg "
-                    "FROM factor_agg ORDER BY n_pitch DESC, t5_avg DESC NULLS LAST").fetchall()]
-        detail = [{"factor": r[0], "code": r[1], "entry_date": r[2], "pool_type": r[3],
-                   "t1": r[4], "t5": r[5]}
-                  for r in con.execute(
-                      "SELECT factor, code, entry_date, pool_type, t1, t5 "
-                      "FROM factor_pitch ORDER BY t5 IS NOT NULL DESC, t5 DESC NULLS LAST LIMIT 80").fetchall()]
-        con.close()
-        out = {"ok": True,
-               "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-               "n_factors": len(aggs), "n_rows": len(detail),
-               "factors": aggs, "detail": detail}
-    except Exception as e:
-        out = {"ok": False, "err": str(e)[:120]}
-    live_factor_perf._cache = (_t.time(), out)
-    return out
+    from deck.research_views import factor_performance
+    return factor_performance()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2209,104 +2123,20 @@ def live_factor_perf() -> dict:
 #   实战强（正收益）的因子排名被拉前 → 影响 pitch 优先级（实测优先于回测的 Pitch v3 精神）
 # ══════════════════════════════════════════════════════════════════
 def live_factor_ranking() -> dict:
-    import sqlite3 as _sq
-    out = {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ranking": [], "config": {}}
-    try:
-        # 1. 读证据权重配置（evidence_weights 表）
-        backtest_w, live_w, min_live, boost = 1.0, 0.4, 20.0, 1.2
-        try:
-            con = _sq.connect("file:data/cache/unified.db?mode=ro&immutable=1", uri=True, timeout=3)
-            for k, v in con.execute("SELECT key, value FROM evidence_weights").fetchall():
-                try:
-                    if k == "backtest_w": backtest_w = float(v)
-                    elif k == "live_w": live_w = float(v)
-                    elif k == "min_live_samples": min_live = float(v)
-                    elif k == "live_strong_boost": boost = float(v)
-                except Exception: pass
-            # 2. 实战业绩（factor_agg）
-            perf = {}
-            for r in con.execute("SELECT factor, n_pitch, t1_avg, t5_avg, t5_win FROM factor_agg").fetchall():
-                perf[r[0]] = {"n": r[1] or 0, "t1": r[2], "t5": r[3], "t5w": r[4]}
-            con.close()
-        except Exception:
-            perf = {}
-        out["config"] = {"backtest_w": backtest_w, "live_w": live_w, "min_live_samples": min_live,
-                         "live_strong_boost": boost, "note": "综合排名分=回测排名×(1-实测权重)+实战排名×实测权重；实测权重=live_w×min(1,pitch样本/min_live_samples)"}
-        # 3. 回测 ICIR120（factor_health）
-        try:
-            from factors.risk.factor_risk import load_health
-            health = {}
-            for r in load_health():
-                try:
-                    health[str(r.get("factor") or "")] = float(r.get("icir120") or 0)
-                except Exception: pass
-        except Exception:
-            health = {}
-        # 4. ★别名映射（主系统财务/技术因子名 → 外包因子名，如 pe_pct→bp / sq_nyoy→sue / roe→f_score）
-        #    factor_agg 是主系统因子名，factor_health 是外包因子名——需 alias_of 对齐后匹配实战业绩
-        try:
-            from factors.signal_family import alias_of
-        except Exception:
-            alias_of = lambda x: x
-        perf_ext = {}
-        for f, p in perf.items():
-            m = alias_of(f)
-            d = perf_ext.setdefault(m, {"n": 0, "t1s": [], "t5s": [], "t5ws": [], "src": []})
-            d["n"] += p.get("n", 0)
-            if p.get("t1") is not None: d["t1s"].append(p["t1"])
-            if p.get("t5") is not None: d["t5s"].append(p["t5"])
-            if p.get("t5w") is not None: d["t5ws"].append(p["t5w"])
-            d["src"].append(f)
-        import statistics as _st
-        for m, d in perf_ext.items():
-            d["t1"] = _st.mean(d["t1s"]) if d["t1s"] else None
-            d["t5"] = _st.mean(d["t5s"]) if d["t5s"] else None
-            d["t5w"] = _st.mean(d["t5ws"]) if d["t5ws"] else None
-        # 5. 构建因子行（以 factor_health 为主，perf_ext 按外包名关联实战业绩）
-        rows = []
-        for f, icir in health.items():
-            p = perf_ext.get(f) or {}
-            n = p.get("n", 0)
-            live_metric = p.get("t5") if p.get("t5") is not None else p.get("t1")  # 优先 T+5，未到期用 T+1
-            rows.append({"factor": f, "icir120": icir, "n_pitch": n, "live_metric": live_metric,
-                         "t1_avg": p.get("t1"), "t5_avg": p.get("t5"), "t5_win": p.get("t5w"),
-                         "src_factors": p.get("src", []),
-                         "bt_rank": None, "live_rank": None, "composite": None, "live_eff": 0.0})
-        # 回测排名（icir120 降序 → 排名 1=最强）
-        rows.sort(key=lambda x: -x["icir120"])
-        for i, r in enumerate(rows): r["bt_rank"] = i + 1
-        # 实战排名（live_metric 降序，仅有 pitch 样本的因子）
-        live_rows = [r for r in rows if r["n_pitch"] > 0]
-        live_rows.sort(key=lambda x: -(x["live_metric"] if x["live_metric"] is not None else -9))
-        for i, r in enumerate(live_rows): r["live_rank"] = i + 1
-        # 综合排名分
-        for r in rows:
-            r["live_eff"] = round(live_w * min(1.0, r["n_pitch"] / max(1.0, min_live)), 3)
-            bt_rank = r["bt_rank"]
-            lv_rank = r["live_rank"]
-            if lv_rank is None:
-                r["composite"] = float(bt_rank)   # 无实战样本 → 纯回测
-            else:
-                r["composite"] = round(bt_rank * (1 - r["live_eff"]) + lv_rank * r["live_eff"], 2)
-        # 最终排名（composite 升序）
-        rows.sort(key=lambda x: x["composite"])
-        for i, r in enumerate(rows): r["rank"] = i + 1
-        out["ranking"] = rows
-    except Exception as e:
-        out["ok"] = False
-        out["err"] = str(e)[:120]
-    return out
+    from deck.research_views import factor_ranking
+    return factor_ranking()
 
 
 # ★2026-08-13 #319：数据库面板（unified.db 关键表内容浏览——因子实战库 + 加权结果）
 # 总指挥诉求：实战远期效果入数据库（factor_agg/factor_pitch）→ 面板直接看数据 + 加权结果
 def live_db_view() -> dict:
     import sqlite3 as _sq
+    from deck.research_views import locations, factor_history
     out = {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "tables": {}, "ranking": []}
     try:
-        con = _sq.connect("file:data/cache/unified.db?mode=ro&immutable=1", uri=True, timeout=3)
+        _, cache = locations()
+        con = _sq.connect((cache/'unified.db').resolve().as_uri()+'?mode=ro', uri=True, timeout=3)
         for tbl, name in (("factor_agg", "因子实战聚合"), ("factor_pitch", "因子×Pitch 明细"),
-                          ("factor_backtest", "因子全量回测（top20%→T+1）"),
                           ("evidence_weights", "证据权重配置"), ("market_daily", "市场日线快照")):
             try:
                 cols = [c[1] for c in con.execute(f"PRAGMA table_info({tbl})").fetchall()]
@@ -2321,10 +2151,12 @@ def live_db_view() -> dict:
         return out
     # 加权结果（复用 live_factor_ranking 的动态加权——回测排名依赖 factor_health 每日更新）
     try:
-        out["ranking"] = live_factor_ranking().get("ranking", [])
-        out["config"] = live_factor_ranking().get("config", {})
+        ranking = live_factor_ranking()
+        out["ranking"] = ranking.get("ranking", [])
+        out["config"] = ranking.get("config", {})
     except Exception:
         out["ranking"] = []
+    out['factor_history'] = factor_history()
     # ★#332 持仓数据同步到数据页（复盘：当前持仓 + 止盈 + 历史决策）
     try:
         h = live_holdings()
@@ -2367,50 +2199,8 @@ def _clean_nan(o):
 
 
 def live_factor_ui_pack() -> dict:
-    out = {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-           "usage": {}, "lifecycle": {}, "corr": {}, "frc_rules": {}, "freshness": {},
-           "style_rotation": {}, "alert_rules": {}}
-    def _latest(prefix):
-        try:
-            fs = sorted(_UI_DATA_DIR.glob(f"{prefix}_*.json"), key=lambda p: p.stat().st_mtime)
-            return fs[-1] if fs else None
-        except Exception:
-            return None
-    for key, prefix in (("usage", "factor_usage"), ("lifecycle", "factor_lifecycle"),
-                        ("corr", "factor_corr"), ("frc_rules", "frc_mine_rules"),
-                        ("freshness", "factor_data_freshness"),
-                        ("style_rotation", "factor_style_rotation"),
-                        ("alert_rules", "factor_alert_rules")):
-        f = _latest(prefix)
-        if f:
-            try:
-                out[key] = _clean_nan(json.loads(f.read_text(encoding="utf-8")))
-            except Exception:
-                pass
-    # ★2026-08-15 数据即时性修复：factor_data_freshness 是因子池清晨快照（反映前一收盘），
-    #   傍晚链更新后该文件不重建 → 因子页"健康/清单日期"滞后 1 天。
-    #   用实际最新文件覆写 updated/manifest/health_csv 日期（显示真实消费口径，消除观感滞后）。
-    try:
-        import csv as _csv
-        _SD = Path("data/factorpool/output")
-        fr = out.get("freshness") or {}
-        _mf = sorted(_SD.glob("factor_manifest_*.json"), key=lambda p: p.stat().st_mtime)
-        if _mf:
-            _mj = json.loads(_mf[-1].read_text(encoding="utf-8"))
-            fr["manifest"] = {"coverage": f"{len(_mj.get('factors', []))} 因子",
-                              "date": _mj.get("date", "")}
-            if _mj.get("date"):
-                fr["updated"] = _mj["date"]
-        _hf = sorted(_SD.glob("health/health_*.csv"), key=lambda p: p.stat().st_mtime)
-        if _hf:
-            _rows = list(_csv.DictReader(_hf[-1].read_text(encoding="utf-8").splitlines()))
-            _hd = _hf[-1].stem.split("_")[-1] if "_" in _hf[-1].stem else ""
-            fr["health_csv"] = {"coverage": f"{len(_rows)} 因子", "date": _hd}
-        if fr:
-            out["freshness"] = fr
-    except Exception:
-        pass
-    return out
+    from deck.research_views import factor_ui_pack
+    return factor_ui_pack()
 
 
 # ★2026-08-13 #329 A股择时轮动日历（总指挥"还欠我"）——F3 风格状态机数据源
@@ -2426,27 +2216,16 @@ def live_rotation_calendar() -> dict:
     out = {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
            "current_style": None, "style_history": [], "style_dist": {},
            "weights": {}, "cal_win": None, "cal_month": {}, "cal_upcoming": []}
-    # 1) F3 月度风格历史（dominant 序列）
-    try:
-        if _STYLE_STATE_CSV.exists():
-            rows = list(_csv.DictReader(_STYLE_STATE_CSV.read_text(encoding="utf-8-sig").splitlines()))
-            if rows:
-                out["style_dist"] = {k: v for k, v in _Counter(r.get("dominant") for r in rows if r.get("dominant")).items()}
-                out["style_history"] = [{"date": r.get("date", "")[:7], "dominant": r.get("dominant")}
-                                        for r in rows[-24:]]
-                out["current_style"] = rows[-1].get("dominant")
-    except Exception:
-        pass
-    # 2) factor_style_rotation（当前风格 + boost/trim 权重）
-    try:
-        fs = sorted(_UI_DATA_DIR.glob("factor_style_rotation_*.json"), key=lambda p: p.stat().st_mtime)
-        if fs:
-            sr = _clean_nan(json.loads(fs[-1].read_text(encoding="utf-8")))
-            if sr.get("current_style"):
-                out["current_style"] = sr["current_style"]
-            out["weights"] = sr.get("weights", {})
-    except Exception:
-        pass
+    # The public validator checks the current source date/configuration. A stale
+    # F3 CSV or an older glob-matched JSON must never resurrect a style state.
+    from deck.research_views import style_diagnostic_state
+    sr=style_diagnostic_state()
+    if sr.get("ready") is True and sr.get("fresh") is True:
+        out["current_style"] = sr["current_style"]
+        out["style_history"] = sr.get("style_history") or []
+        out["style_dist"] = dict(_Counter(row.get("dominant") for row in out["style_history"] if row.get("dominant")))
+        out.update({key:sr[key] for key in ("kind","calibrated","weights_enabled","auto_trade_allowed","source","method","limitations","strength","data_date") if key in sr})
+        out["weights"] = {}  # This observed diagnostic does not supply calibrated weights.
     # 3) 日历效应窗口（复用 timing_dash）
     try:
         td = live_timing_dash()
@@ -2455,6 +2234,14 @@ def live_rotation_calendar() -> dict:
         out["cal_upcoming"] = td.get("cal_upcoming") or []
     except Exception:
         pass
+    if not out.get("current_style"):
+        configured=(BASE/"config/style_diagnostic.yaml").is_file()
+        out.update({"state":"missing_data" if configured else "optional_unconfigured","initialized":False,"ready":False,
+                    "reason":sr.get("reason") or "市值风格诊断尚未通过当前日期和配置验收；日历信息不代表加减权策略"})
+    else:
+        limited=out.get("calibrated") is False or out.get("weights_enabled") is False
+        out.update({"state":"limited_research" if limited else "ready","initialized":True,"ready":True,
+                    "reason":"市值风格诊断未校准，不产生加减权或自动交易" if limited else "已读取实际风格研究产物"})
     return out
 
 
@@ -2473,7 +2260,11 @@ def live_strong_hits() -> dict:
         from factors.opportunities.scan import load_strong_hits
         hits = load_strong_hits()
         import sqlite3 as _sq
-        con = _sq.connect("file:data/cache/stock_basic.db?mode=ro&immutable=1", uri=True)
+        from data.cache import CACHE_DIR
+        basic_db = CACHE_DIR / "stock_basic.db"
+        if not basic_db.exists():
+            return {"ok": False, "error": "股票资料库尚未初始化（stock_basic.db）"}
+        con = _sq.connect(basic_db.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
         meta = {r[0]: (r[1], r[2] or "") for r in con.execute(
             "SELECT code, name, industry FROM stock_basic").fetchall()}
         con.close()
@@ -2529,7 +2320,12 @@ def live_auction() -> dict:
         from factors.opportunities.scan import load_auction_signals
         sig = load_auction_signals()
         if not sig:
-            return {"ok": False, "error": "无竞价信号数据（供应商 1 分钟未交付，待新浪降级补拉）"}
+            reason = "集合竞价研究未启用：需要可核验的真实集合竞价成交及足够历史基准，普通1分钟和当前5分钟行情均不能替代；不属于连续竞价模拟的必要条件"
+            evidence=_read("auction-permission-verification.json","runtime/research")
+            return {"ok":False,"state":"optional_unconfigured","initialized":False,"ready":False,
+                    "error":reason,"reason":reason,"source":"unconfigured","top":[],"hot":[],
+                    "permission_evidence":{key:evidence.get(key) for key in ("endpoint","checked_at","ok","phase")},
+                    "documentation":"https://tushare.pro/document/2?doc_id=353"}
         d8 = sorted(sig.keys())[-1]
         day = sig[d8]
         import sqlite3 as _sq
@@ -2601,6 +2397,16 @@ def live_timing_dash() -> dict:
                      key=os.path.getmtime)
         if _fs:
             out["timing"] = json.loads(Path(_fs[-1]).read_text(encoding="utf-8"))
+        _breadth=((out.get("timing") or {}).get("dims") or {}).get("宽度") or {}
+        _total=_breadth.get("total");_up=_breadth.get("up")
+        out["breadth"]={"score":_breadth.get("score"),"source":_breadth.get("source"),"asof":_breadth.get("asof"),
+                        "up_fraction":_up/_total if isinstance(_up,(int,float)) and isinstance(_total,(int,float)) and _total>0 else None,
+                        "note":_breadth.get("note"),"score_unit":"0_to_100"}
+        _sentiment=((out.get("timing") or {}).get("dims") or {}).get("情绪") or {}
+        out["sentiment"]={"score":_sentiment.get("score"),"source":_sentiment.get("source") or "timing_system.sentiment_score",
+                          "asof":(out.get("timing") or {}).get("date"),"note":_sentiment.get("note"),"unit":"0_to_100"}
+        out["temperature"]={"value":None,"supported":False,"state":"legacy_unsupported",
+                            "reason":"旧外包独立温度模型未提供可执行算法，不属于当前研究初始化项目；当前情绪评分为独立命名的真实指标"}
         # 2) sparkline 序列（★#155 深度打磨：真实历史，按时间序取全部历史文件）
         #    ① score_hist：★#172 优先读 timing_history 跨日序列（择时历史归档器），
         #       fallback timing_system_*.json 当日多次评估走势
@@ -2632,20 +2438,6 @@ def live_timing_dash() -> dict:
             pass
         try:
             _sd = "data/factorpool/output"
-            _ths2 = []
-            for _f in sorted(glob.glob(_sd + "/market_emotion_temp*.json"),
-                             key=os.path.getmtime):
-                try:
-                    _tj = json.loads(Path(_f).read_text(encoding="utf-8"))
-                    _ths2.append(round(float(_tj.get("temp", 0)), 1))
-                except Exception:
-                    continue
-            if _ths2:
-                out["temp_hist"] = _ths2
-        except Exception:
-            pass
-        try:
-            _sd = "data/factorpool/output"
             _whs = []
             for _f in sorted(glob.glob(_sd + "/market_snapshot_ext_*.json"),
                              key=os.path.getmtime):
@@ -2667,21 +2459,12 @@ def live_timing_dash() -> dict:
                 try:
                     _cj = json.loads(Path(_f).read_text(encoding="utf-8"))
                     if _cj.get("crowding_pctile_252") is not None:
-                        _chs.append(round(float(_cj["crowding_pctile_252"]), 4))
+                        _chs.append(round(float(_cj["crowding_pctile_252"])/100, 6))
                 except Exception:
                     continue
             if _chs:
                 out["crowd_hist"] = _chs
-        except Exception:
-            pass
-        try:
-            _sd = "data/factorpool/output"
-            _tf = sorted(glob.glob(_sd + "/market_emotion_temp*.json"),
-                         key=os.path.getmtime)
-            if _tf:
-                _tjj = json.loads(Path(_tf[-1]).read_text(encoding="utf-8"))
-                out["temp_components"] = _tjj.get("components", {})
-                out["temp_zone"] = _tjj.get("zone", "")
+                out["crowd_hist_unit"] = "fraction"
         except Exception:
             pass
         # 3) 日历窗口 + 未来预告（H16/H17）
@@ -2720,7 +2503,8 @@ def live_timing_dash() -> dict:
             if _cf:
                 _cd = json.loads(Path(_cf[-1]).read_text(encoding="utf-8"))
                 out["crowding"] = {
-                    "mkt": _cd.get("crowding_mkt"), "pctile": _cd.get("crowding_pctile_252"),
+                    "mkt": _cd.get("crowding_mkt"), "pctile": float(_cd["crowding_pctile_252"])/100 if _cd.get("crowding_pctile_252") is not None else None,
+                    "pctile_percent":_cd.get("crowding_pctile_252"),"pctile_unit":"fraction",
                     "zone": _cd.get("zone"), "n_crowded": _cd.get("n_crowded_stocks"),
                     "date": _cd.get("date"),
                 }
@@ -2754,96 +2538,9 @@ _fd_cache = {"ts": 0, "data": None}
 
 
 def live_factor_dash() -> dict:
-    """因子池全景单 API 聚合（60s 缓存）：
-    manifest（95 因子全量）+ health（83 体检）+ flags（6 反向信号命中数）+
-    crowding（拥挤度仪表盘）+ risk（FRC 系数）+ decay（衰减预警）+
-    new（新因子培育）+ categories（分类计数）。页面一次 fetch 全渲染。"""
-    _now = time.time()
-    if _fd_cache["data"] is not None and _now - _fd_cache["ts"] < 60:
-        return _fd_cache["data"]
-    out = {"ok": True, "schema_version": "1.0", "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-    _SD = "data/factorpool/output"
-    try:
-        # 1) manifest 全因子（mtime 取最新）
-        _mf = sorted(glob.glob(_SD + "/factor_manifest_*.json"), key=os.path.getmtime)
-        if _mf:
-            _mj = json.loads(Path(_mf[-1]).read_text(encoding="utf-8"))
-            out["manifest"] = {
-                "date": _mj.get("date"), "n": len(_mj.get("factors", [])),
-                "factors": _mj.get("factors", []),
-                "health_date": _mj.get("health_date", ""),
-            }
-            # ★#338 防漂移：health_date 非当天 → 清单状态基于旧体检，前端提示等待
-            _hd = _mj.get("health_date", "")
-            out["manifest"]["health_stale"] = (datetime.now().strftime("%Y-%m-%d") not in _hd)
-            out["categories"] = {}
-            for f in _mj.get("factors", []):
-                c = f.get("category", "其他")
-                out["categories"][c] = out["categories"].get(c, 0) + 1
-        # 2) health 体检（mtime 取最新）
-        _hf = sorted(glob.glob(_SD + "/health/health_*.csv"), key=os.path.getmtime)
-        if _hf:
-            import csv as _csv
-            _rows = list(_csv.DictReader(open(_hf[-1], encoding="utf-8")))
-            out["health"] = {
-                "date": _rows[0].get("test_date") or _rows[0].get("last_date") if _rows else "",
-                "n": len(_rows), "rows": _rows,
-            }
-        # 3) 反向 flag 命中（daily CSV 最新，flag_ 列计数）
-        _df = sorted(glob.glob(_SD + "/daily_scores/daily_*.csv"), key=os.path.getmtime)
-        if _df:
-            import csv as _csv2
-            _cols = None
-            _cnt = {}
-            _tot = 0
-            _fcodes = {}
-            with open(_df[-1], encoding="utf-8", newline="") as _f:
-                _rd = _csv2.DictReader(_f)
-                _cols = _rd.fieldnames
-                for _r in _rd:
-                    _tot += 1
-                    for _k, _v in _r.items():
-                        if _k.startswith("flag_") and str(_v).strip() in ("1", "true", "True"):
-                            _cnt[_k] = _cnt.get(_k, 0) + 1
-                            _fcodes.setdefault(_k, []).append(_r.get("code", ""))
-            out["flags"] = {"date": "", "total": _tot, "counts": _cnt}
-            if _cols and "date" in _cols:
-                pass
-        # 4) crowding 拥挤度仪表盘
-        _cf = sorted(glob.glob(_SD + "/crowding_*.json"), key=os.path.getmtime)
-        if _cf:
-            _cj = json.loads(Path(_cf[-1]).read_text(encoding="utf-8"))
-            out["crowding"] = {
-                "mkt": _cj.get("crowding_mkt"), "pctile": _cj.get("crowding_pctile_252"),
-                "zone": _cj.get("zone"), "n_crowded": _cj.get("n_crowded_stocks"),
-                "date": _cj.get("date"),
-            }
-        # 5) FRC 风控系数
-        _rf = sorted(glob.glob(_SD + "/risk/risk_multiplier_*.json"), key=os.path.getmtime)
-        if _rf:
-            _rj = json.loads(Path(_rf[-1]).read_text(encoding="utf-8"))
-            out["risk"] = _rj
-        # ★2026-08-12 用户需求#177：因子实战归因（factor_attribution 报告 → 因子池页"实战 T+5"列）
-        try:
-            _af = sorted(glob.glob(str(BASE / "output" / "factor_attribution_*.json")),
-                         key=os.path.getmtime)
-            if _af:
-                _ad = json.loads(Path(_af[-1]).read_text(encoding="utf-8"))
-                _attr_map = {}
-                for _r in (_ad.get("factors") or []):
-                    _attr_map[_r.get("factor")] = {
-                        "n": _r.get("n_pitch", 0),
-                        "t5_avg": _r.get("t5_avg"),
-                        "t5_win": _r.get("t5_win"),
-                        "t1_avg": _r.get("t1_avg"),
-                    }
-                out["attribution"] = _attr_map
-        except Exception:
-            pass
-        _fd_cache.update({"ts": _now, "data": out})
-        return out
-    except Exception as e:
-        return {"ok": False, "error": str(e)[:120]}
+    """Actual supported factors, with typed missing metrics and explicit research provenance."""
+    from deck.research_views import factor_dashboard
+    return factor_dashboard()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2851,31 +2548,76 @@ def live_factor_dash() -> dict:
 # 门户 JS 原 3 次 fetch（chain/timing/pools）→ 1 次，全部走缓存（4ms 级）
 # ══════════════════════════════════════════════════════════════════
 _pd_cache = {"ts": 0, "data": None}
+from deck.background_snapshot import BackgroundSnapshot
+_portal_snapshot = BackgroundSnapshot("portal-summary")
+
+
+def _portal_version():
+    from deck.daily_status import file_versions
+    from deck.research_views import _minute_background_job
+    job=_minute_background_job()
+    paths = [BASE / "runtime/research/pipeline-state.json", BASE / "runtime/research/bootstrap-manifest.json"]
+    # Include every existing file read by the aggregate, not only its newest timestamp.
+    for folder in ("logs", "output", "report"):
+        paths.extend(sorted((BASE / folder).glob("*.json")))
+    minute_version=(job.get("job_id"),job.get("status"),job.get("database_path"),job.get("current_date_ready"),
+                    job.get("cache_verified") if job.get("status")=="complete" else None)
+    return (_bars_version(), file_versions(paths),minute_version)
+
+
+def _portal_public_status():
+    """Fast public progress is refreshed even while an old aggregate is being rebuilt."""
+    from deck.system_live import _api_health, _research_status, _autotrade_status, _next_schedule
+    products = _api_health()
+    auto = _autotrade_status()
+    return {"api_health": products, "research_data": _research_status(products),
+            "autotrade": auto, "next_schedule": _next_schedule(auto)}
 
 
 def live_portal_dash() -> dict:
-    """门户单 API 聚合（★#308 缓存 30s→300s：门户数据 18:30 数据链才更新，非实时；30s 太短导致频繁重算）：
-    pools（5 池状态）+ timing（择时）+ chain（决策链）+ brief（简报）。页面一次 fetch 全渲染。"""
-    _now = time.time()
-    if _pd_cache["data"] is not None and _now - _pd_cache["ts"] < 300:
-        return _pd_cache["data"]
+    """Never make an HTTP request wait for full-database completeness queries."""
+    result = _portal_snapshot.read(_portal_version(), _collect_portal_dash, max_age=300)
+    out = {**(result["data"] or {}), "ok": True, "schema_version": "1.1"}
+    try:
+        out.update(_portal_public_status())
+    except Exception:
+        out["research_data"] = {"ready": False, "message": "研究进度暂不可读，请检查本机服务"}
+    research = out.get("research_data") or {}
+    daily = out.get("daily_status") or {}
+    out.update(loading=result["loading"], stale=result["stale"], snapshot_at=result["updated_at"],
+               ready=bool(result["current"] and out.get("aggregate_complete") and research.get("ready") and daily.get("ready")),
+               state=("failed" if out.get("section_errors") else daily.get("state","unknown") if not daily.get("ready") else research.get("status", "incomplete")) if result["current"] else result["state"])
+    if not result["current"]:
+        out["reason"] = ("完整门户汇总正在后台核验；当前保留上次真实快照" if result["stale"] else "完整门户汇总正在后台核验；初始化进度已实时显示") if result["loading"] else "门户汇总失败，请检查本机研究服务"
+        if result["error"]:
+            out["error"] = "门户后台核验失败；未将旧结果视为最新状态"
+    else:
+        out["reason"] = "部分门户模块读取失败，详情保留在 section_errors" if out.get("section_errors") else research.get("message", "已读取当前真实研究结果")
+    return out
+
+
+def _collect_portal_dash() -> dict:
+    """Full aggregate, including actual completeness evidence, runs off the request thread."""
+    daily_status = _complete_daily_status(wait=True)
     out = {"ok": True, "schema_version": "1.0", "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    out["daily_status"] = daily_status
+    out["section_errors"] = {}
     try:
         out["pools"] = live_pools()
     except Exception:
-        pass
+        out["section_errors"]["pools"] = "候选池汇总读取失败"
     try:
         out["timing"] = live_timing_dash()
     except Exception:
-        pass
+        out["section_errors"]["timing"] = "市场择时读取失败"
     try:
-        out["chain"] = live_chain()
+        out["chain"] = live_chain(_date_status=daily_status)
     except Exception:
-        pass
+        out["section_errors"]["chain"] = "决策链读取失败"
     try:
         out["brief"] = live_brief()
     except Exception:
-        pass
+        out["section_errors"]["brief"] = "研究简报读取失败"
     try:
         # ★2026-08-14 跨资产轮动防守信号（a_share_weak + global_rotation，因子池 P0 落地）
         _gr = BASE / "output" / "global_rotation.json"
@@ -2894,45 +2636,19 @@ def live_portal_dash() -> dict:
         pass
     try:
         # ★#347 数据日（顶层，供门户摘要条"数据日"显示——完整交易日门槛）
-        from data.cache import DailyCache
-        _td = DailyCache().latest_trade_date()
+        _td = daily_status.get("date") if daily_status.get("ready") else None
         if _td:
             out["data_date"] = str(_td)
-            # ★2026-08-14 数据即时性优化：数据日语义（盘中/盘后/周末 + 下次更新说明）
-            #   ——解决"看到 13 号不知道是正常还是卡住"的观感痛点
-            #   ★修复：变量名用 _dnow（勿覆盖函数顶部 float `_now = time.time()`，
-            #     否则缓存 ts 变 datetime → 下次 `_now - ts` 报 TypeError 500）
-            import datetime as _dt
-            _dnow = _dt.datetime.now()
-            _wk = _dnow.weekday()
-            _hm = _dnow.hour * 100 + _dnow.minute
-            _td_ts = _dt.datetime.strptime(str(_td), "%Y-%m-%d")
-            _td_wk = _td_ts.weekday()
-            _is_td = (_td_ts.date() == _dnow.date())
-            if _is_td:
-                if _hm < 930:
-                    _sem = "盘前 · 今日数据待 18:30 收盘后更新"
-                elif _hm < 1500:
-                    _sem = "盘中 · 实时数据为上一交易日（今日 18:30 收盘后更新）"
-                elif _hm < 1830:
-                    _sem = "已收盘 · 数据 18:30 管道更新中"
-                else:
-                    _sem = "今日数据已更新"
-            else:
-                _days = (_dnow.date() - _td_ts.date()).days
-                if _wk >= 5:
-                    _sem = f"周末 · 最新完整交易日 {_td}（周一 18:30 更新）"
-                elif _days >= 1:
-                    _sem = f"最新完整交易日 {_td} · 今日数据 18:30 收盘后更新"
-                else:
-                    _sem = f"最新完整交易日 {_td}"
-            out["data_semantic"] = _sem
+            out["data_semantic"] = f"最新核验完整日线 {_td} · 后续更新以研究服务实际进度为准"
+        else:
+            out["data_semantic"] = daily_status.get("reason") or "完整日线日期尚未核验"
     except Exception:
         pass
     try:
         # ★2026-08-14 数据即时性优化：下次计划运行（门户运行状态窗口数据源）
-        from deck.system_live import _next_schedule
+        from deck.system_live import _next_schedule, _autotrade_status
         out["next_schedule"] = _next_schedule()
+        out["autotrade"] = _autotrade_status()
     except Exception:
         pass
     try:
@@ -2965,7 +2681,7 @@ def live_portal_dash() -> dict:
             out["kpi_series"][_k] = _ser[-12:]
     except Exception:
         pass
-    _pd_cache.update({"ts": _now, "data": out})
+    out["aggregate_complete"] = not out["section_errors"]
     return out
 
 
@@ -3062,31 +2778,14 @@ _data_assets_cache = {"ts": 0.0, "data": None}
 def live_data_assets() -> dict:
     """数据资产概览：unified.db 各表统计 + asset_inventory（资产清单）+ data_lineage（消费链路）"""
     _now = time.time()
-    if _data_assets_cache["data"] is not None and _now - _data_assets_cache["ts"] < 120:
+    from deck.research_views import locations, data_assets
+    _, cache = locations()
+    path = cache/'unified.db'
+    version = (str(path), path.stat().st_mtime_ns, path.stat().st_size) if path.exists() else (str(path), None)
+    if _data_assets_cache["data"] is not None and _data_assets_cache.get('version') == version and _now - _data_assets_cache["ts"] < 120:
         return _data_assets_cache["data"]
-    out = {"ok": True, "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-           "tables": [], "inventory": [], "lineage": []}
-    try:
-        import sqlite3 as _sq
-        _con = _sq.connect("file:data/cache/unified.db?mode=ro&immutable=1",
-                           uri=True, timeout=3)
-        _cur = _con.cursor()
-        for (t,) in _cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
-            try:
-                n = _cur.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0]
-                out["tables"].append({"name": t, "rows": n})
-            except Exception:
-                pass
-        _ci = [c[1] for c in _cur.execute("PRAGMA table_info(asset_inventory)").fetchall()]
-        for r in _cur.execute("SELECT * FROM asset_inventory").fetchall():
-            out["inventory"].append(dict(zip(_ci, r)))
-        _cl = [c[1] for c in _cur.execute("PRAGMA table_info(data_lineage)").fetchall()]
-        for r in _cur.execute("SELECT * FROM data_lineage").fetchall():
-            out["lineage"].append(dict(zip(_cl, r)))
-        _con.close()
-    except Exception as e:
-        out["error"] = str(e)[:120]
-    _data_assets_cache.update({"ts": _now, "data": out})
+    out = data_assets()
+    _data_assets_cache.update({"ts": _now, "data": out, 'version': version})
     return out
 
 
@@ -3095,25 +2794,21 @@ def live_data_assets() -> dict:
 #   新浪全市场实时快照（akshare stock_zh_a_spot，5542 只，~12s）→ 市场实时指标
 #   60s 缓存（盘中频繁请求不重复拉；非交易时段自动降级返回最近快照）
 # ══════════════════════════════════════════════════════════════════
-_rt_cache = {"ts": 0.0, "data": None, "err": None}
+_rt_cache = {"ts": 0.0, "data": None, "err": None, "loading": False, "attempt_ts": 0.0}
+_rt_lock = threading.Lock()
 
 
-def live_realtime() -> dict:
+def _fetch_realtime() -> dict:
     """盘中实时行情快照：涨跌家数/涨停数/成交额/涨跌幅分布/领涨领跌。
     数据源：新浪实时快照（akshare stock_zh_a_spot，60s 缓存）。
     非交易时段（周末/盘前/盘后）返回最近一次快照 + market_open=False。"""
     global _rt_cache
     import time as _t
     now = _t.time()
-    # 60s 缓存命中
-    if _rt_cache["data"] is not None and now - _rt_cache["ts"] < 60:
-        return _rt_cache["data"]
     out = {"ok": True, "market_open": True,
            "ts": datetime.now().strftime("%H:%M:%S"),
            "source": "sina_realtime"}
     try:
-        import socket as _sk
-        _sk.setdefaulttimeout(20)
         import akshare as _ak
         import pandas as _pd
         df = _ak.stock_zh_a_spot()   # 新浪全市场实时（5542 只）
@@ -3189,6 +2884,96 @@ def live_realtime() -> dict:
     return out
 
 
+def live_realtime() -> dict:
+    """Keep slow upstream market downloads out of request and health-check threads."""
+    from paperlive.config import load_config as _paper_config
+    cfg = _paper_config()
+    if cfg['market']['provider'] in ('tushare','tencent_tushare'):
+        configured_source=cfg['market'].get('source_label') or ('tushare:rt_k' if cfg['market']['provider']=='tushare' else cfg['market']['provider'])
+        # The quote daemon is the only live downloader. A read endpoint must not
+        # silently switch to a different supplier or turn historical bars into ticks.
+        try:
+            from paperlive.runtime import public_state
+            from datetime import timezone, timedelta
+            try:
+                raw = json.loads((Path(cfg['runtime_dir']) / 'state.json').read_text())
+            except (OSError,ValueError):
+                raw = {}
+            state = public_state(cfg, raw, {})
+            market = state.get('market', {})
+            source=market.get('source') or configured_source
+            activation=state.get('activation') or {}
+            readiness = state.get('readiness') or {}
+            if readiness.get('state') == 'waiting_market':
+                return {'ok': True, **readiness, 'readiness': readiness, 'paused': True,
+                        'activation': activation, 'market_open': False, 'source': source,
+                        'loading': False, 'quotes': {}, 'ts': state.get('updated_at')}
+            if activation.get('enabled') and activation.get('armed') is not False and activation.get('status')=='waiting_data':
+                return {'ok':True,'ready':False,'state':'waiting_data','paused':True,'activation':activation,
+                        'market_open':False,'source':source,'loading':False,'quotes':{},
+                        'reason':'等待所需数据验收后自动启动；当前尚未开始盘中模拟',
+                        'historical_error':market.get('error'),'ts':state.get('updated_at')}
+            if state.get('paused'):
+                return {'ok':True,'ready':False,'state':'deferred','paused':True,'market_open':False,
+                        'source':source,'loading':False,'quotes':{},
+                        'reason':'盘中模拟已按当前选择暂停；核心研究与分钟历史补齐继续运行',
+                        'historical_error':market.get('error'),'ts':state.get('updated_at')}
+            now_dt = datetime.now(timezone(timedelta(hours=8)))
+            quotes = []
+            for row in state.get('quotes', []):
+                stamp = datetime.fromisoformat(row['timestamp'])
+                age = (now_dt - stamp).total_seconds()
+                if not 0 <= age <= cfg['market']['max_quote_age_seconds']:
+                    continue
+                last, previous = float(row['last']), float(row['previous_close'])
+                if last <= 0 or previous <= 0:
+                    continue
+                quotes.append({**row, 'price': last, 'pct': (last/previous-1)*100})
+            if market.get('error') or market.get('heartbeat_stale') or not quotes:
+                return {'ok': False, 'market_open': False, 'source': source,
+                        'scope': '当前沪深300可交易成分', 'loading': False, 'quotes': {},
+                        'error': market.get('error') or '尚无可验证的新鲜盘中报价',
+                        'ts': state.get('updated_at'), 'phase': market.get('phase')}
+            ranked = sorted(quotes, key=lambda row: row['pct'], reverse=True)
+            simple = lambda row: {'code':row['symbol'], 'name':row['name'], 'pct':round(row['pct'], 2)}
+            return {'ok': True, 'market_open': bool(market.get('open')), 'source': source,
+                    'scope': '当前沪深300可交易成分', 'n_stocks':len(quotes), 'ts':state.get('updated_at'),
+                    'up':sum(row['pct']>0 for row in quotes), 'down':sum(row['pct']<0 for row in quotes),
+                    'flat':sum(row['pct']==0 for row in quotes),
+                    'limit_up':sum(row.get('limit_up') is not None and row['price']>=float(row['limit_up']) for row in quotes),
+                    'limit_down':sum(row.get('limit_down') is not None and row['price']<=float(row['limit_down']) for row in quotes),
+                    'total_amount_yi':None, 'gainers':list(map(simple,ranked[:5])),
+                    'losers':list(map(simple,ranked[-5:][::-1])),
+                    'quotes':{row['symbol']:{'price':row['price'],'pct':round(row['pct'],2)} for row in quotes}}
+        except Exception:
+            return {'ok':False, 'source':configured_source, 'market_open':False, 'loading':False,
+                    'error':'本机行情状态尚未就绪', 'quotes':{}}
+    now = time.time()
+    refresh_seconds = _health_config().get("realtime_refresh_seconds", 60)
+    with _rt_lock:
+        if _rt_cache["data"] is not None and now - _rt_cache["ts"] < refresh_seconds:
+            return dict(_rt_cache["data"])
+        if not _rt_cache["loading"] and now - _rt_cache["attempt_ts"] >= refresh_seconds:
+            _rt_cache.update({"loading": True, "attempt_ts": now})
+
+            def refresh():
+                try:
+                    _fetch_realtime()
+                except Exception as exc:
+                    _rt_cache["err"] = str(exc)[:120]
+                finally:
+                    with _rt_lock:
+                        _rt_cache["loading"] = False
+
+            threading.Thread(target=refresh, name="market-snapshot", daemon=True).start()
+        if _rt_cache["data"] is not None:
+            return {**_rt_cache["data"], "stale": True, "loading": _rt_cache["loading"],
+                    "error": _rt_cache["err"] or "行情快照正在刷新"}
+        return {"ok": False, "loading": _rt_cache["loading"],
+                "ts": datetime.now().strftime("%H:%M:%S"),
+                "error": _rt_cache["err"] or "实时行情正在加载，请稍后刷新"}
+
+
 # ══════════════════════════════════════════════════════════════════
 # ★2026-08-14 API 接口状态探测（用户需求："再做一个API接口状态的信息块"）
 # 并发 HTTP 自探测全部 /api 端点：每个端点 200/耗时/错误 → 门户"API 接口状态"块
@@ -3197,115 +2982,151 @@ def live_realtime() -> dict:
 _ep_cache = {"ts": 0.0, "data": None, "err": None}
 
 # 全部探测端点（只读；排除 export_data 内部子进程导出、stock_check 个股重查询——非稳态端点）
-_ENDPOINTS = [
-    "/api/live/portal_dash", "/api/live/chain", "/api/live/pools",
-    "/api/live/timing_dash", "/api/live/factor_dash", "/api/live/brief",
-    "/api/live/factors", "/api/live/opp", "/api/live/tech",
-    "/api/live/holdings", "/api/live/alerts", "/api/live/funnel",
-    "/api/live/actions", "/api/live/calendar", "/api/live/validation",
-    "/api/live/review", "/api/live/strong_hits", "/api/live/watch",
-    "/api/live/forward", "/api/live/audit", "/api/live/pool",
-    "/api/live/enums", "/api/live/data_assets", "/api/live/factor_ranking",
-    "/api/live/db_view", "/api/live/factor_ui_pack",
-    "/api/live/rotation_calendar", "/api/live/auction", "/api/live/realtime",
-    "/api/live/factor_perf", "/api/pitch_v2", "/api/tech_pitch",
-    "/api/portfolio", "/api/daily_report", "/api/system_live",
-    "/api/decisions",
-]
+def _health_config() -> dict:
+    import yaml
+    for name in ("web_health.yaml", "web_health.yaml.example"):
+        try:
+            cfg = yaml.safe_load((BASE / "config" / name).read_text(encoding="utf-8"))
+            if isinstance(cfg, dict) and isinstance(cfg.get("endpoints"), list):
+                return cfg
+        except (OSError, ValueError, yaml.YAMLError):
+            continue
+    return {"endpoints": []}
 
 
 def _probe_one(path: str, port: int = 8787) -> dict:
     import urllib.request as _ur, time as _t
-    _st = _t.time()
+    from urllib.error import HTTPError
+    _st = _t.monotonic()
     try:
-        with _ur.urlopen(f"http://127.0.0.1:{port}{path}", timeout=25) as _r:
-            _ms = int((_t.time() - _st) * 1000)
-            return {"path": path, "status": _r.status, "ms": _ms, "ok": _r.status == 200}
+        timeout = float(_health_config().get("timeout_seconds", 5))
+        opener = _ur.build_opener(_ur.ProxyHandler({}))
+        try:
+            response = opener.open(f"http://127.0.0.1:{port}{path}", timeout=timeout)
+        except HTTPError as exc:
+            response = exc
+        errors = []
+        with response as _r:
+            status = _r.code
+            try:
+                body = json.loads(_r.read())
+            except (ValueError, UnicodeError):
+                body = None
+                errors.append("接口返回的内容不是有效 JSON")
+        business_state = None
+        if isinstance(body, dict) and status == 200:
+            from paperlive.readiness import classify_market_wait
+            waiting = classify_market_wait(path, body)
+            if waiting:
+                return {'path': path, 'status': status, 'reachable': True,
+                        'ms': int((_t.monotonic()-_st)*1000), 'ok': False,
+                        'state': waiting['state'], 'initialized': waiting['initialized'],
+                        'error': waiting['reason'], 'next_open': waiting.get('next_open')}
+        if isinstance(body,dict) and status==200 and (((body.get("activation") or {}).get("status")=="waiting_data" and (body.get("activation") or {}).get("armed") is not False) or body.get("state")=="waiting_data"):
+            return {"path":path,"status":status,"reachable":True,"ms":int((_t.monotonic()-_st)*1000),
+                    "ok":False,"state":"waiting_data","error":"等待所需数据验收后自动启动；当前尚未开始盘中模拟"}
+        if isinstance(body,dict) and body.get("paused") is True and status==200:
+            return {"path":path,"status":status,"reachable":True,"ms":int((_t.monotonic()-_st)*1000),
+                    "ok":False,"state":"deferred","error":body.get("reason") or "盘中模拟已暂停，暂不启用"}
+        if not isinstance(body, (dict, list)):
+            errors.append("接口没有返回有效业务对象")
+        if isinstance(body, dict):
+            readiness = body.get("readiness") if isinstance(body.get("readiness"), dict) else {}
+            business_state = readiness.get("state") or body.get("state")
+            for key in ("error", "err"):
+                if body.get(key):
+                    errors.append(str(body[key]))
+            for value in body.values():
+                if isinstance(value, dict) and (value.get("error") or value.get("err")):
+                    errors.append(str(value.get("error") or value.get("err")))
+            if body.get("ok") is False and not errors:
+                errors.append("数据尚未就绪")
+            if body.get("stale"):
+                errors.append("当前返回上次快照")
+            if (body.get("ready") is False or readiness.get("ready") is False
+                    or business_state in {"missing_data", "missing_schema", "initializing", "pending_history", "optional_unconfigured", "permission_blocked", "unknown", "failed", "stale"}):
+                errors.append(str(readiness.get("reason") or body.get("reason") or body.get("message") or "业务尚未就绪"))
+        ready = status == 200 and not errors
+        row = {"path": path, "status": status, "reachable": True,
+               "ms": int((_t.monotonic() - _st) * 1000), "ok": ready,
+               "state": (business_state or "ready") if ready else (business_state or "not_ready")}
+        if isinstance(body, dict) and "initialized" in body:
+            row["initialized"] = body["initialized"] is True
+        if not ready:
+            row["error"] = ("；".join(dict.fromkeys(errors)) or f"HTTP {status}")[:200]
+        return row
     except Exception as _e:
-        _ms = int((_t.time() - _st) * 1000)
-        return {"path": path, "status": 0, "ms": _ms, "ok": False,
+        _ms = int((_t.monotonic() - _st) * 1000)
+        return {"path": path, "status": 0, "ms": _ms, "ok": False, "reachable": False,
+                "state": "connection_error",
                 "error": str(_e)[:80]}
 
 
+_endpoint_snapshot = BackgroundSnapshot('endpoint-health', retry_seconds=5)
+_endpoint_progress = {'version':None,'endpoints':[],'started_at':0}
+_endpoint_progress_lock = threading.Lock()
+
+
+def _endpoint_counts(rows, total):
+    return {'total':total,'checked_count':len(rows),'ok_count':sum(bool(row.get('ok')) for row in rows),
+            'connected_count':sum(bool(row.get('reachable')) for row in rows),
+            'unready_count':sum(bool(row.get('reachable')) and not row.get('ok') and row.get('state')!='deferred' for row in rows),
+            'deferred_count':sum(row.get('state')=='deferred' for row in rows),
+            'waiting_market_count':sum(row.get('state')=='waiting_market' for row in rows),
+            'fail':[row for row in rows if not row.get('ok')],'endpoints':rows}
+
+
+def _collect_endpoints(endpoints, workers, version):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with _endpoint_progress_lock:
+        _endpoint_progress.update(version=version,endpoints=[],started_at=time.time())
+    rows=[]
+    with ThreadPoolExecutor(max_workers=workers,thread_name_prefix='endpoint-check') as pool:
+        futures={pool.submit(_probe_one,path):path for path in endpoints}
+        for future in as_completed(futures):
+            rows.append(future.result())
+            with _endpoint_progress_lock:
+                _endpoint_progress.update(version=version,endpoints=list(rows))
+    rows.sort(key=lambda row:endpoints.index(row['path']))
+    return {**_endpoint_counts(rows,len(endpoints)),'ts':datetime.now().isoformat(timespec='seconds')}
+
+
 def live_endpoints() -> dict:
-    """全部 API 端点状态：先 warm 重端点缓存（避免冷缓存并发挤压误报超时）→
-    并发探测 + 120s 缓存。ok_count / total / 每端点 status+ms。
-    失败端点保留上次成功状态（stale 标记），避免偶发网络抖动全屏红。"""
-    global _ep_cache
-    import time as _t
-    now = _t.time()
-    if _ep_cache["data"] is not None and now - _ep_cache["ts"] < 120:
-        return _ep_cache["data"]
-    # ★2026-08-14 先 warm 重端点（portal_dash/chain/calendar/realtime/alerts 冷缓存重算 3-15s，
-    #   若直接并发探测会把"冷启动慢"误报为"接口故障"）
-    for _w in (live_portal_dash, live_chain, live_alerts, live_calendar):
-        try:
-            _w()
-        except Exception:
-            pass
-    try:
-        live_realtime()   # 新浪快照拉取（60s 缓存命中后 <1ms）
-    except Exception:
-        pass
-    out = {"ok": True, "ts": datetime.now().strftime("%H:%M:%S"),
-           "total": len(_ENDPOINTS), "endpoints": []}
-    try:
-        from concurrent.futures import ThreadPoolExecutor as _TPE
-        with _TPE(max_workers=8) as _ex:
-            _results = list(_ex.map(_probe_one, _ENDPOINTS))
-        _ok = [r for r in _results if r.get("ok")]
-        # 失败端点 → 保留上次状态（若曾有）
-        _prev = {e["path"]: e for e in (_ep_cache["data"] or {}).get("endpoints", [])}
-        for _r in _results:
-            if not _r.get("ok") and _r["path"] in _prev:
-                _r["stale"] = True
-                _r["last_ok"] = _prev[_r["path"]].get("ms")
-        out["ok_count"] = len(_ok)
-        out["fail"] = [_r for _r in _results if not _r.get("ok")]
-        out["endpoints"] = _results
-        _ep_cache.update({"ts": now, "data": out, "err": None})
-    except Exception as _e:
-        _ep_cache["err"] = str(_e)[:120]
-        if _ep_cache["data"] is not None:
-            out = dict(_ep_cache["data"])
-            out["stale"] = True
-            out["stale_ts"] = datetime.now().strftime("%H:%M:%S")
-        else:
-            out = {"ok": False, "ts": datetime.now().strftime("%H:%M:%S"),
-                   "total": len(_ENDPOINTS), "ok_count": 0, "endpoints": [],
-                   "error": str(_e)[:120]}
-    return out
+    """A read-only, deduplicated background audit; no warm-up or scans in HTTP."""
+    from validation.check_portal_readiness import SAFE_APIS
+    cfg=_health_config();allowed=set(SAFE_APIS)
+    configured=[path for path in cfg.get('endpoints',[]) if isinstance(path,str)]
+    endpoints=list(dict.fromkeys(path for path in configured if path in allowed))
+    excluded=[path for path in configured if path not in allowed]
+    if not endpoints:
+        return {**_endpoint_counts([],0),'ok':True,'ready':False,'state':'optional_unconfigured',
+                'loading':False,'excluded_routes':excluded,'reason':'没有配置已核定安全的只读检查项'}
+    workers=max(1,min(4,int(cfg.get('max_workers',4))))
+    version=(tuple(endpoints),workers,float(cfg.get('timeout_seconds',5)))
+    result=_endpoint_snapshot.read(version,lambda:_collect_endpoints(endpoints,workers,version),
+                                   max_age=max(5,float(cfg.get('cache_seconds',120))))
+    if result['current']:
+        data=dict(result['data'])
+    else:
+        with _endpoint_progress_lock:
+            rows=(list(_endpoint_progress['endpoints']) if _endpoint_progress['version']==version
+                  and _endpoint_progress.get('started_at',0)>(result['updated_at'] or 0) else [])
+        data=_endpoint_counts(rows,len(endpoints))
+    return {**data,'ok':True,'ready':result['current'],'state':result['state'],
+            'loading':result['loading'],'stale':False,'excluded_routes':excluded,
+            'reason':'只读接口检查已完成' if result['current'] else '正在后台检查只读接口；未完成项不计为可用' if result['loading'] else '后台接口检查失败，冷却后重试',
+            'error':result['error'],'updated_at':result['updated_at']}
 
 
 def live_wufu_rotation() -> dict:
-    """★2026-08-16 五福轮动门户摆件：9 只全球 ETF 代理池常态动量面板（常显，不依赖弱市）
-    + 弱市防守建议（读 global_rotation.json 合并）。"""
-    out = {"ok": True, "date": "", "assets": [], "a_share_weak": None, "weak_vote": None,
-           "defensive": None}
+    """Read the current explicitly identified proxy-rotation artifact only."""
     try:
-        import sys as _sys
-        from pathlib import Path as _P
-        _BASE = _P(__file__).resolve().parent.parent
-        if str(_BASE) not in _sys.path:
-            _sys.path.insert(0, str(_BASE))
-        from factors.policy.global_rotation import widget
-        w = widget()
-        out.update({"date": w["date"], "assets": w["assets"]})
-    except Exception as _e:
-        out["error"] = str(_e)[:200]
-    # 弱市防守建议（global_rotation.json）
-    try:
-        _gr = _BASE / "output" / "global_rotation.json"
-        if _gr.exists():
-            import json as _j
-            g = _j.loads(_gr.read_text(encoding="utf-8"))
-            out["a_share_weak"] = bool(g.get("a_share_weak"))
-            out["weak_vote"] = g.get("weak_vote")
-            out["defensive"] = g.get("global_rotation")
-            out["date"] = g.get("date") or out["date"]
+        from data.global_rotation import widget
+        return widget()
     except Exception:
-        pass
-    return out
+        return {"ok": False, "ready": False, "initialized": False, "state": "missing_data",
+                "assets": [], "date": "", "a_share_weak": None, "weak_vote": None, "defensive": None,
+                "error": "全球资产当前日期、身份、配置或覆盖尚未通过验收"}
 
 
 if __name__ == "__main__":

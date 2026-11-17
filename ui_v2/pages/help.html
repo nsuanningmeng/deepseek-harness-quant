@@ -32,6 +32,7 @@
 <body style="background:var(--bg);margin:0">
 <div id="sidebar"></div>
 <div class="v2-wrap">
+  <div class="v2-card mini" style="line-height:1.9">本页包含历史研究审批流程说明。实时AI虚拟账户的资金、风控与成交状态以 <a href="/paperlive">实时模拟盘</a> 为准。</div>
   <div class="v2-h"><span class="bar"></span><h1>说明</h1><span class="sub">全决策流程 · 动态漏斗 · 各层原理 · 协作</span></div>
   <div class="mini" style="opacity:.7">UI v2 · 说明页 2026-08-15 重建 —— 展示系统真实决策链（源头数据 → 各层过滤 → Pitch → 持仓 → 验证）</div>
 
@@ -66,14 +67,14 @@
         <div class="mini" style="color:var(--muted);line-height:1.8"><b>Pitch 长线</b>（价值/质量缺口/重估，1/2/3 年证据+止损）+
           <b>Pitch 短线</b>（情绪/事件，ATR 双倍止损"见光死"）。<br>
           决策页「今日买入指令」= 长+短待审批卡聚合（同源）。<br>
-          持仓 ≤5 纪律：审批买入满仓自动进超限，须先卖后买。<br>
+          历史审批组合与实时AI账户使用各自的持仓和风控配置，资金与收益分开记录。<br>
           ⚠️ 实证：<b style="color:var(--gold)">pitch 高分集中持仓 = -41~-60% 回撤</b>——pitch 是雷达+卫星仓，主力走 turn_low 分散。</div>
       </div>
       <div class="layer">
         <h3><span class="ln" style="background:rgba(39,174,96,.14);color:#4ade80">L1</span> 因子参考层 · 不产生指令</h3>
-        <div class="mini" style="color:var(--muted);line-height:1.8">因子净化 A/B/C 分类（稳定 47 / 反转 21 / 噪声 55）+ 机会池 + 机器池 + 竞价排雷。<br>
+        <div class="mini" style="color:var(--muted);line-height:1.8">当前实际支持公式、方向和成熟样本从研究产物读取；独立机器池、风格轮动和竞价研究会注明配置状态。<br>
           参考数据：daily_scores（因子池）/ 机会池 / 远期池验证（T+1/5/20/60 实盘归因）。<br>
-          turn_low 防守因子：40日 top20、T+1、无止损无择时（+15.9%/-8.7%/1.11，2019+）。</div>
+          turn_low 防守因子：换手窗口与执行口径见当前配置和来源记录；2019年前换手类结论无效。</div>
       </div>
     </div>
   </div>
@@ -84,7 +85,7 @@
     <div class="mini" style="line-height:2;color:var(--muted)">
       <b style="color:var(--navy)">数据审计闸门</b>：每日链开头 gate（FAIL → 信号标记"不可执行"）。<br>
       <b style="color:var(--navy)">因子健康分层</b>：有效 / 弱有效 / 反向漂移 / 衰减 / 失效——反向/失效/衰减因子不得选股（FRC 排雷）。<br>
-      <b style="color:var(--navy)">Beneish M-Score</b>：财务操纵检测（HIGH 260/WATCH 350/LOW 4891，R6 一票否决）。<br>
+      <b style="color:var(--navy)">Beneish M-Score</b>：按实际已公告财务数据计算风险档位，缺数据时明确保留缺口。<br>
       <b style="color:var(--navy)">竞价反信号</b>：strength≥6 高开过热 → 机会池减分回避（T-3 实证 1 日短效/5-20 日反转）。<br>
       <b style="color:var(--navy)">单因子依赖</b>：仅 1 因子/单类型命中 → 橙徽章需主观复核。<br>
       <b style="color:var(--navy)">实盘归因门控</b>：revalue 下跌日放大亏损（-1.25pp 实证）→ 防御期审批从严。
@@ -95,11 +96,11 @@
   <div class="v2-card anim-fade-in-up d1" style="margin-top:14px">
     <h2> 协作体系 <span class="tag">因子池 · AlphaGPT 科研 · 留言区</span></h2>
     <div class="mini" style="line-height:2;color:var(--muted)">
-      <b style="color:var(--navy)">因子池（研究员）</b>：挖掘/验证/交付（122 份报告 + daily_scores/health/manifest/ui_data），主系统只读+留言裁决。<br>
+      <b style="color:var(--navy)">因子池（研究员）</b>：挖掘、验证与实际产物交付（当前公式和样本以因子页面为准），主系统只读+留言裁决。<br>
       <b style="color:var(--navy)">★新员工：AlphaGPT 自动因子挖掘（科研阶段）</b>：`_trial_alphagpt/` 独立目录，正在做 Alpha158/公式生成研究；
-      已按验证链走通 69 因子对表→去重闸门→组合层 T+1→终审（结论：外部因子库≠增量，价值=校准基线）。
-      科研产出经入池流程规范化（9 步 + 回测图归档）后进入因子池。<br>
-      <b style="color:var(--navy)">沟通文件夹</b>：量化代码库思路库/AI协作、因子池/AI协作、DeepSeek HARNESS Quant/AI协作、deepseek-harness-quant/AI协作（留言-回执制）。
+      独立科研内容的完成情况以本机实际产物为准，不把历史项目说明当成当前已验证结果。
+      科研产出需要真实数据、执行口径和成熟样本校准后再评估。<br>
+      <b style="color:var(--navy)">沟通文件夹</b>：本机研究产物保留数据来源、样本范围和执行口径，可在数据与回测页面查看。
     </div>
   </div>
 
@@ -115,11 +116,15 @@
   </div>
 
   <!-- 手动更新 -->
+  <section class="v2-card" style="margin-top:14px">
+    <h2>历史分钟数据补齐 <span class="tag">独立固定窗口任务</span></h2>
+    <div id="minute-job" class="mini" role="status" aria-live="polite" style="line-height:1.9">读取独立后台任务…</div>
+  </section>
   <div class="v2-card anim-fade-in-up d1" style="margin-top:14px">
-    <h2> 手动更新全域数据 <span class="tag">数据及时性补救 · 自动程序运行中自动拒绝</span></h2>
-    <div class="mini" style="color:var(--muted);margin-bottom:10px;line-height:1.7">系统不 24h 在线，自动链失效或关机后会缺数据——点此一键触发完整数据管道。自动程序运行中会自动拒绝。</div>
+    <h2> 更新研究数据 <span class="tag">真实初始化进度 · 运行中复用现有任务</span></h2>
+    <div class="mini" style="color:var(--muted);margin-bottom:10px;line-height:1.7">更新请求先在本机排队，后台核实交易日和收盘数据后更新。初始化进行中显示现有进度，不会重复启动任务。</div>
     <div id="mu-status" class="mini" style="line-height:1.9;margin-bottom:10px"> 加载状态…</div>
-    <button id="mu-btn" class="v2-btn">手动更新全域数据</button>
+    <button id="mu-btn" class="v2-btn">更新研究数据</button>
     <div id="mu-log" class="mini" style="margin-top:10px;color:var(--muted);font-family:monospace;font-size:12px;line-height:1.6;white-space:pre-wrap"></div>
   </div>
 
@@ -172,6 +177,8 @@
 
 <script src="/v2/core/api.js"></script>
 <script src="/v2/core/render.js"></script>
+<script src="/v2/components/research-update.js"></script>
+<script src="/v2/components/minute-status.js"></script>
 <script src="/v2/components/icons.js"></script>
 <script src="/v2/components/search.js"></script>
 <script src="/v2/components/sidebar.js"></script>
@@ -179,6 +186,10 @@
 (function () {
   LW.sidebar.render('sidebar', {active: 'help'});
   var R = LW.render;
+  LW.minuteStatus.bind('minute-job');
+
+  function esc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  function healthState(value) { return ({ready:'已核验',empty_valid:'分析完成，0候选',pending_history:'历史待积累',initializing:'初始化中',probing:'后台核验中',rate_limited:'按官方限频后台补齐',missing_data:'缺数据',missing_schema:'缺业务表',permission_blocked:'权限阻塞',optional_unconfigured:'可选项未配置',failed:'执行失败',stale:'内容日期滞后',unknown:'尚未验收'})[value] || '尚未验收'; }
 
   function dot(ok, warn) {
     var c = ok ? 'var(--green)' : (warn ? 'var(--gold)' : 'var(--red)');
@@ -225,15 +236,16 @@
 
   /* ── 系统运行状态（/api/system_live）── */
   function loadSys() {
-    LW.api.get('/api/system_live', { bypass: true }).then(function (d) {
+    LW.api.get('/api/system_live', { bypass: true, staleFallback:false }).then(function (d) {
       if (d.error) { document.getElementById('sys-meta').innerHTML = '状态获取失败：' + R._f(d.error); return; }
       document.getElementById('sys-meta').innerHTML = '采集 ' + R._f(d.ts) + ' · deck 进程 PID ' + R._f(d.deck_pid);
       var dbs = d.databases || {};
       document.getElementById('sys-db').innerHTML = Object.keys(dbs).map(function (k) {
         var v = dbs[k];
-        return dot(v.online, false) + '<b>' + k + '</b> ' +
-          (v.online ? ((v.rows != null ? (v.rows / 10000).toFixed(0) + ' 万行' : '') + (v.ms != null ? ' · ' + v.ms + 'ms' : '')) : '离线');
-      }).join('　');
+        return '<div>'+dot(v.ready === true, v.online === true) + '<b>' + esc(k) + '</b> · ' + esc(healthState(v.state)) +
+          ' · '+esc(v.rows == null?'—':v.rows)+' 行'+(v.data_date?' · 内容至 '+esc(v.data_date):'')+(v.freq?' · '+esc(v.freq):'')+
+          '<span style="opacity:.7"> · '+esc(v.reason||v.error||'')+'</span></div>';
+      }).join('');
       var sc = d.scheduled || {};
       document.getElementById('sys-sched').innerHTML = Object.keys(sc).map(function (k) {
         var v = sc[k];
@@ -242,57 +254,26 @@
       var ah = d.api_health || {};
       document.getElementById('sys-api').innerHTML = Object.keys(ah).map(function (k) {
         var v = ah[k];
-        var stale = !!v.stale;
-        return dot(v.online, stale) + '<b>' + k + '</b> ' +
-          (v.online ? (v.age_h != null ? v.age_h.toFixed(1) : '—') + 'h' : '离线') +
-          (stale ? ' <span style="color:var(--gold)">滞后</span>' : '');
-      }).join('　');
+        return '<div>'+dot(v.ready === true, v.ready !== true) + '<b>' + esc(k) + '</b> · ' +esc(healthState(v.state))+
+          (v.data_date?' · 内容至 '+esc(v.data_date):'')+'<span style="opacity:.7"> · '+esc(v.reason||'尚缺业务验收信息')+'</span></div>';
+      }).join('');
+      var research = d.research || {}, bootstrap=research.bootstrap||{};
+      document.getElementById('sys-meta').textContent='采集 '+(d.ts||'—')+' · '+(research.initialized?'核心研究已初始化':'研究初始化 '+(bootstrap.stage||bootstrap.phase||research.status||'尚未读取'))+
+        (!research.initialized && bootstrap.total_units?' · '+(bootstrap.completed_units||0)+'/'+bootstrap.total_units:'')+' · 已初始化 '+(research.initialized_count||0)+'/'+(research.total||Object.keys(ah).length)+' 项'+
+        (research.pending_history_count?' · '+research.pending_history_count+' 项等待样本':'')+
+        (!research.initialized && bootstrap.last_error?' · '+bootstrap.last_error:'');
     }).catch(function (e) {
       document.getElementById('sys-meta').innerHTML = '状态获取失败：' + e;
     });
   }
 
-  /* ── 手动更新 ── */
-  function loadMu() {
-    LW.api.get('/api/update_status', { bypass: true }).then(function (d) {
-      var st = document.getElementById('mu-status');
-      var btn = document.getElementById('mu-btn');
-      if (d.busy) {
-        st.innerHTML = dot(false, true) + '<b>忙碌</b> ' + R._f(d.reason);
-        btn.disabled = true;
-      } else {
-        var last = d.last || {};
-        st.innerHTML = dot(true, false) + '<b>空闲</b>，可手动更新' +
-          (last.ts ? ' · 上次 ' + R._f(last.ts) + ' [' + R._f(last.status || '') + ']' : ' · 尚无更新记录');
-        btn.disabled = false;
-      }
-      var log = d.log_tail || [];
-      document.getElementById('mu-log').innerHTML = log.length ? log.join('\n') : '';
-    }).catch(function (e) {
-      document.getElementById('mu-status').innerHTML = '状态获取失败：' + e;
-    });
-  }
-
-  document.getElementById('mu-btn').onclick = function () {
-    var btn = document.getElementById('mu-btn');
-    btn.disabled = true; btn.textContent = '正在触发…';
-    LW.api.post('/api/manual_update', {}).then(function (d) {
-      btn.textContent = '手动更新全域数据';
-      if (d.ok) { loadMu(); }
-      else { alert('触发失败：' + (d.reason || d.error || '未知原因')); loadMu(); }
-    }).catch(function (e) {
-      btn.textContent = '手动更新全域数据';
-      alert('触发失败：' + e);
-      loadMu();
-    });
-  };
+  // This endpoint queues the current service and never starts the legacy daily pipeline.
+  LW.researchUpdate.bind({buttonId:'mu-btn',statusId:'mu-status',detailId:'mu-log',onIdle:loadSys});
 
   loadFunnel();
   loadSys();
-  loadMu();
   setInterval(loadFunnel, 60000);
   setInterval(loadSys, 30000);
-  setInterval(loadMu, 10000);
 })();
 </script>
 </body>

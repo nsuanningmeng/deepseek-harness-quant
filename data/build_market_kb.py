@@ -26,8 +26,9 @@ sys.path.insert(0, str(BASE))
 LOGS = BASE / "logs"
 REPORT = BASE / "report"
 OUTPUT = BASE / "output"
-UNIFIED = Path(r"data/cache/unified.db")
-EXT_HS = Path(r"data/factorpool/output/health")
+from data.cache import CACHE_DIR
+UNIFIED = CACHE_DIR / "unified.db"
+EXT_HS = BASE / "data/factorpool/output/health"
 
 TABLES = {
     "market_daily": """CREATE TABLE IF NOT EXISTS market_daily (
@@ -124,12 +125,13 @@ def load_market_width():
     try:
         from data.cache import DailyCache
         date = DailyCache().latest_trade_date()
-        con = sqlite3.connect("file:data/cache/bars.db?mode=ro&immutable=1", uri=True, timeout=5)
+        con = sqlite3.connect(f"file:{CACHE_DIR / 'bars.db'}?mode=ro", uri=True, timeout=5)
+        con.execute('ATTACH DATABASE ? AS meta', (f"file:{CACHE_DIR / 'stock_basic.db'}?mode=ro",))
         rows = con.execute(
             "SELECT SUM(CASE WHEN pct_chg>0 THEN 1 ELSE 0 END), SUM(CASE WHEN pct_chg<0 THEN 1 ELSE 0 END),"
             " SUM(CASE WHEN pct_chg=0 THEN 1 ELSE 0 END),"
             " SUM(CASE WHEN source IN ('tushare','tushare_backup') THEN amount*1000 ELSE amount END) FROM daily_bar "
-            "WHERE adjust='qfq' AND date=? AND code NOT LIKE 'SH.%' AND code NOT LIKE 'sh.%'", (date,)).fetchone()
+            "WHERE adjust='none' AND date=? AND code IN (SELECT code FROM meta.stock_basic)", (date,)).fetchone()
         con.close()
         n_up, n_down, n_flat, amt_yuan = rows if rows else (None, None, None, None)
         # ★2026-08-15 单位归一：tushare 千元×1000→元，baostock/akshare 元；排除 SH.000300 指数行
@@ -252,6 +254,8 @@ def build(con):
 
     # 1) market_daily（最新一天）
     t = load_timing()
+    if not t or not t.get('date') or t.get('timing_score') is None:
+        raise ValueError('市场知识库需要本轮实际择时结果')
     if t and t.get("date"):
         pct, n_crowd = load_crowding()
         wd, n_up, n_down, n_flat, amt = load_market_width()
@@ -303,10 +307,12 @@ def dump_ai(con):
     ms = con.execute("SELECT * FROM market_style_daily ORDER BY date DESC LIMIT 10").fetchall()
     mscols = [c[1] for c in con.execute("PRAGMA table_info(market_style_daily)").fetchall()]
     ms_rows = [dict(zip(mscols, r)) for r in ms]
-    fh = con.execute("SELECT date, COUNT(*) n, SUM(CASE WHEN status LIKE '%有效%' THEN 1 ELSE 0 END) eff FROM factor_health_snap GROUP BY date ORDER BY date DESC LIMIT 7").fetchall()
+    fh = con.execute("SELECT date, COUNT(*) n, SUM(CASE WHEN status LIKE '%有效%' AND status NOT LIKE '%无效%' THEN 1 ELSE 0 END) eff FROM factor_health_snap GROUP BY date ORDER BY date DESC LIMIT 7").fetchall()
     dump = {
+        "data_date": md_rows[0]['date'] if md_rows else None,
+        "source": "verified-local-research-cache",
         "generated": __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "note": "市场知识库 AI 视图——因子实测 + 市场快照 + 风格 + 健康。用于知识库 AI 主观分析。",
+        "note": "本机市场快照与因子研究；前向收益需要从实际登记日起积累，尚无样本时保留空值。风格策略未配置时不提供风格结论。",
         "market_daily_recent": md_rows,
         "factor_perf_top": fp_rows,
         "market_style_recent": ms_rows,

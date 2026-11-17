@@ -157,13 +157,14 @@
     var ov = d.overview || {};
     var ovEl = q('.overview');
     if (ovEl && ov.regime_cn) {
-      var gateHtml = (!ov.gate_ok) ? '<div class="gate-banner">⛔ 信号闸门阻断：' + esc(ov.gate_reason) + '</div>' : '';
+      var gateHtml = (ov.gate_ok === false) ? '<div class="gate-banner">⛔ 信号闸门阻断：' + esc(ov.gate_reason) + '</div>' :
+        (ov.signal_summary && ov.signal_summary.research_only ? '<div class="mini">'+esc(ov.signal_summary.note)+'</div>' : '');
       var audHtml = (ov.audit_blocked) ? '<div class="audit-block">🔴 数据审计阻断：' + esc(ov.audit_block_reason) + '</div>' : '';
       ovEl.innerHTML = gateHtml + audHtml +
         '<div class="ov-grid">' +
-        '<div class="ov-card"><div class="mini">择时档位</div><b>' + esc(ov.regime_cn) + '</b><div class="mini">现金 ' + Math.round((ov.regime_cash || 0) * 100) + '% · ' + esc(ov.regime_level) + '</div></div>' +
-        '<div class="ov-card"><div class="mini">数据审计</div><b style="color:' + (ov.audit_fail > 0 ? '#C0392B' : '#0F6E56') + '">' + num(ov.audit_health, 0) + '/100</b><div class="mini">PASS ' + fmt(ov.audit_pass, 0) + ' · FAIL ' + fmt(ov.audit_fail, 0) + '</div></div>' +
-        '<div class="ov-card"><div class="mini">通过股票数</div><b>' + esc(ov.n_passed) + '</b><div class="mini">今日信号</div></div>' +
+        '<div class="ov-card"><div class="mini">研究择时档位</div><b>' + esc(ov.regime_cn) + '</b><div class="mini">现金 ' + (ov.regime_cash == null?'—':Math.round(ov.regime_cash * 100)+'%') + ' · ' + esc(ov.regime_level) + '</div></div>' +
+        '<div class="ov-card"><div class="mini">数据审计</div><b>' + (ov.audit_health == null?'—':num(ov.audit_health, 0)+'/100') + '</b><div class="mini">PASS ' + (ov.audit_pass == null?'—':fmt(ov.audit_pass, 0)) + ' · FAIL ' + (ov.audit_fail == null?'—':fmt(ov.audit_fail, 0)) + '</div></div>' +
+        '<div class="ov-card"><div class="mini">明确记录的过滤通过数</div><b>' + esc(ov.n_passed == null?'—':ov.n_passed) + '</b><div class="mini">研究汇总不提供该值时保持未知</div></div>' +
         '<div class="ov-card"><div class="mini">今日建议</div><b class="mini">' + esc(ov.advice) + '</b></div></div>';
     }
     // ★2026-08-11 信号族页签计数 + 各行（按 signal_family 分组；排序 = rank_signal 信号加权排名）

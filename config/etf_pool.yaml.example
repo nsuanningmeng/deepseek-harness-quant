@@ -42,7 +42,7 @@ pool:
   - { code: "159941", name: "纳指100ETF", category: "跨境" }
   - { code: "513180", name: "恒生科技ETF", category: "跨境" }
   - { code: "518880", name: "黄金ETF", category: "商品" }
-  - { code: "518800", name: "黄金ETF华夏", category: "商品" }
+  - { code: "518800", name: "黄金ETF国泰", category: "商品" }
   - { code: "511010", name: "国债ETF", category: "债券" }
   - { code: "511260", name: "十年国债ETF", category: "债券" }
   - { code: "511380", name: "可转债ETF", category: "债券" }

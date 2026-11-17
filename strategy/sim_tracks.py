@@ -33,8 +33,10 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
-BARS_DB = r"data\cache\bars.db"
+from factors.research_context import cache_dir, connect as research_connect, config as research_config, scope_metadata
+BARS_DB = cache_dir() / "bars.db"
 
 import numpy as np
 import pandas as pd
@@ -55,14 +57,13 @@ TOP_N = 5             # 每月 Pitch 上限
 
 
 def _load_regime() -> dict:
-    """dynamic_regime.json → {month: pos}；缺失时全仓（pos=1）"""
-    if not REGIME_JSON.exists():
-        return {}
-    try:
-        d = json.loads(REGIME_JSON.read_text(encoding="utf-8"))
-        return {k: v.get("pos", 1.0) for k, v in d.items() if isinstance(v, dict)}
-    except Exception:
-        return {}
+    """Actual monthly positions only; missing risk evidence must not imply full exposure."""
+    d = json.loads(REGIME_JSON.read_text(encoding="utf-8"))
+    out = {k: float(v["pos"]) for k, v in d.items()
+           if isinstance(v, dict) and isinstance(v.get("pos"), (int, float)) and 0 <= v["pos"] <= 1 and str(v.get("signal_month", "9999")) < k}
+    if not out:
+        raise ValueError("缺少真实月度regime仓位")
+    return out
 
 
 def _monthly_market_ret(bars: pd.DataFrame, months: list) -> pd.DataFrame:
@@ -82,7 +83,9 @@ def _score_candidates(f: pd.DataFrame, trig: dict, winrate_map: dict) -> list:
             continue
         mask = f.apply(trig[ot], axis=1)
         for code, r in f[mask].iterrows():
-            wr = winrate_map.get(ot, 0.60)
+            wr = winrate_map.get(ot)
+            if wr is None:
+                continue
             dd = abs(float(r.get("drawdown_60d") or 0.2)) * 100
             vol = float(r.get("vol60") or 0.3)
             risk = min(dd / 6.0 + 1.0 + max(vol - 0.20, 0) * 8 + 1.5, 10)
@@ -100,7 +103,7 @@ def _score_candidates(f: pd.DataFrame, trig: dict, winrate_map: dict) -> list:
     for c in cands:
         if c["code"] not in seen or c["score"] > seen[c["code"]]["score"]:
             seen[c["code"]] = c
-    top = sorted(seen.values(), key=lambda x: -x["score"])[:TOP_N]
+    top = sorted(seen.values(), key=lambda x: -x["score"])
     return top
 
 
@@ -148,46 +151,60 @@ def _stats(curve_rets: list, nav_curve: list) -> dict:
     }
 
 
-def run(start: str = "2020-01") -> dict:
+def run(start: str = "auto") -> dict:
     print("加载数据...", flush=True)
     bars, fin, q, basic = _load_all()
+    cfg = research_config()
+    sim_cfg = cfg["sim_tracks"]
+    hold_months, top_n = int(sim_cfg["hold_months"]), int(sim_cfg["top_n"])
     trig = triggers()
     regime = _load_regime()
 
     # 回测期（月度）
     dates = pd.DatetimeIndex(sorted(bars["date"].unique()))
     month_ends = []
-    cur = pd.Timestamp(start)
+    if len(dates) < int(cfg["min_history_days"]):
+        raise ValueError("历史不足，不能运行预热后的双轨回测")
+    ready = dates[int(cfg["min_history_days"]) - 1]
+    cur = ready if start == "auto" else max(pd.Timestamp(start), ready)
+    cur = cur.to_period("M").to_timestamp()
     while cur <= dates.max():
         mask = (dates >= cur) & (dates < _add_months(cur, 1))
-        if mask.any():
+        if mask.any() and cur.to_period("M") < pd.Period(datetime.now().strftime("%Y-%m"), freq="M"):
             month_ends.append(dates[mask][-1])
         cur = _add_months(cur, 1)
 
     mkt = _monthly_market_ret(bars, [str(m)[:7] for m in month_ends])
 
     by_code = {c: g.sort_values("date") for c, g in bars.groupby("code")}
-    winrate_map = _load_winrates()
+    calibration = json.loads((BASE / "logs/opportunity_winrates.json").read_text(encoding="utf-8"))
+    observations = calibration.get("observations")
+    if not isinstance(observations, list) or not observations:
+        raise ValueError("缺少带真实到期日的校准样本，先运行backtest_winrate")
 
     # 优选轨持仓（rolling）：{code: 到期月}
     holdings = {}
     config_rets, pitch_rets = [], []
+    n_entries, warmup_months = 0, []
 
     for k, t in enumerate(month_ends):
         ym = str(t)[:7]
         # ---------- 配置轨 ----------
-        pos = regime.get(ym, 1.0)
-        mret = float(mkt.get(ym, 0.0)) if ym in mkt.index else 0.0
+        if ym not in regime:
+            raise ValueError(f"缺少{ym}生效择时证据，不能假设全仓")
+        pos = regime[ym]
+        if ym not in mkt.index or not np.isfinite(mkt[ym]):
+            raise ValueError(f"缺少{ym}真实市场月收益")
+        mret = float(mkt[ym])
         config_rets.append((ym, mret * pos))
 
         # ---------- 优选轨 ----------
         # 到期剔除
-        holdings = {c: h for c, h in holdings.items() if h.get("due", "") > ym}
         if holdings:
             # 用入轨 base 价（T+1 开盘）计算当前持仓月收益
             r2 = []
             for c, h in holdings.items():
-                base = h.get("base")
+                base = h.get("mark")
                 g = by_code.get(c)
                 if g is None or base is None:
                     continue
@@ -196,28 +213,39 @@ def run(start: str = "2020-01") -> dict:
                     continue
                 last = float(gd["close"].iloc[-1])
                 r_one = last / base - 1
-                if -2.0 < r_one < 2.0:          # 异常收益（脏数据/复权异常）剔除
-                    r2.append(r_one)
+                if not np.isfinite(r_one) or r_one <= -1:
+                    raise ValueError(f"{c} {ym}价格路径无效")
+                r2.append(r_one)
+                h["mark"] = last
             pitch_rets.append((ym, float(np.mean(r2)) if r2 else 0.0))
         else:
             pitch_rets.append((ym, 0.0))
 
+        holdings = {c: h for c, h in holdings.items() if h.get("due", "") > ym}
+
         # 每月末：新一期 Pitch 入轨（T+1 开盘买入 → base 价 = 下月首日开盘）
-        win = bars[(bars["date"] > t - pd.Timedelta(days=330)) & (bars["date"] <= t)]
+        win = bars[(bars["date"] > t - pd.Timedelta(days=500)) & (bars["date"] <= t)]
         px = win.pivot(index="date", columns="code", values="close").ffill()
         vx = win.pivot(index="date", columns="code", values="volume").fillna(0)
         st = _load_st_on(bars, t)
         f = compute_factors_pit(px, vx, _pit_finance(fin, t), _pit_quality(q, t), st, basic)
         if f.empty:
             continue
-        top = _score_candidates(f, trig, winrate_map)
-        due = str(_add_months(t, HOLD_MONTHS))[:7]
+        winrate_map = _load_winrates(observations, t, int(cfg["calibration_min_samples"]))
+        if not winrate_map:
+            warmup_months.append(ym)
+        top = _score_candidates(f, trig, winrate_map)[:top_n]
+        due = str(_add_months(t, hold_months))[:7]
         for c in top:
             base = _next_open_px(by_code, c["code"], t)
-            if base and base > 0:
-                holdings[c["code"]] = {"due": due, "base": base, "otype": c["otype"]}
+            if base and base > 0 and c["code"] not in holdings:
+                holdings[c["code"]] = {"due": due, "mark": base, "otype": c["otype"]}
+                n_entries += 1
         if (k + 1) % 24 == 0:
             print(f"  {k + 1}/{len(month_ends)} 期 ({t.date()}) 持仓 {len(holdings)} 只", flush=True)
+
+    if not month_ends or not n_entries:
+        raise ValueError("历史中没有经足量已到期校准证据支持的入轨记录，未生成成功回测")
 
     # Deck 联动：当前已批准买入
     deck_buys = []
@@ -243,13 +271,18 @@ def run(start: str = "2020-01") -> dict:
             portfolio_positions = []
 
     out = {
-        "date": datetime.now().strftime("%Y-%m-%d"),
+        "date": str(dates.max().date()),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "kind": "historical_backtest",
+        "status": "limited",
+        "research_scope": scope_metadata(),
         "tracks": {
             "config": {"curve": _month_nav(config_rets), "stats": _stats(config_rets, _month_nav(config_rets))},
             "pitch": {"curve": _month_nav(pitch_rets), "stats": _stats(pitch_rets, _month_nav(pitch_rets))},
         },
         "meta": {
-            "note": "配置轨=全市场等权×择时仓位；优选轨=Pitch Top{TOP_N} 等权持有{HOLD_MONTHS}月滚动，T+1 开盘买入，PIT 对齐",
+            "note": f"历史研究：当前研究池等权×当月生效择时（上月信号）；优选Top{top_n}持有{hold_months}月，T+1开盘，逐月mark-to-market；不是实时模拟账户",
+            "n_entries": n_entries, "calibration_warmup_months": warmup_months,
             "start": start,
             "n_months": len(month_ends),
             "regime_source": "output/dynamic_regime.json",
@@ -261,7 +294,8 @@ def run(start: str = "2020-01") -> dict:
                 "优选轨未计交易成本/冲击成本（月换仓≈1/3 持仓），结果偏乐观",
                 "简化评分使 revalue（业绩爆发）类霸榜 → 优选轨≈业绩动量组合",
                 "2020-2023 结构性行情下业绩爆发股动量延续性强，历史收益不代表未来",
-                "退市股覆盖 93.2%（数据审计），幸存者偏差残留约 7%",
+                "当前成分股回看历史存在幸存者偏差；本次未验证旧研究中的退市覆盖率",
+                "仅计算已结束的自然月；当前未结束月份不按完整月年化",
                 "单只月收益 |r|≥2 已剔除（脏数据防御）",
             ],
         },
@@ -269,31 +303,22 @@ def run(start: str = "2020-01") -> dict:
     OUT.parent.mkdir(parents=True, exist_ok=True)
     # ★#417 时间戳文件名（写保护免疫 + 保留历史；读取方 glob 取最新——固定名 sim_tracks.json 是 08-09 旧残留）
     try:
-        OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        OUT.write_text(json.dumps(json_safe(out), ensure_ascii=False, indent=1), encoding="utf-8")
     except PermissionError:
         pass
     _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     _p = BASE / "logs" / f"sim_tracks_{_ts}.json"
-    _p.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    _p.write_text(json.dumps(json_safe(out), ensure_ascii=False, indent=1), encoding="utf-8")
     return out
 
 
-def _load_winrates() -> dict:
-    """机会回测胜率（外包 #2 产出）→ {otype: 6月持有胜率}，无则用硬编码"""
-    hard = {"reversal": 0.62, "value": 0.65, "breakout": 0.58,
-            "revalue": 0.60, "event": 0.55, "quality_gap": 0.63}
-    p = BASE / "logs" / "opportunity_winrates.json"
-    if not p.exists():
-        return hard
-    try:
-        d = json.loads(p.read_text(encoding="utf-8"))
-        out = {}
-        for ot, hs in d.get("results", {}).items():
-            v = hs.get("6", {})
-            out[ot] = v.get("winrate", hard.get(ot, 0.6))
-        return out
-    except Exception:
-        return hard
+def _load_winrates(observations, asof, min_samples):
+    """Walk-forward calibration: a future realized outcome cannot score a past decision."""
+    values = {}
+    for row in observations:
+        if row.get("horizon_months") == 6 and row.get("exit_date", "9999") <= str(asof.date()):
+            values.setdefault(row["otype"], []).append(float(row["ret"]))
+    return {ot: float(np.mean(np.asarray(rets) > 0)) for ot, rets in values.items() if len(rets) >= min_samples}
 
 
 def live_track() -> dict:
@@ -308,7 +333,7 @@ def live_track() -> dict:
     if not pos:
         return {"error": "当前无持仓（holding 为空）", "positions": []}
 
-    con = sqlite3.connect(BARS_DB)
+    con = research_connect(BARS_DB)
     out_pos = []
     for p in pos:
         code = p["code"]
@@ -344,13 +369,13 @@ def live_track() -> dict:
                 "可按 T+1 开盘回填）；盈亏为持仓浮盈，未计手续费",
     }
     LIVE_OUT = BASE / "logs" / "sim_tracks_live.json"
-    LIVE_OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    LIVE_OUT.write_text(json.dumps(json_safe(out), ensure_ascii=False, indent=1), encoding="utf-8")
     return out
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start", type=str, default="2020-01")
+    ap.add_argument("--start", type=str, default="auto")
     ap.add_argument("--live", action="store_true", help="实时段：真实持仓估值（portfolio.json → sim_tracks_live.json）")
     args = ap.parse_args()
     if args.live:

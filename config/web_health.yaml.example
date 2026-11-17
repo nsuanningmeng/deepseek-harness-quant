@@ -1,0 +1,57 @@
+# Copy to web_health.yaml to customize read-only interface monitoring.
+endpoints:
+- /api/live/portal_dash
+- /api/live/chain
+- /api/live/pools
+- /api/live/timing_dash
+- /api/live/factor_dash
+- /api/live/brief
+- /api/live/factors
+- /api/live/opp
+- /api/live/tech
+- /api/live/holdings
+- /api/live/alerts
+- /api/live/funnel
+- /api/live/actions
+- /api/live/calendar
+- /api/live/validation
+- /api/live/review
+- /api/live/strong_hits
+- /api/live/watch
+- /api/live/forward
+- /api/live/audit
+- /api/live/pool
+- /api/live/enums
+- /api/live/data_assets
+- /api/live/factor_ranking
+- /api/live/db_view
+- /api/live/factor_ui_pack
+- /api/live/rotation_calendar
+- /api/live/auction
+- /api/live/realtime
+- /api/live/factor_perf
+- /api/pitch_v2
+- /api/tech_pitch
+- /api/portfolio
+- /api/daily_report
+- /api/system_live
+- /api/decisions
+- /api/live/wufu_rotation
+- /api/harness
+timeout_seconds: 5
+max_workers: 4
+cache_seconds: 120
+realtime_refresh_seconds: 60
+# Actual complete-day coverage floor, checked against every existing daily-bar database.
+daily_complete_min_symbols: 4000
+# Keep unconfigured extensions/history visible without calling them a broken data pipeline.
+chain_optional_inputs:
+  竞价信号:
+    state: optional_unconfigured
+    reason: 集合竞价研究未启用；需要真实集合竞价成交及足够历史基准，普通1分钟与5分钟均不能替代；不属于连续竞价模拟必要条件
+  持仓:
+    state: pending_history
+    reason: 尚无历史审批组合记录；实时AI虚拟账户使用独立账本
+  止盈引擎:
+    state: pending_history
+    reason: 历史审批组合尚无持仓和止盈记录；未伪造信号

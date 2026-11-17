@@ -1,0 +1,25 @@
+enabled: true
+provider: baostock
+research_config: config/research.yaml
+runtime_dir: runtime/research/minute-baostock
+request_interval_seconds: 1
+rate_limit_cooldown_seconds: 60
+error_backoff_seconds: 120
+global_error_backoff_seconds: 15
+poll_seconds: 1
+heartbeat_seconds: 15
+heartbeat_grace_seconds: 90
+maximum_source_rows: 8000
+request_timeout_seconds: 45
+follow_core_updates: true
+suspension_proof:
+  retry_seconds: 3600
+  maximum_rows: 5000
+  request_timeout_seconds: 10
+repairs:
+  enabled: true
+  source: sina
+  endpoint: https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData
+  maximum_rows: 1023
+  amount_absolute_tolerance_yuan: 0.10
+  amount_relative_tolerance: 0.00000001

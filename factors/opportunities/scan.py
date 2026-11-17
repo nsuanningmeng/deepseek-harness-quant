@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore")
 
 BASE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
 import numpy as np
 import pandas as pd
@@ -46,10 +47,14 @@ from factors.opportunities.score import (opportunity_score, gains_score, prob_sc
                                          EXPRESS_MIN_FAMILY, CONSENSUS_MIN_FAMILY,
                                          EXPRESS_PER_LINE, CONSENSUS_PER_LINE)
 
-BARS_DB = r"data\cache\bars.db"
-FIN_DB = r"data\cache\finance.db"
-QD_DB = r"data\cache\finance_quality.db"
-BASIC_DB = r"data\cache\stock_basic.db"
+from factors.research_context import cache_dir, connect as research_connect, config as research_config, universe, scope_metadata, latest_published, valuations, read_bars
+
+CACHE_DIR = cache_dir()
+
+BARS_DB = str(CACHE_DIR / "bars.db")
+FIN_DB = str(CACHE_DIR / "finance.db")
+QD_DB = str(CACHE_DIR / "finance_quality.db")
+BASIC_DB = str(CACHE_DIR / "stock_basic.db")
 OUT = BASE / "logs" / f"opp_pool_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"   # 每次运行唯一文件名（安全层限制同名文件只能写一次）
 # 兼容读取：pitch_v2.py 用 get_latest_pool() 取最新
 
@@ -75,20 +80,10 @@ def batch_check_one(code: str) -> dict:
     if not _risk_loaded:
         try:
             from risk.stock_risk import _check_row
-            import sqlite3
-            con = sqlite3.connect(QD_DB)
-            period = con.execute(
-                "SELECT period, COUNT(*) c FROM quality WHERE period < '2026-07-01' "
-                "GROUP BY period ORDER BY period DESC LIMIT 1").fetchone()
-            # 取最新且覆盖≥1000 的期
-            rows = con.execute(
-                "SELECT code, roe_avg, gp_margin, current_ratio, liability_to_asset, cfo_to_np "
-                "FROM quality WHERE period=(SELECT MAX(period) FROM quality "
-                "WHERE period<'2026-07-01' AND (SELECT COUNT(*) FROM quality q2 "
-                "WHERE q2.period=quality.period)>=1000)").fetchall()
-            con.close()
-            for code_r, roe, gp, cr, liab, cfo in rows:
-                _risk_cache[code_r] = _check_row(code_r, None, roe, gp, cr, liab, cfo)
+            q = load_quality()
+            for row in q.itertuples():
+                _risk_cache[row.code] = _check_row(row.code, row.period, row.roe_avg, row.gp_margin,
+                                                  row.current_ratio, row.liability_to_asset, row.cfo_to_np)
             _risk_loaded = True
         except Exception:
             _risk_loaded = True  # 加载失败不重试
@@ -107,35 +102,15 @@ def load_valuation(date: str = None) -> dict:
     列序（实测）：ts_code, trade_date, pe, pe_ttm, pb, ps, ps_ttm, dv_ratio, dv_ttm, total_mv, circ_mv
     失败返回 {}（扫描器降级为价格分位近似）
     """
-    import requests
-    try:
-        cfg = _load_data_cfg()
-        base = cfg["tushare_backup"]["url"].rstrip("/")
-        key = cfg["tushare_backup"]["api_key"]
-        r = requests.get(f"{base}/daily-basic", headers={"X-API-Key": key},
-                         params={"trade_date": (date or "").replace("-", ""),
-                                 "fields": "ts_code,pe,pe_ttm,pb,ps,ps_ttm,dv_ratio,dv_ttm,total_mv,circ_mv"},
-                         timeout=30)
-        d = r.json()
-        if d.get("code") != 0:
-            return {}
-        items = d["data"].get("items", [])
-        out = {}
-        for it in items:
-            vals = (list(it) + [None] * 10)[:10]
-            code, pe, pe_ttm, pb, ps, ps_ttm, dv, dv_ttm, tmv, cmv = vals
-            out[code] = {
-                "pe": _f(pe), "pe_ttm": _f(pe_ttm), "pb": _f(pb),
-                "dv_ratio": _f(dv), "dv_ttm": _f(dv_ttm),
-                "total_mv": _f(tmv), "circ_mv": _f(cmv),
-            }
-        return out
-    except Exception:
+    df = valuations(date or datetime.now().strftime("%Y-%m-%d"))
+    if df.empty:
         return {}
+    df = df.rename(columns={"dv_ttm": "dv_ratio"})
+    return df.set_index("code").to_dict("index")
 
 
 def load_basic() -> pd.DataFrame:
-    con = sqlite3.connect(BASIC_DB)
+    con = research_connect(BASIC_DB)
     df = pd.read_sql("SELECT code, name, industry, ipo_date FROM stock_basic", con)
     con.close()
     return df.set_index("code")
@@ -147,34 +122,17 @@ def load_panel(end: str = None, days: int = 300):
     ★2026-08-10 双库合并：bars.db 被环境写保护 → 增量写入 bars_incr_*.db；
       此处读取时合并（主库历史 + 增量库最新），保证增量数据对扫描可见
     """
-    rows = []
-    from data.cache import CACHE_DIR as _CD
-    from pathlib import Path as _P
-    # ★2026-08-11 #65 修复：只读最近 3 个增量库 + immutable（原遍历全部 64 个 + 普通连接，
-    #   每库等锁 5-20s → load_panel 10min+ 无输出）。增量语义：最新库已含全部增量，3 个兜底足够。
-    inc_files = sorted(_CD.glob("bars_incr_*.db"))[-3:]
-    dbs = [BARS_DB] + [str(p) for p in inc_files]
-    for db in dbs:
-        try:
-            uri = f"{_P(db).as_uri()}?mode=ro&immutable=1"   # immutable 免等锁（0.01s vs 20s）
-            con = sqlite3.connect(uri, uri=True, timeout=3)
-            r2 = con.execute(
-                "SELECT code, date, close, volume FROM daily_bar WHERE adjust='qfq' "
-                "AND code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%' AND date >= '2020-01-01'",
-                ()).fetchall()
-            con.close()
-            rows.extend(r2)
-        except Exception:
-            continue
-    if not rows:
-        return None, None
-    df = pd.DataFrame(rows, columns=["code", "date", "close", "volume"])
-    df = df.drop_duplicates(subset=["code", "date"], keep="last")  # 增量覆盖主库
-    px = df.pivot(index="date", columns="code", values="close").ffill()
-    vx = df.pivot(index="date", columns="code", values="volume").fillna(0)
+    df = read_bars("code,date,close,volume")
+    df = df[df["code"].isin(universe())]
     if end:
-        px = px[px.index <= end]
-        vx = vx[vx.index <= end]
+        df = df[df["date"] <= end]
+    counts = df.groupby("code")["date"].nunique()
+    eligible = counts[counts >= int(research_config()["min_history_days"])].index
+    df = df[df["code"].isin(eligible)]
+    if df.empty:
+        return None, None
+    px = df.pivot(index="date", columns="code", values="close")
+    vx = df.pivot(index="date", columns="code", values="volume")
     return px.tail(days), vx.tail(days)
 
 
@@ -183,102 +141,33 @@ def load_fundamentals(end: str = None) -> pd.DataFrame:
     ★取"最近且覆盖≥4000 只"的期（MAX(period) 可能只有 129 只——最新财报未披露完；
       ORDER BY COUNT(*) DESC 会取到 2022 年报 5399 只（太老）→ 按 period 倒序 + 覆盖阈值，2026-08-09 修复）
     """
-    con = sqlite3.connect(FIN_DB)
-    period = con.execute(
-        "SELECT period FROM finance_report WHERE period < '2026-07-01' "
-        "GROUP BY period HAVING COUNT(*) >= 4000 ORDER BY period DESC LIMIT 1").fetchone()[0]
-    rows = con.execute(
-        "SELECT code, period, net_profit, sq_net_yoy, sq_rev_yoy, roe FROM finance_report WHERE period=?",
-        (period,)).fetchall()
-    con.close()
-    df = pd.DataFrame(rows, columns=["code", "period", "net_profit", "sq_net_yoy", "sq_rev_yoy", "roe"])
+    end = end or datetime.now().strftime("%Y-%m-%d")
+    df = latest_published(FIN_DB, "finance_report", end)
+    df = df[df["code"].astype(str).str[:6].isin({s[:6] for s in universe()})].copy()
+    if df.empty:
+        raise ValueError("研究范围缺少截至数据日已公告财报")
     df["code6"] = df["code"].astype(str).str[:6]
-    # 毛利率从质量库补充
-    q = load_quality()
-    if q is not None and not q.empty:
-        df = df.merge(q[["code6", "gp_margin"]], on="code6", how="left")
-        df["gross_margin"] = df["gp_margin"]
-    df["code6"] = df["code6"].astype(str)
+    q = load_quality(end)
+    df["gross_margin"] = df["code6"].map(q.set_index("code6")["gp_margin"]) if not q.empty else np.nan
     return df.set_index("code6")
 
 
-def load_quality() -> pd.DataFrame:
-    con = sqlite3.connect(QD_DB)
-    # ★取覆盖最全的最近期（≥1000 只；MAX(period) 可能只有 47 只）
-    period = con.execute(
-        "SELECT period FROM quality WHERE period < '2026-07-01' "
-        "GROUP BY period HAVING COUNT(*) >= 1000 ORDER BY period DESC LIMIT 1").fetchone()
-    if not period:
-        con.close()
-        return None
-    period = period[0]
-    df = pd.read_sql(
-        "SELECT code, period, roe_avg, gp_margin, np_margin, current_ratio, "
-        "liability_to_asset, cfo_to_np, cfo_to_or FROM quality WHERE period=?",
-        con, params=(period,))
-    con.close()
-    df["code6"] = df["code"].str[:6]
+def load_quality(end: str = None) -> pd.DataFrame:
+    df = latest_published(QD_DB, "quality", end or datetime.now().strftime("%Y-%m-%d"))
+    df["code6"] = df["code"].astype(str).str[:6]
     return df
 
 
 def load_st_codes() -> set:
-    """ST 名单（bars.db is_st 最新一天）
-    ★2026-08-12 #136 修复：① 普通连接改 immutable 只读（防等锁）② is_st 异常检测+回溯——
-    08-11 Tushare 增量写入丢 is_st 列（当天仅 4 只 vs 正常 ~200 只）→ ST 过滤静默失效；
-    若最新日 is_st=1 数量 <50（异常），回溯最近 10 个交易日取第一个正常日（≥50）名单"""
-    con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
-    try:
-        # 双库合并探测最新交易日（#135 原则，复用 cache.py 已实现）
-        try:
-            from data.cache import DailyCache as _DC
-            _mx = _DC().latest_trade_date()
-        except Exception:
-            _mx = None
-        _mx = _mx or con.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
-        # 回溯：最近 10 个交易日找 is_st 正常日
-        _days = [r[0] for r in con.execute(
-            "SELECT DISTINCT date FROM daily_bar WHERE date<=? ORDER BY date DESC LIMIT 10", (_mx,)).fetchall()]
-        _mx_n = con.execute("SELECT COUNT(*) FROM daily_bar WHERE date=? AND is_st=1", (_mx,)).fetchone()[0]
-        for _d in _days:
-            _n = con.execute("SELECT COUNT(*) FROM daily_bar WHERE date=? AND is_st=1", (_d,)).fetchone()[0]
-            if _n >= 50:   # 正常 ST 规模 ~200 只，<50 视为该日 is_st 列异常（增量丢列）
-                st = {r[0] for r in con.execute(
-                    "SELECT code FROM daily_bar WHERE date=? AND is_st=1", (_d,)).fetchall()}
-                if _d != _mx:
-                    import logging
-                    logging.getLogger("scan").warning(
-                        f"is_st 最新日 {_mx} 异常（仅 {_mx_n} 只，正常 ~200）→ 回溯使用 {_d} ST 名单（{len(st)} 只）")
-                return st
-        return set()
-    finally:
-        con.close()
+    df = read_bars("code,date,is_st")
+    last = df.sort_values("date").drop_duplicates("code", keep="last")
+    flags = set(last.loc[last["is_st"] == 1, "code"])
+    basic = load_basic()
+    flags.update(basic.index[basic["name"].fillna("").str.upper().str.contains("ST", regex=False)])
+    return flags
 
 
-# ==================== 外部因子池信号源（B-4 对接协议，2026-08-09） ====================
-# 读小弟（量化代码库思路库/因子池）每日评分 CSV → 因子命中 → 共识加分
-# ★B-12 裁决落地（2026-08-10 18:20 总指导）：五强 → 十强（+max_ret20/skew20/amihud/mom60/std20，
-#   ICIR 0.417-0.642 且低相关互补；回测师规格 pitch/主系统因子消费扩展_pitch.md 档位 A）
-EXT_SIGNAL_FACTORS = ["turn_mid_prox", "sentiment", "turnover", "reversal20", "lowvol",
-                      "max_ret20", "skew20", "amihud", "std20",
-                      # ★#418 剔除 mom60：health_2026-08-14 实测 icir120=0.108 ❌失效（因子池 F块留言也建议降权，
-                      #   已彻底反转 +7.05→-2.95；动态名单 ICIR≥0.5 本就筛掉，硬编码 fallback 也不该留失效因子）
-                      "open_prem_20", "lhb_jg_cnt_20",
-                      # ★2026-08-13 外包 D7 组合验证（C14_D7）：open_vol_share +9.4%（低换手族 dir=-1）
-                      #   ★#379 factor_corr 决策（总指挥授权 AI 综合决定）：strong_close_quiet_open × open_vol_share 相关 0.801
-                      #   ——日频 ICIR 实据（risk_multiplier/health 实测）：strong_close 0.23(🟡弱有效 k=0.25) < open_vol_share 0.40(✅有效 t=6.24 k=0.5)
-                      #   ——两者同含"低开盘量"信号（0.801 冗余），剔除更弱且冗余的 strong_close_quiet_open，保留更强的 open_vol_share（宁缺毋滥）
-                      #   ——★撤销 #251 D15"换 close_to_high→strong_close"：D15 误用分钟频 ICIR 39.81，日频实际 0.23（分钟因子日频聚合优势消失）
-                      "open_vol_share", "kline_hammer_cnt"]  # ★#76 十二强：+open_prem_20（60日ICIR 0.958 全库第一）+ lhb_jg_cnt_20（ICIR 0.900 分年度全正）★#239 +D7 分钟因子 ★#266 E8 预登记 kline_hammer_cnt（D10 ICIR 27.4 质量族 win 78%）
-# ★2026-08-13 #267 用户反馈：EXT 名单本应自动（手动维护是设计缺陷）——动态生成优先：
-#   从 factor_health（取因子数最多 CSV）筛「有效 + ICIR120≥0.5 + t≥4」按 ICIR120 排序 top N；
-#   动态失败 → 降级硬编码 EXT_SIGNAL_FACTORS（宁缺毋滥）
-_EXT_DYN_CACHE = {"ts": 0.0, "factors": None}
-
-# ★#419 涨停/龙虎榜因子符号反临时黑名单（#406 外包 bug：原始值全非正，rank 方向反转）
-#   反转市里 IC 恰为正掩盖了方向错；等外包核实符号+重算 rank 后移除本黑名单。
-#   （#411 哨兵每晚告警"符号反"，此黑名单在哨兵修复前临时阻断符号反因子进动态名单）
-EXT_SIGN_REVERSED = {"limup_ex_5", "limit_up_cnt_5d", "lhb_jg_cnt_20", "limup_ex_ret_20",
-                     "limit_up_turn", "consec_limit_up", "limit_up_flag"}
+_EXT_DYN_CACHE = {"factors": None, "ts": 0.0}
 
 
 def _dynamic_ext_factors(n: int = 15) -> list:
@@ -1449,7 +1338,7 @@ def load_external_signals() -> dict:
         #   lhb_jg_cnt_20 等符号反因子会重新进入共识（方向错配命中决策链）。黑名单过滤统一
         #   下沉到此：无论动态/fallback 名单，一律剔除符号反因子。
         _dyn = _dynamic_ext_factors() or []
-        _ext_list = [f for f in (_dyn or [x for x in EXT_SIGNAL_FACTORS if x not in EXT_SIGN_REVERSED])]
+        _ext_list = list(_dyn)  # Missing evaluated external factors do not become a static signal list.
         # ★2026-08-14 Pitch 规格 v2 ④ 口径定版（研究员 14:50 裁决采纳 A 口径）：
         #   pv 触发 = 动态名单（排风格暴露 + F3 家族去重）hits≥6 + 双 rank≥0.75 + 成交额≥0.5 亿
         #   ——动态名单是 health 有效因子（五强已衰减，B-6 协议与 R-4 双低不兼容）；
@@ -1560,7 +1449,7 @@ def compute_factors(px: pd.DataFrame, vx: pd.DataFrame, fin: pd.DataFrame,
                     basic: pd.DataFrame, st_codes: set) -> pd.DataFrame:
     """全市场因子面板（行=股票，列=因子）"""
     close = px.astype(float)
-    ret = close.pct_change()
+    ret = close.pct_change(fill_method=None)
     f = pd.DataFrame(index=close.columns)
 
     # 技术因子
@@ -1595,7 +1484,7 @@ def compute_factors(px: pd.DataFrame, vx: pd.DataFrame, fin: pd.DataFrame,
     f = f.merge(fin[["sq_net_yoy"]].rename(columns={"sq_net_yoy": "sq_nyoy"}),
                 left_on="code6", right_index=True, how="left", suffixes=("", "_x"))
     # 质量因子（quality.code6 是整数 → 转字符串对齐）
-    q = load_quality()
+    q = load_quality(str(px.index[-1]))
     if q is not None and not q.empty:
         q["code6"] = q["code6"].astype(str)
         q = q.set_index("code6")
@@ -1615,11 +1504,11 @@ def compute_factors(px: pd.DataFrame, vx: pd.DataFrame, fin: pd.DataFrame,
     f["non_st"] = (~f.index.isin(st_codes)).astype(int)
     # ★C8（外包 08-12）：min_price 硬过滤——极端低价股（仙股/1 元股）流动性差、退市风险高，
     #   组合回测口径 min_price=1.5（外包 C4/C8 引擎已内置）；主系统补同款硬筛（non_lowprice）
-    f["non_lowprice"] = (f["close"] >= 1.5).astype(int) if "close" in f.columns else 1
-    # ★估值因子（备用服务器 daily-basic 真实 PB/PE/股息率；失败降级价格分位近似）
-    val = load_valuation()
+    f["non_lowprice"] = (f["close"] >= float(research_config()["min_price"])).astype(int) if "close" in f.columns else 1
+    # Official daily_basic valuations use raw close; technical factors retain qfq close.
+    val = load_valuation(str(px.index[-1]))
     if val:
-        vdf = pd.DataFrame.from_dict(val, orient="index")
+        vdf = pd.DataFrame.from_dict(val, orient="index").rename(columns={'close':'valuation_close'})
         vdf.index.name = "code"
         f = f.join(vdf, how="left")
         # PB 分位（截面内越低越好 → pb_pct 越小越好，触发条件用 <0.20 分位）
@@ -1627,12 +1516,12 @@ def compute_factors(px: pd.DataFrame, vx: pd.DataFrame, fin: pd.DataFrame,
         # PE 分位（排除负 PE：负 PE 直接给 1.0 高分位=不触发低估）
         pe_clean = f["pe_ttm"].where(f["pe_ttm"] > 0)
         f["pe_pct"] = pe_clean.rank(pct=True, na_option="bottom")
-        f["div_yield"] = f["dv_ratio"].fillna(0.0)   # 股息率 %
-        f["total_mv_yi"] = f["total_mv"].fillna(0) / 10000  # 万元→亿
+        f["div_yield"] = pd.to_numeric(f["dv_ratio"], errors='coerce')   # Missing source values remain unknown.
+        f["total_mv_yi"] = pd.to_numeric(f["total_mv"], errors='coerce') / 10000  # 万元→亿
     else:
-        f["pb_pct"] = f["close"].rank(pct=True)
-        f["pe_pct"] = f["close"].rank(pct=True)
-        f["div_yield"] = 0.0
+        f["pb_pct"] = np.nan
+        f["pe_pct"] = np.nan
+        f["div_yield"] = np.nan
         # ★降级占位列（2026-08-09 外包反馈）：value 触发引用 r["pb"]/r["pe_ttm"]，
         # 估值接口失败时无此列 → KeyError；补 NaN 占位使触发安全降级
         f["pb"] = np.nan
@@ -1686,7 +1575,7 @@ def triggers():
             (r["roe"] or 0) > 0.02 and
             (r["liability"] if pd.notna(r.get("liability")) else 1) < 0.70 and r["non_st"] == 1 and r["non_lowprice"] == 1),
         "breakout": lambda r: (
-            (r["near_high_250"] or -1) > -0.05 and (r["vol_ratio"] or 1) >= 1.5 and
+            pd.notna(r["near_high_250"]) and r["near_high_250"] > -0.05 and (r["vol_ratio"] or 1) >= 1.5 and
             r["ma50_up"] == 1 and r["ma200_up"] == 1 and r["non_st"] == 1 and r["non_lowprice"] == 1),
         "revalue": lambda r: (
             (r["sq_nyoy"] or 0) > 0.50 and (r["roe"] or 0) > 0.05 and
@@ -1744,23 +1633,17 @@ def winrate_approx(otype: str) -> float:
         if p.exists():
             try:
                 d = json.loads(p.read_text(encoding="utf-8"))
+                if d.get("kind") != "historical_calibration" or (d.get("meta", {}).get("research_scope") or {}).get("universe_fingerprint") != scope_metadata()["universe_fingerprint"]:
+                    return None
                 for ot, hs in d.get("results", {}).items():
                     v = hs.get("6", {})
-                    if v.get("n", 0) >= 30 and v.get("winrate") is not None:
+                    if v.get("n", 0) >= int(research_config()["calibration_min_samples"]) and v.get("winrate") is not None:
                         _WR_CACHE[ot] = v["winrate"]
             except Exception:
                 _WR_CACHE = {}
     if otype in _WR_CACHE:
         return _WR_CACHE[otype]
-    # ★2026-08-11 实证校准（知识库《Pitch台逻辑分析报告》：评分必须用 17 年回测胜率，不靠人工直觉）
-    #   17 年回测（2011-2026, 188 期）：quality_gap 70.4% / value 62.5% / revalue 53.6% /
-    #   pv_consensus 53.3% / event 51.5% / breakout 45.5% / reversal 39.0%（负期望）
-    #   旧兜底（reversal 0.62/breakout 0.58）严重高估 → Pitch 推次优类型；实证值让评分反映真实胜率
-    return {
-        "quality_gap": 0.704, "value": 0.625, "revalue": 0.536,
-        "pv_consensus": 0.533, "event": 0.515, "breakout": 0.455,
-        "reversal": 0.39,   # ★17 年负期望 → 概率分低 → 评分自然低于门槛
-    }.get(otype, 0.50)
+    return None  # No evidence is not a 50% or a hardcoded historical success rate.
 
 
 # ==================== 主流程 ====================
@@ -1769,13 +1652,10 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
     # ★2026-08-10 修复：默认 date 用 bars.db 最近交易日（避免周末/节假日用当天日期
     #   导致 date 字段虚标未来；数据实际基于最近交易日）
     if date is None:
-        try:
-            # ★2026-08-10 双库合并探测：主库 08-07 + 增量库 08-10 → 取最新（直连主库会虚标旧日期）
-            from data.cache import DailyCache
-            _d = DailyCache().latest_trade_date()
-            date = _d or datetime.now().strftime("%Y-%m-%d")
-        except Exception:
-            date = datetime.now().strftime("%Y-%m-%d")
+        available = read_bars("code,date")
+        if available.empty:
+            return {"error": "研究池日线为空"}
+        date = str(available["date"].max())
     px, vx = load_panel(end=date, days=320)
     if px is None or px.empty:
         return {"error": "行情面板为空（检查 bars.db qfq 数据）", "date": date}
@@ -1783,6 +1663,9 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
     fin = load_fundamentals(date)
     st = load_st_codes()
     f = compute_factors(px, vx, fin, basic, st)
+    f = f[f["code6"].isin(fin.index) & f["vol60"].notna() & f["drawdown_60d"].notna()]
+    if f.empty:
+        return {"error": "范围内缺少可用行情与已公告财报交集", "date": date}
 
     types = types or ORDER
     trig = triggers()
@@ -1799,6 +1682,9 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
         if ot not in OPPORTUNITY_TYPES:
             continue
         spec = OPPORTUNITY_TYPES[ot]
+        if winrate_approx(ot) is None:
+            stats[ot] = {"status": "uncalibrated", "reason": "真实完整持有期样本不足，未生成概率分或推荐"}
+            continue
         if ot == "pv_consensus":
             # ★第 7 类：外部信号驱动（EXT rank≥0.75 命中 ≥6 的股票——B-12 十强裁决）
             # 需在面板中找到对应行（code 匹配），非ST 硬筛
@@ -1872,7 +1758,7 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
                     "factors": {k: (round(v, 4) if isinstance(v, (int, float)) else str(v))
                                 for k, v in r.items() if k in spec["factors"]}
                                or _pv_factors(code, spec["factors"]),
-                    "evidence": spec["evidence"],
+                    "evidence": "本次真实本地6月完整持有期校准；胜率见winrate_est，未引用旧研究的静态收益证据",
                     "ext_signal": e,
                 }
                 opportunities.append(opp)
@@ -1917,13 +1803,16 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
                 "size_tier": _tier,
                 "factors": {k: (round(v, 4) if isinstance(v, (int, float)) else str(v))
                             for k, v in r.items() if k in spec["factors"]},
-                "evidence": spec["evidence"],
+                "evidence": "本次真实本地6月完整持有期校准；胜率见winrate_est，未引用旧研究的静态收益证据",
             }
             if safety_pad is not None:
                 opp["safety_pad"] = safety_pad
                 if safety_pad >= 6:
                     opp["note"] = (opp.get("note") or "") + f"·厚安全垫({safety_pad})"
             opportunities.append(opp)
+
+    if not any(winrate_approx(ot) is not None for ot in types if ot in OPPORTUNITY_TYPES):
+        return {"error": "所有请求机会类型均缺真实完整持有期校准，不能将缺数据当无信号", "date": date}
 
     # ★同股多类命中 → 只保留最高分类（其余降为 tags 标注）；共识加分（多类型命中）
     n_types = {}
@@ -1958,7 +1847,7 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
     #   无窗口 → 0 副作用。数据源：data/calendar_hook.py（登记表按年维护）
     try:
         from data.calendar_hook import get_window as _get_cal
-        _cal = _get_cal()
+        _cal = _get_cal(date)
         if _cal:
             _cb = _cal["bonus"]
             for o in opportunities:
@@ -1974,7 +1863,7 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
     #   实为只落地了 H16/H17 窗口层，CAL 月收益层缺失——本次补齐（与日历窗口同构，0 副作用兜底）。
     try:
         import datetime as _dt
-        _mon = _dt.datetime.now().month
+        _mon = _dt.date.fromisoformat(date).month
         _mb = 0
         if _mon == 2:
             _mb = 5   # CAL-1 春季躁动（+4.89%/胜率 75%）
@@ -2439,6 +2328,10 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
         "opportunities": opportunities,
         "pitch": pitch_out,          # 长线 ≤10：⚡express ≤2 + 🤝consensus ≤3 + 📊score ≤5（子分类字段 pitch_line/pitch_sub）
         "thresholds": SCORE_THRESHOLDS,
+        "research_scope": scope_metadata(),
+        "status": "ready" if opportunities else "no_qualifying_signals",
+        "calibration_source": "logs/opportunity_winrates.json",
+        "score_method": "既有规则的收益空间/风险启发式分 + 真实本地滚动胜率；分数不是收益保证或统计概率",
     }
     OUT.parent.mkdir(parents=True, exist_ok=True)
     # ★2026-08-14 #430 幂等：数据源未更新时本次扫描结果与上次相同 → 跳过写时间戳文件
@@ -2459,7 +2352,7 @@ def scan(types: list = None, date: str = None, pitch_only: bool = False) -> dict
     except Exception:
         _unchanged = False
     if not _unchanged:
-        OUT.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+        OUT.write_text(json.dumps(json_safe(result), ensure_ascii=False, indent=1), encoding="utf-8")
     return result
 
 

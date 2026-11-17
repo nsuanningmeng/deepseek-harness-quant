@@ -3,7 +3,7 @@
 # 复制为 params.yaml 并填写你的配置：
 #   cp params.yaml.example params.yaml
 # 数据目录：默认 data/cache；可用环境变量 LWQUANT_CACHE_DIR 覆盖。
-# Tushare token 请在 https://tushare.pro 注册获取（数据获取脚本见 data/fetch_data.py）。
+# Tushare token 请在 https://tushare.pro 注册获取（在本机 /data-settings 保存，初始化运行 data/research_bootstrap.py）。
 # ============================================================
 # ============================================================
 # DeepSeek HARNESS Quant · 全局参数配置（v2.5）
@@ -13,20 +13,20 @@
 
 # ---------- 数据源 ----------
 data:
-  cache_dir: "<your-config>" # 本地缓存（SQLite/Parquet），唯一读取接口；已迁移 D 盘（2026-08-06）
-  cache_dir_note: "<your-config>"
+  cache_dir: "data/cache" # 本地缓存（SQLite/Parquet），唯一读取接口；已迁移 D 盘（2026-08-06）
+  cache_dir_note: "真实研究数据缓存；与前向模拟账户隔离"
   sources:                           # 多源主备
-    daily_primary: "baostock"        # 行情主源（稳）
-    daily_backup: "akshare"          # 行情备源（全）
+    daily_primary: "tushare"        # 行情主源（稳）
+    daily_backup: null          # 行情备源（全）
     financial_primary: "tushare"     # 财报主源（含公告日 ann_date → PIT）
-    coverage: "akshare"              # 业绩预告/快报/机构调研
-  tushare_token: "<your-config>" # [升级 2026-08-07 主服务器 15000积分+实时竞价]
-  tushare_api_url: "<your-config>" # 主服务器（109 接口，无逐股限频，按日批量 5533 只 3-16s）
+    coverage: "tushare"              # 业绩预告/快报/机构调研
+  tushare_token: null # [升级 2026-08-07 主服务器 15000积分+实时竞价]
+  tushare_api_url: "https://api.tushare.pro" # 主服务器（109 接口，无逐股限频，按日批量 5533 只 3-16s）
   tushare_backup:                                  # 备用服务器（HTTP API 封装，见 data/fetcher_tushare_backup.py）
-    url: "<your-config>"
-    api_key: "<your-config>"
-  jqdata_user: "<your-config>" # 聚宽 JQData 账号（2026-08-14 用户申请）
-  jqdata_password: "<your-config>" # 聚宽 JQData 密码
+    url: null
+    api_key: null
+  jqdata_user: null # 聚宽 JQData 账号（2026-08-14 用户申请）
+  jqdata_password: null # 聚宽 JQData 密码
   jqdata_note: "试用/免费版：数据窗口 2025-05-06~2026-05-13（约1年，含 1m/30m/60m 分钟线+申万行业+valuation；无当前实时数据，分钟线仅可用于回测验证周期因子）"
 
 # ---------- CANSLIM 主引擎（修正版）----------
@@ -67,7 +67,7 @@ defense:
 # ---------- PEAD / 分析师预期 [CS-06/20] ----------
 pead:
   weight_max: 0.10                   # 权重上限 10%
-  scope: "<your-config>" # 仅限大盘/质量池
+  scope: "hs300" # 仅限大盘/质量池
   forecast_upgrade: true             # 业绩预告/快报上修加分
 
 # ---------- 因子权重（初始，[P0.5校准] 动态调权为核心机制 [CS-10/23]）----------
@@ -78,7 +78,7 @@ weights:
   canslim: 0.40                      # CANSLIM 主引擎合计
   pead: 0.10                         # PEAD/分析师预期
   bonus: 0.10                        # 加分项（RPS 领涨、调研、快报等）
-  rebalance: "<your-config>" # 动态调权：按季度滚动 IC 校准
+  rebalance: "quarterly" # 动态调权：按季度滚动 IC 校准
 
 # ---------- ★策略分层（v2.8，用户拍板 C 方案）----------
 # 实证发现：欧奈尔止损纪律（7%/移动止损/止盈）为"右侧趋势突破"设计，
@@ -99,9 +99,9 @@ layers:
 
 
   # ---- 权重版本元数据（第17课落地 #3：M3 回写权重前必须预留）----
-  weight_version: "<your-config>" # 当前权重版本（调权时递增，可回滚）
-  weight_date: "<your-config>" # 本次权重生效日期
-  decay_mode: "<your-config>" # 在线更新模式：指数遗忘
+  weight_version: "initial-unvalidated" # 当前权重版本（调权时递增，可回滚）
+  weight_date: "2026-11-11" # 本次权重生效日期
+  decay_mode: "exponential" # 在线更新模式：指数遗忘
   decay_lambda_factor: 0.99          # 财报/基本面因子（低频）遗忘因子 λ≈0.99
   decay_lambda_price: 0.95           # 量价因子（中频）遗忘因子 λ≈0.95
 
@@ -142,7 +142,7 @@ risk:
   circuit_breaker_cooldown_days: 5   # 熔断冷静期（天）
 
   # ---- 仓位模型（第10/15课 Half-Kelly + Van Tharp，M4 落地）----
-  position_model: "<your-config>"
+  position_model: "risk_budget"
   half_kelly:
     enabled: true                    # 进攻上限（最大化长期复利）
     sample_discount: 0.25            # 样本 <100 次时 Kelly ×0.25（第15课）
@@ -153,18 +153,18 @@ risk:
 
   # ---- 12 种死亡方式周检（附录B，M8 看板/dev_auto 落地）----
   weekly_health_check:              # 每周 12 项打勾
-    data_quality: true               # #1 数据污染：多源校验通过
-    regime_normal: true              # #3 Regime 漂移：状态未剧烈变化
-    slippage_expected: true          # #4 执行失真：滑点在预期内
-    risk_not_triggered: true         # #5 风控失效：熔断未被绕过
-    liquidity_normal: true           # #6 流动性枯竭：成交正常
-    correlation_ok: true             # #7 相关性飙升：相关矩阵无异常
-    leverage_ok: true                # #8 杠杆：无融资加杠杆
-    no_manual_override: true         # #9 人为干预：无异常人工覆盖
-    system_healthy: true             # #10 系统故障：健康度 100%
-    no_regulatory_change: true       # #11 监管变化：无新规影响
-    alpha_decay_expected: true       # #12 对手盘适应：Alpha 衰减在预期内
-    oos_consistent: true             # 样本外与预期一致
+    data_quality: null               # #1 数据污染：多源校验通过
+    regime_normal: null              # #3 Regime 漂移：状态未剧烈变化
+    slippage_expected: null          # #4 执行失真：滑点在预期内
+    risk_not_triggered: null         # #5 风控失效：熔断未被绕过
+    liquidity_normal: null           # #6 流动性枯竭：成交正常
+    correlation_ok: null             # #7 相关性飙升：相关矩阵无异常
+    leverage_ok: null                # #8 杠杆：无融资加杠杆
+    no_manual_override: null         # #9 人为干预：无异常人工覆盖
+    system_healthy: null             # #10 系统故障：健康度 100%
+    no_regulatory_change: null       # #11 监管变化：无新规影响
+    alpha_decay_expected: null       # #12 对手盘适应：Alpha 衰减在预期内
+    oos_consistent: null             # 样本外与预期一致
 
 # ---------- Regime 五档 → 现金比例 [CS-04/05] ----------
 regime:
@@ -198,13 +198,13 @@ pools:
 
 # ---------- 回测 ----------
 backtest:
-  start: "<your-config>" # ★2026-08-07 数据审计修正：缓存数据 2019-01-01 起（bulk_loader START_DATE），原 2010 配置致前 9 年空转
+  start: "2019-01-01" # ★2026-08-07 数据审计修正：缓存数据 2019-01-01 起（bulk_loader START_DATE），原 2010 配置致前 9 年空转
   end: null                          # null = 至今
   include_delisted: true             # 尽力含退市股（数据覆盖不足如实披露；★2026-08-07 审计：148 只退市股缺失待补拉）
   commission_bps: 2.6                # 双边佣金万 2.6
   stamp_tax: 0.0005                  # 卖出印花税 0.05%
   slippage: 0.001                    # 滑点 0.1%
-  out_of_sample_start: "<your-config>" # 样本外起点
+  out_of_sample_start: "2019-01-01" # 样本外起点
 
 # ---------- 个股状态分类（v2.9，用户新方向）----------
 # 先分类再配策略：right 突破（欧奈尔止损）/ left 超跌反转（无止损）/ neutral 低波防守
@@ -231,13 +231,13 @@ calendar:
 #   （夏普 1.07→0.91；快照口径的 0.95/1.01 是 look-ahead 幻觉——快照市值=幸存者市值）
 #   → min_mv_yi 归 0（仅保留退市/ST/流动性硬过滤），v3 正式形态 = 等权+Regime，夏普 1.07
 strategy_v3:
-  mode: "<your-config>" # 主策略模式
+  mode: "equal_weight_regime" # 主策略模式
   min_mv_yi: 0.0                # ★PIT 验收后归 0（市值过滤 look-ahead 幻觉，负贡献）
   min_turnover_yi: 0.1          # 日均成交额下限 0.1 亿（流动性，保留）
   filter_delisted: true         # 剔除退市股（delisted_list.csv）
   filter_st: true               # 剔除 ST（2026-08-07 F-1 已修复）
   rebalance_months: 3           # 季度调仓
-  lookahead_note: "<your-config>"
+  lookahead_note: "研究池为当前沪深300，历史回测具有当前成分幸存者偏差，不作为无偏实盘收益证明"
 
 # ---------- 数据审计（risk/data_audit.py 风控前置闸门，2026-08-07 新建）----------
 data_audit:
@@ -255,7 +255,7 @@ data_audit:
     finance_null_pct_max: 1.0      # E3 财报缺失率上限(%)
     sq_calc_coverage_min: 90.0     # E4 单季自算覆盖率下限(%)
     delisted_coverage_min: 95.0    # A3 退市股覆盖率下限(%)
-  data_start_note: "<your-config>"
+  data_start_note: "日线自2019起初始化；财报按真实公告日期使用"
 
 # ---------- 因子池（factors/pool/ 动态因子池，2026-08-07 落地）----------
 # 定位：挖→抓→测→决→报 闭环；时序因子（EPU 等）走 eval_ts，横截面因子走 factor_evaluator
@@ -266,4 +266,4 @@ factor_pool:
     candidate: 40                 # 40-65 分 → candidate（观察）
   evaluate_on_sched: true         # dev_auto 每轮评估候选+巡检 active
   fetch_on_sched: true            # 每轮刷新政策数据（EPU FRED 全量重下，量小）
-  ts_eval_start: "<your-config>" # 时序因子评估起点（覆盖 2020-2025 回测 + 前段滚动窗口）
+  ts_eval_start: "2019-01-01" # 时序因子评估起点（覆盖 2020-2025 回测 + 前段滚动窗口）

@@ -29,92 +29,46 @@ from pathlib import Path
 warnings.filterwarnings("ignore")
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
 import numpy as np
 import pandas as pd
 
-BARS_DB = Path(r"D:/劳威派量化数据/cache/bars.db")
-FIN_DB = Path(r"D:/劳威派量化数据/cache/finance.db")
-BASIC_DB = Path(r"D:/劳威派量化数据/cache/stock_basic.db")
-MV_CSV = Path(r"D:/劳威派量化数据/cache/circ_mv_map_full.csv")
+from factors.research_context import (cache_dir, connect as research_connect, read_bars,
+                                      latest_published, universe, config as research_config, scope_metadata)
+
+BARS_DB = cache_dir() / "bars.db"
+FIN_DB = cache_dir() / "finance.db"
+BASIC_DB = cache_dir() / "stock_basic.db"
+MV_CSV = cache_dir() / "circ_mv_map_full.csv"
 
 
-def load_close_panel(days=300, end=None) -> pd.DataFrame:
-    """近 N 个交易日全市场 close+volume 面板（date × code，qfq）
-    ★2026-08-07 扩展：days 默认 130→300（决策池技术确认需要 MA200/52 周高点）；
-    返回 (close_df, volume_df) 双面板"""
-    con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
-    # ★#143 双库合并：主库写保护后增量库含最新日（08-12 起排行不虚标旧日）
+def load_close_panel(days=300, end=None):
+    df = read_bars("code,date,close,volume,high,low")
+    df = df[df["code"].isin(universe())]
     if end:
-        last = con.execute(
-            "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq' AND date<=?",
-            (end,)).fetchone()[0]
-    else:
-        last = con.execute(
-            "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
-        try:
-            from pathlib import Path as _P
-            for _p in sorted(_P(BARS_DB).parent.glob("bars_incr_*.db"))[-3:]:
-                try:
-                    _c = sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3)
-                    _m = _c.execute(
-                        "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
-                    _c.close()
-                    if _m and _m > last:
-                        last = _m
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    df = pd.read_sql(
-        "SELECT date, code, close, volume, high, low FROM daily_bar "
-        "WHERE adjust='qfq' AND date<=? AND close>0", con, params=(last,))
-    # ★#143 增量库数据补充（增量行覆盖主库同 key）
-    try:
-        from pathlib import Path as _P
-        for _p in sorted(_P(BARS_DB).parent.glob("bars_incr_*.db"))[-3:]:
-            try:
-                _c = sqlite3.connect(f"file:{_p}?mode=ro&immutable=1", uri=True, timeout=3)
-                _df2 = pd.read_sql(
-                    "SELECT date, code, close, volume, high, low FROM daily_bar "
-                    "WHERE adjust='qfq' AND date<=? AND close>0", _c, params=(last,))
-                if len(_df2):
-                    df = pd.concat([df, _df2], ignore_index=True).drop_duplicates(
-                        subset=["date", "code"], keep="last")
-                _c.close()
-            except Exception:
-                pass
-    except Exception:
-        pass
-    con.close()
-    p = df.pivot_table(index="date", columns="code", values="close")
-    v = df.pivot_table(index="date", columns="code", values="volume")
-    h = df.pivot_table(index="date", columns="code", values="high")
-    l = df.pivot_table(index="date", columns="code", values="low")
-    p = p.sort_index().tail(days)
-    v = v.reindex(p.index).sort_index()
-    h = h.reindex(p.index).sort_index()
-    l = l.reindex(p.index).sort_index()
-    return p, v, h, l
+        df = df[df["date"] <= end]
+    counts = df.groupby("code")["date"].nunique()
+    eligible = counts[counts >= int(research_config()["min_history_days"])].index
+    df = df[df["code"].isin(eligible)]
+    panels = [df.pivot(index="date", columns="code", values=k).sort_index().tail(days)
+              for k in ("close", "volume", "high", "low")]
+    return tuple(panels)
 
 
-def load_fundamentals(end=None) -> pd.DataFrame:
-    """最新一期财报基本面（roe / sq_net_yoy，PIT：period <= end）"""
-    con = sqlite3.connect(str(FIN_DB))
-    sql = """SELECT f.code, f.period, f.roe, f.sq_net_yoy, f.revenue, f.net_profit
-             FROM finance_report f
-             JOIN (SELECT code, MAX(period) p FROM finance_report
-                   WHERE period <= ? GROUP BY code) m ON f.code=m.code AND f.period=m.p
-             WHERE f.period >= '2018-01-01'"""
-    df = pd.read_sql(sql, con, params=(end or "2099-12-31",))
-    con.close()
-    df = df.drop_duplicates("code")
+def load_fundamentals(end=None):
+    """Keep ROE as a ratio; expose growth in the percentage points used below."""
+    df = latest_published(FIN_DB, "finance_report", end or datetime.now().strftime("%Y-%m-%d"))
+    if df.empty:
+        raise ValueError("没有截至研究日已公告的财报")
+    df["code"] = df["code"].astype(str).str[:6]
     df = df.rename(columns={"sq_net_yoy": "nyoy"})
+    df["nyoy"] = pd.to_numeric(df["nyoy"], errors="coerce") * 100
     return df.set_index("code")
 
 
 def load_basic() -> pd.DataFrame:
-    con = sqlite3.connect(str(BASIC_DB))
+    con = research_connect(BASIC_DB)
     df = pd.read_sql("SELECT * FROM stock_basic", con)
     con.close()
     return df.set_index("code")
@@ -125,22 +79,11 @@ def rank(date: str = None, n: int = 30) -> dict:
     #   周末/数据未更新时虚标，pool_layers 观察池显示 08-10 实际数据只有 08-07）
     # ★第四十波：改双库合并探测（主库 08-07 + 增量库 08-10）
     if not date:
-        try:
-            from data.cache import DailyCache as _DC2
-            _last = _DC2().latest_trade_date()
-        except Exception:
-            _last = None
-        if not _last:
-            try:
-                import sqlite3 as _s
-                _c = _s.connect(str(BARS_DB))
-                _last = _c.execute(
-                    "SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
-                _c.close()
-            except Exception:
-                _last = None
-        date = _last or datetime.now().strftime("%Y-%m-%d")
-    px, vx, hx, lx = load_close_panel(end=date)
+        available = read_bars("code,date")
+        if available.empty:
+            return {"error": "研究池日线为空"}
+        date = str(available["date"].max())
+    px, vx, hx, lx = load_close_panel(days=int(research_config()["min_history_days"]), end=date)
     if px.empty:
         return {"error": "close 面板为空", "date": date}
 
@@ -194,11 +137,12 @@ def rank(date: str = None, n: int = 30) -> dict:
     f["mv_yi"] = pd.Series(mv).reindex(f.index)
 
     # ---- 数据清洗（优中选优前提：盈利 + 无脏数据）----
-    f["nyoy"] = pd.to_numeric(f["nyoy"], errors="coerce").clip(-300, 300)  # 异常同比截断
+    f["nyoy"] = pd.to_numeric(f["nyoy"], errors="coerce")
     f["roe"] = pd.to_numeric(f["roe"], errors="coerce")
 
+    f = f[f["roe"].notna() & f["nyoy"].notna()]
     # ST 过滤（最新交易日 is_st=1 剔除）
-    con = sqlite3.connect(str(BARS_DB))
+    con = research_connect(BARS_DB)
     last = con.execute("SELECT MAX(date) FROM daily_bar WHERE adjust='qfq'").fetchone()[0]
     st_codes = {r[0] for r in con.execute(
         "SELECT code FROM daily_bar WHERE date=? AND is_st=1", (last,)).fetchall()}
@@ -212,8 +156,11 @@ def rank(date: str = None, n: int = 30) -> dict:
     score = pd.DataFrame(index=f.index)
     score["lowvol"] = f["vol60"].rank(pct=True, ascending=False)      # 波动低→高分
     score["reversal"] = f["mom120"].rank(pct=True, ascending=False)   # 超跌→高分（动量反向）
-    score["quality"] = f["roe"].rank(pct=True, ascending=False)       # ROE 高→高分
-    score["growth"] = f["nyoy"].rank(pct=True, ascending=False)       # 净利同比高→高分
+    score["quality"] = f["roe"].rank(pct=True, ascending=True)       # ROE 高→高分
+    # Only the scoring input is bounded. Reports and AI evidence keep the
+    # actual published growth percentage, including values beyond +/-300%.
+    growth_input = f["nyoy"].clip(-300, 300)
+    score["growth"] = growth_input.rank(pct=True, ascending=True)    # 净利同比高→高分
     # ★2026-08-16 B-14：量价前四强（全负向：低彩票/低波/低振幅/低偏度 → 高分）
     score["max_ret20"] = f["max_ret20"].rank(pct=True, ascending=False)
     score["std20"] = f["std20"].rank(pct=True, ascending=False)
@@ -226,7 +173,7 @@ def rank(date: str = None, n: int = 30) -> dict:
     f["score"] = total * 100
 
     # 硬筛选：优中选优 = 高质量 + 正成长（ROE≥5% 且 净利同比>0）→ 再按四因子排名
-    f_valid = f[(f["roe"] >= 0.05) & (f["nyoy"] > 0)].sort_values("score", ascending=False)
+    f_valid = f[(f["roe"] >= 0.05) & (f["nyoy"] > 0) & f["score"].notna()].sort_values("score", ascending=False)
     # 行业上限（★2026-08-07 观察池需求：3→5，保证观察池规模；决策池阶段再收紧分散度）
     basic = load_basic()
     f_valid["industry"] = basic["industry"].reindex(f_valid.index).fillna("")
@@ -282,6 +229,7 @@ def rank(date: str = None, n: int = 30) -> dict:
         })
     return {
         "date": date,
+        "research_scope": scope_metadata(),
         "n": len(out),
         "method": "4因子等权打分（低波+反转+ROE+净利同比），实证方向；Top100 为观察池，决策池需技术确认（pool_layers）",
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -314,7 +262,10 @@ def main():
     args = ap.parse_args()
     r = rank(args.date, args.n)
     out = BASE / "output" / "ranking_top.json"
-    out.write_text(json.dumps(r, ensure_ascii=False, indent=2), encoding="utf-8")
+    if r.get("error"):
+        raise ValueError(r["error"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(json_safe(r), ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"排名已生成：{out}（Top {len(r.get('top', []))}）")
     for t in r.get("top", [])[:8]:
         print(f"  #{t['rank']} {t['code']} {t['name']} [{t['industry']}] 分{t['score']} "

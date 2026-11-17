@@ -40,9 +40,10 @@ THRESHOLDS = {"active": 65, "candidate": 40}
 # ---------- 市场月度收益（沪深300，none 复权）----------
 def market_monthly_returns(start="2019-01-01") -> pd.Series:
     """沪深300 月末收益序列（index=YYYY-MM）"""
-    cache = DailyCache()
-    df = cache.get_daily("SH.000300", start=start, adjust="none")
-    if df is None or df.empty:
+    from factors.research_context import read_bars
+    df = read_bars("code,date,close", adjust="none", symbols=["SH.000300", "000300.SH"])
+    df = df[df["date"] >= start].drop_duplicates("date", keep="last")
+    if df.empty:
         return pd.Series(dtype=float)
     close = df.set_index("date")["close"].astype(float)
     close.index = pd.to_datetime(close.index)
@@ -141,6 +142,13 @@ def evaluate_time_series(name: str, factor: pd.Series, mkt_ret: pd.Series,
                          regime_cash: pd.Series = None, horizon: tuple = (1, 3, 6)) -> dict:
     """时序因子评估主函数 → 评分卡 + 裁决"""
     factor = factor.astype(float).dropna()
+    from factors.research_context import config as research_config
+    minimum = int(research_config()["calibration_min_samples"])
+    counts = {str(h): len(pd.concat([factor, _fwd_ret(mkt_ret, h)], axis=1).dropna()) for h in horizon}
+    if any(n < minimum for n in counts.values()):
+        return {"factor": name, "kind": "time_series", "score": None, "status": "candidate",
+                "ready": False, "verdict": "完整远期月样本不足，未生成中性兜底评分", "sample_counts": counts,
+                "required_samples": minimum, "ic_h1": None, "t_h1": None, "gap_hl": None}
     ic_results = {}
     for h in horizon:
         fwd = _fwd_ret(mkt_ret, h)
@@ -182,7 +190,7 @@ def evaluate_time_series(name: str, factor: pd.Series, mkt_ret: pd.Series,
     verdict = f"方向{direction}（信号高 → 未来市场收益{'正' if direction=='+' else '负' if direction=='-' else '无'}）"
 
     return {
-        "factor": name, "kind": "time_series",
+        "factor": name, "kind": "time_series", "ready": True, "sample_counts": counts,
         "score": round(raw, 1), "status": status, "verdict": verdict,
         "ic_h1": round(ic1.get("ic_mean", np.nan), 3) if not np.isnan(ic1.get("ic_mean", np.nan)) else None,
         "icir_h1": round(ic1.get("icir", np.nan), 2) if not np.isnan(ic1.get("icir", np.nan)) else None,

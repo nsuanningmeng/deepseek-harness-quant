@@ -30,18 +30,19 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
 # ★U1-3 写保护免疫（2026-08-10）：固定名被锁 → 时间戳文件名；读取方（daily_signal/
 #   dashboard_watch/live_api）glob pool_layers_*.json 取最新
 OUT = BASE / "output" / f"pool_layers_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
 # 技术确认阈值（严格；低频策略宁缺毋滥）
-CFG_DEF = {
-    "above_ma50": True,          # 价格必须站上 MA50（中期趋势向上）
-    "max_dist_high52_pct": -20.0,  # 距 52 周高点回撤必须 ≤20%（强势整理，不追高不接飞刀）
-    "min_vol_ratio": 0.8,        # 20日均量/60日均量 ≥0.8（维持关注度）
-    "industry_cap": 3,           # 决策池每行业最多 3 只（分散）
-}
+from factors.research_context import config as research_config
+
+
+def layer_config():
+    return research_config()["pool_layers"]
+
 
 
 def build_layers(ranking: dict, capital: float = 200_000,
@@ -49,15 +50,22 @@ def build_layers(ranking: dict, capital: float = 200_000,
     """ranking_top.json → 三层池
     ranking: rank() 输出；regime_cash: 当前择时现金比例（防守档强制清空决策池）
     """
+    if ranking.get("error"):
+        raise ValueError(ranking["error"])
+    cfg = layer_config()
     top = ranking.get("top", []) or []
+    if not top:
+        raise ValueError("没有真实排名结果，未生成空成功三层池")
+    if regime_cash is None:
+        raise ValueError("缺少当前生效regime，不能绕过防守检查")
     watch = top                                            # L1 观察池 = 排名全量
     cand = []
     for t in watch:
         tech = t.get("tech", {}) or {}
         ok = (
             (tech.get("above_ma50") is True) and
-            ((tech.get("dist_high52_pct") or -999) >= CFG_DEF["max_dist_high52_pct"]) and
-            ((tech.get("vol_ratio_20_60") or 0) >= CFG_DEF["min_vol_ratio"])
+            ((tech.get("dist_high52_pct") if tech.get("dist_high52_pct") is not None else float("-inf")) >= cfg["max_dist_high52_pct"]) and
+            ((tech.get("vol_ratio_20_60") or 0) >= cfg["min_vol_ratio"])
         )
         if ok:
             cand.append(t)
@@ -66,11 +74,11 @@ def build_layers(ranking: dict, capital: float = 200_000,
     decision, ind_count = [], {}
     for t in cand_sorted:
         ind = t.get("industry", "")
-        if ind_count.get(ind, 0) < CFG_DEF["industry_cap"]:
+        if ind_count.get(ind, 0) < cfg["industry_cap"]:
             decision.append(t)
             ind_count[ind] = ind_count.get(ind, 0) + 1
     # 防守档（现金≥50%）→ 决策池清空：只减不加
-    if regime_cash is not None and regime_cash >= 0.5:
+    if regime_cash is not None and regime_cash >= float(cfg["defensive_cash"]):
         decision = []
     if decision_cap:
         decision = decision[:decision_cap]
@@ -92,7 +100,7 @@ def build_layers(ranking: dict, capital: float = 200_000,
             "watch": "四因子排名 Top N：ROE≥5% + 净利同比>0 + 非ST + 行业上限5",
             "candidate": "技术确认：价>MA50 且 距52周高点回撤≤20% 且 量比≥0.8",
             "decision": "score 排序 + 每行业≤3 + 资金分档；防守档(现金≥50%)清空；不足宁缺毋滥不补抽",
-            "evidence": "2020-2025 逐季实证（23 季）：决策池 vs 观察池次季收益 -2.0pp/季、胜率30%——严格筛选不提升选股收益，价值=可执行性+防守（下跌市抗跌：2024Q1 +1.8% vs -7.2%）+低频纪律；收益 alpha 仍来自动态择时",
+            "evidence": "本次为当前研究池的规则筛选；没有重跑验证的旧研究收益不作为本次证据",
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         },
     }
@@ -100,15 +108,13 @@ def build_layers(ranking: dict, capital: float = 200_000,
 
 def capital_to_n(capital: float) -> int:
     """资金规模 → 决策池只数上限（低资金更少持仓）"""
+    cfg = layer_config()
     if capital <= 0:
-        return 10
-    if capital < 100_000:
-        return 5
-    if capital < 300_000:
-        return 10
-    if capital < 1_000_000:
-        return 15
-    return 20
+        raise ValueError("研究资金参数必须为正")
+    for band in cfg["capital_bands"]:
+        if capital < float(band["below"]):
+            return int(band["count"])
+    return int(cfg["max_holdings"])
 
 
 def main():
@@ -121,7 +127,18 @@ def main():
 
     from strategy.ranking_v2 import rank
     rk = rank(args.n) if False else rank(None, args.n)
-    layers = build_layers(rk, capital=args.capital, regime_cash=args.regime_cash)
+    regime = json.loads((BASE / "output/dynamic_regime.json").read_text(encoding="utf-8"))
+    month = str(rk.get("date", ""))[:7]
+    effective = regime.get(month) or {}
+    if str(effective.get("signal_month", "9999")) >= month or effective.get("pos") is None:
+        raise ValueError("研究日缺少已完成上月信号对应的有效regime")
+    regime_cash = 1 - float(effective["pos"])
+    if args.regime_cash is not None and abs(args.regime_cash - regime_cash) > 1e-8:
+        raise ValueError("手动regime参数与真实生效状态不符")
+    layers = build_layers(rk, capital=args.capital, regime_cash=regime_cash)
+    layers["research_scope"] = rk.get("research_scope")
+    layers["status"] = "ready"
+    OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(layers, ensure_ascii=False, indent=1), encoding="utf-8")
 
     print(f"三层池已生成：{OUT}")

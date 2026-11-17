@@ -69,7 +69,7 @@
 
   <div class="v2-card anim-fade-in-up" style="margin-top:14px">
     <h2> 小资金配置建议 <span class="tag">ETF 复制策略暴露</span></h2>
-    <div class="mini" style="color:var(--muted)">高分且互不冗余（两两相关≤0.85）的 ETF 子集 → 三方案权重。场内 ETF 一手 100 份，几千元即可起步。</div>
+    <div class="mini" style="color:var(--muted)">ETF选择和权重在训练期确定，后续留出期单独检验；仅供研究，不会自动提交买卖。</div>
     <div id="etf-alloc">加载中…</div>
   </div>
 
@@ -106,16 +106,24 @@
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
-  function pct(x) { return (x * 100).toFixed(1) + '%'; }
+  function numeric(x) { return x == null || x === '' || !Number.isFinite(Number(x)) ? null : Number(x); }
+  function fixed(x,n) { var v=numeric(x);return v == null ? '—' : v.toFixed(n == null ? 2 : n); }
+  function pct(x) { var v=numeric(x);return v == null ? '—' : (v * 100).toFixed(1) + '%'; }
+  function executionNote(item) {
+    var ex=item.execution || {},parts=[];
+    if (item.closed === false) parts.push('期末仍有未实际退出持仓，年化留空');
+    if (item.complete_marks === false) parts.push('存在收盘估值缺口，回撤和夏普留空');
+    [['delayed_exits','延迟退出'],['delayed_entries','延迟入场'],['unresolved_holdings','未退出持仓']].forEach(function(pair){if(Array.isArray(ex[pair[0]]))parts.push(pair[1]+' '+ex[pair[0]].length);});
+    if (item.valuation_gap_days != null) parts.push('估值缺口 '+item.valuation_gap_days+' 日');
+    return parts.join(' · ');
+  }
   function tierChip(t) {
     if (t === 'A') return '<span class="etf-chip chip-a">A</span>';
     if (t === 'B') return '<span class="etf-chip chip-b">B</span>';
     return '<span class="etf-chip chip-c">C</span>';
   }
-  fetch('/api/etf_map', { cache: 'no-store' }).then(function (r) {
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }).then(function (d) {
+  LW.api.get('/api/etf_map', {bypass:true,staleFallback:false}).then(function (d) {
+    if(d.ok === false || d.error) throw new Error(d.reason || d.error || 'ETF研究尚未初始化');
     var st = d.strategy || {};
     var rec = d.recommend || {};
     var top = (d.etf_corr_top || []);
@@ -126,14 +134,15 @@
     if (updEl) {
       updEl.innerHTML =
         '上次数据更新：<b>' + esc((d.generated_at || '').replace('T', ' ')) + '</b>' +
-        '<span>· 策略 ' + esc(st.name || '—') + '（' + (st.days || 0) + ' 日）</span>' +
-        '<span>· 更新方式：运行 <b style="color:var(--navy2)">etf/etf_map.py</b> 后刷新</span>';
+        '<span>· 研究 ' + esc(st.name || '—') + '（' + fixed(st.days,0) + ' 日）</span>' +
+        '<span>· 来源 '+esc(d.data_source || '尚未声明')+' · 行情至 '+esc(d.asof || '—')+' · 训练截止 '+esc(d.training_end || '—')+'</span>'+
+        '<span style="color:var(--gold)">· 有限研究 · 不可自动买入</span>';
     }
     // KPI
     var kpi = [
-      { k: '策略 · turn_low defensive', v: pct(st.annual), s: '回撤 ' + pct(st.max_dd) + ' · ' + (st.days || 0) + ' 日' },
-      { k: '映射 ETF 数', v: (top.length || 0) + ' 只', s: '正相关 ' + cards.filter(function (c) { return c.corr > 0.15; }).length + ' 只' },
-      { k: '推荐方案复制度', v: rec.corr_to_strategy != null ? rec.corr_to_strategy.toFixed(2) : '—', s: '复制组合 vs 策略 相关性' },
+      { k: esc(st.name || '基础策略研究'), v: pct(st.annual), s: '回撤 ' + pct(st.max_dd) + ' · ' + fixed(st.days,0) + ' 日' },
+      { k: '映射 ETF 数', v: top.length + ' 只', s: '已生成研究卡 ' + cards.length + ' 只' },
+      { k: '留出期组合相关', v: fixed(rec.corr_to_strategy,2), s: '研究组合 vs 基础策略 · 非复制保证' },
       { k: '数据日期', v: (d.generated_at || '').slice(0, 10) || '—', s: '生成于 ' + esc(d.generated_at || '') }
     ];
     document.getElementById('etf-kpis').innerHTML = kpi.map(function (k) {
@@ -141,21 +150,21 @@
     }).join('');
     // 相关性表
     if (!top.length) {
-      document.getElementById('etf-corr-table').innerHTML = '<div class="mini" style="padding:10px 0">无数据 —— 请先运行 <b>etf/etf_map.py</b></div>';
+      document.getElementById('etf-corr-table').textContent = '尚无经过实际训练期检验的ETF映射，请查看研究服务进度。';
     } else {
       var rows = top.map(function (e) {
         return '<tr>' +
           '<td>' + esc(e.code) + '</td><td>' + esc(e.name) + '</td>' +
           '<td><span class="cat">' + esc(e.category || '') + '</span></td>' +
-          '<td><b style="color:' + (e.corr > 0.3 ? '#4ade80' : (e.corr > 0 ? '#f2c94c' : '#eb5757')) + '">' + e.corr.toFixed(3) + '</b></td>' +
+          '<td><b>' + fixed(e.corr,3) + '</b></td>' +
           '<td>' + (e.corr_roll_mean != null ? e.corr_roll_mean.toFixed(3) : '—') + '</td>' +
           '<td>' + (e.corr_roll_vol != null ? e.corr_roll_vol.toFixed(3) : '—') + '</td>' +
           '<td>' + (e.beta != null ? e.beta.toFixed(2) : '—') + '</td>' +
-          '<td>' + e.avg_amount_yi + '亿</td></tr>';
+          '<td>' + fixed(e.avg_amount_yi,2) + '亿</td></tr>';
       }).join('');
       document.getElementById('etf-corr-table').innerHTML =
         '<table class="etf-table"><thead><tr>' +
-        '<th>代码</th><th>名称</th><th>类别</th><th>全期相关</th><th>滚动相关均值</th><th>滚动相关波动</th><th>beta</th><th>近20日成交额</th>' +
+        '<th>代码</th><th>名称</th><th>类别</th><th>训练期相关</th><th>滚动相关均值</th><th>滚动相关波动</th><th>beta</th><th>成交额指标</th>' +
         '</tr></thead><tbody>' + rows + '</tbody></table>';
     }
     // pitch 卡
@@ -164,12 +173,12 @@
     } else {
       document.getElementById('etf-pitch').innerHTML = cards.map(function (c) {
         var yr = (c.yearly || {});
-        var yrs = Object.keys(yr).slice(0, 5).map(function (y) { return y + ':' + (yr[y] > 0 ? '+' : '') + yr[y].toFixed(2); }).join(' ');
+        var yrs = Object.keys(yr).slice(0, 5).map(function (y) { return y + ':' + (yr[y] > 0 ? '+' : '') + fixed(yr[y],2); }).join(' ');
         return '<div class="etf-card">' +
-          '<div class="hd"><span class="nm">' + esc(c.name) + tierChip(c.tier) + '</span><span class="sc">' + c.score.toFixed(0) + '</span></div>' +
-          '<div class="kv"><span>' + esc(c.code) + ' · <span class="cat">' + esc(c.category) + '</span></span><span>相关 <b>' + c.corr.toFixed(3) + '</b></span></div>' +
+          '<div class="hd"><span class="nm">' + esc(c.name) + tierChip(c.tier) + '</span><span class="sc">' + fixed(c.score,0) + '</span></div>' +
+          '<div class="kv"><span>' + esc(c.code) + ' · <span class="cat">' + esc(c.category) + '</span></span><span>相关 <b>' + fixed(c.corr,3) + '</b></span></div>' +
           '<div class="kv"><span>滚动相关</span><span>' + (c.corr_roll_mean != null ? c.corr_roll_mean.toFixed(3) : '—') + ' ± ' + (c.corr_roll_vol != null ? c.corr_roll_vol.toFixed(3) : '—') + '</span></div>' +
-          '<div class="kv"><span>beta · 成交额</span><span>' + (c.beta != null ? c.beta.toFixed(2) : '—') + ' · ' + c.avg_amount_yi + '亿</span></div>' +
+          '<div class="kv"><span>beta · 成交额</span><span>' + fixed(c.beta,2) + ' · ' + fixed(c.avg_amount_yi,2) + '亿</span></div>' +
           (yrs ? '<div class="kv"><span>年度相关</span><span>' + esc(yrs) + '</span></div>' : '') +
           '</div>';
       }).join('');
@@ -180,7 +189,7 @@
     var sel = rec && rec.weights ? Object.keys(rec.weights) : [];
     if (sel.length) {
       var wmax = Math.max.apply(null, sel.map(function (c) { return rec.weights[c]; }));
-      allocHtml = '<div class="alloc-row" style="margin-top:12px"><span class="w">推荐方案</span><span class="mini" style="color:var(--muted)">' + names[(d.recommend_name || 'corr_liq_w')] + ' · 复制相关 ' + rec.corr_to_strategy + ' · 年化 ' + pct(rec.annual) + ' · 回撤 ' + pct(rec.max_dd) + ' · 夏普 ' + (rec.sharpe != null ? rec.sharpe.toFixed(2) : '—') + '</span></div>';
+      allocHtml = '<div class="alloc-row" style="margin-top:12px"><span class="w">研究权重</span><span class="mini" style="color:var(--muted)">' + esc(names[d.recommend_name] || d.recommend_name || '实际研究方案') + ' · 留出期相关 ' + fixed(rec.corr_to_strategy,3) + ' · 年化 ' + pct(rec.annual) + ' · 回撤 ' + pct(rec.max_dd) + ' · 夏普 ' + fixed(rec.sharpe,2) + '</span></div>';
       sel.forEach(function (c) {
         var e = cards.filter(function (x) { return x.code === c; })[0];
         allocHtml += '<div class="alloc-row"><span class="w">' + esc(c) + ' ' + (e ? esc(e.name) : '') + '</span>' +
@@ -194,19 +203,22 @@
     var rowsA = [];
     Object.keys(alloc).forEach(function (k) {
       var a = alloc[k];
-      rowsA.push('<tr><td>' + (names[k] || k) + '</td><td>' + a.corr_to_strategy.toFixed(3) + '</td><td>' + pct(a.annual) + '</td><td>' + pct(a.max_dd) + '</td><td>' + (a.sharpe != null ? a.sharpe.toFixed(2) : '—') + '</td></tr>');
+      rowsA.push('<tr><td>' + esc(names[k] || k) + '</td><td>' + fixed(a.corr_to_strategy,3) + '</td><td>' + pct(a.annual) + '</td><td>' + pct(a.max_dd) + '</td><td>' + fixed(a.sharpe,2) + '</td></tr>');
     });
     if (rowsA.length) {
-      allocHtml += '<div style="margin-top:14px"><div class="mini" style="color:var(--muted)">三方案对比（复制组合，样本内）：</div>' +
+      allocHtml += '<div style="margin-top:14px"><div class="mini" style="color:var(--muted)">训练期选定权重的留出期研究（下一交易日开盘、含费用；执行限制以来源记录为准）：</div>' +
         '<div class="etf-alloc-table-wrap"><table class="etf-table"><thead><tr><th>方案</th><th>与策略相关</th><th>年化</th><th>最大回撤</th><th>夏普</th></tr></thead><tbody>' +
         rowsA.join('') + '</tbody></table></div></div>';
     }
     document.getElementById('etf-alloc').innerHTML = allocHtml;
     // notes
     document.getElementById('etf-notes').innerHTML = (d.notes || []).map(function (n) { return '<div>· ' + esc(n) + '</div>'; }).join('') +
-      '<div>· 生成: <b style="color:var(--navy)">' + esc(d.generated_at || '') + '</b> ｜ 更新: 运行 <b>etf/etf_map.py</b>（需网络拉 akshare ETF 行情，约 3-5 分钟）</div>';
+      '<div>· 基础策略执行：'+esc(executionNote(st) || '尚无执行限制统计')+'</div>'+
+      Object.keys(alloc).map(function(k){return '<div>· '+esc(names[k] || k)+'：'+esc(executionNote(alloc[k]) || '尚无执行限制统计')+'</div>';}).join('')+
+      (d.failed_inputs && d.failed_inputs.length ? '<div style="color:var(--gold)">· 缺失输入：'+esc(JSON.stringify(d.failed_inputs))+'</div>' : '')+
+      '<div>· 本机真实行情研究，存在当前股票池选择偏差，不等于独立前向验证或可自动执行的交易计划。更新情况见研究服务进度。</div>';
   }).catch(function (e) {
-    document.getElementById('etf-kpis').innerHTML = '<div class="etf-kpi"><div class="k">读取失败</div><div class="v" style="color:var(--red)">' + esc(e.message) + '</div><div class="s">运行 etf/etf_map.py 生成 output/etf_map.json 后刷新</div></div>';
+    document.getElementById('etf-kpis').innerHTML = '<div class="etf-kpi"><div class="k">研究数据暂不可读</div><div class="v" style="color:var(--red)">' + esc(e.message) + '</div><div class="s">查看研究服务进度及实际缺失输入；不会填充示例绩效。</div></div>';
     ['etf-corr-table', 'etf-pitch', 'etf-alloc', 'etf-notes'].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.innerHTML = '<div class="mini" style="padding:10px 0">— 未生成 —</div>';

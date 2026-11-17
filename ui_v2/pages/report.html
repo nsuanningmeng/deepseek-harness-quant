@@ -67,6 +67,9 @@
     var inUl = false;
     function closeUl() { if (inUl) { html.push('</ul>'); inUl = false; } }
     lines.forEach(function (l) {
+      // The generated status footer links only to these two local status pages.
+      l = l.replace(/\[数据页\]\(\/data\)/g, '<a href="/data">数据页</a>')
+        .replace(/\[实时模拟盘\]\(\/paperlive\)/g, '<a href="/paperlive">实时模拟盘</a>');
       if (/^# /.test(l)) { closeUl(); html.push('<h1>' + l.slice(2) + '</h1>'); }
       else if (/^## /.test(l)) { closeUl(); html.push('<h2>' + l.slice(3) + '</h2>'); }
       else if (/^### /.test(l)) { closeUl(); html.push('<h3>' + l.slice(4) + '</h3>'); }  // ★#361 牛散点评个股三级标题
@@ -89,12 +92,12 @@
     return html.join('');
   }
 
-  // ★#347 日报加载：60s 轮询（18:30 自动链跑完自动出现新日报，不用手动刷新）+ 数据日标注
+  // 日报在收盘研究完成后生成；每60秒检查新产物并显示真实数据日。
   function loadReport() {
     LW.api.get('/api/daily_report', { bypass: true }).then(function (d) {
       var box = document.getElementById('report-box');
       if (!d.ok) { box.innerHTML = '<div class="mini" style="color:var(--muted)">' + (d.error || '日报未生成') + '</div>'; return; }
-      box.innerHTML = '<div class="mini" style="margin:0 0 8px;opacity:.6">日报数据日 <b>' + R._f(d.date) + '</b> · 每日 18:30 自动更新（60s 自动刷新）</div>' +
+      box.innerHTML = '<div class="mini" style="margin:0 0 8px;opacity:.6">日报数据日 <b>' + R._f(d.date) + '</b> · 收盘研究完成后自动更新（页面每60秒刷新）</div>' +
         '<div class="report-md">' + md2html(d.markdown) + '</div>';
     }).catch(function (e) {
       document.getElementById('report-box').innerHTML = '<div class="mini" style="color:var(--muted)">日报加载失败：' + e + '</div>';

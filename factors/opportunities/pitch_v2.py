@@ -36,13 +36,15 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
 import numpy as np
 import pandas as pd
 
 from factors.opportunities.backtest_winrate import _add_months, _holding_stats
 
-BARS_DB = r"data\cache\bars.db"
+from factors.research_context import cache_dir, connect as research_connect, read_bars, scope_metadata
+BARS_DB = cache_dir() / "bars.db"
 LOGS = BASE / "logs"
 OUT_FILE = LOGS / f"pitch_v2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"   # ★动态时间戳文件名（安全层同名二次写被锁，2026-08-09 改）；读取方用 glob 取最新
 
@@ -71,8 +73,7 @@ def _type_stop(otype, score):
         return type_stop_plan(otype, score)
     except Exception:
         # ★2026-08-10 B-9.1 验收修复：异常兜底改为"无硬止损"（与 v2.0 实证哲学一致——防守型 7% 有害）
-        return {"otype": otype, "desc": "异常兜底：无硬止损（逻辑止损为主）", "stop_loss_pct": None,
-                "logic_fail_rules": []}
+        return {"otype": otype, "status": "unavailable", "desc": "止损规则加载失败，需复核", "stop_loss_pct": None, "logic_fail_rules": []}
 
 
 def _type_mechanism(otype):
@@ -91,6 +92,7 @@ HORIZONS = {1: 12, 2: 24, 3: 36}
 QUARTER_MONTHS = (1, 4, 7, 10)
 
 _bench_cache = None
+_stock_bars_cache = None
 
 
 def get_latest_pool() -> Path:
@@ -100,29 +102,18 @@ def get_latest_pool() -> Path:
     2. 周末/节假日 scan 的 date 字段会回退到最近交易日（如 8-09 周日扫描 date=08-07），
        不能用 date 字段排序（会选到昨天的池）；按 mtime 取最新含候选者最贴近"当日审批"。
     """
-    best, best_mtime = None, -1.0
-    for p in sorted(LOGS.glob("opp_pool_*.json")):
-        try:
-            d = json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not (d.get("pitch")):
-            continue
-        mt = p.stat().st_mtime
-        if mt > best_mtime:
-            best, best_mtime = p, mt
-    return best
+    # The latest scan may legitimately contain no signals; never resurrect an older pool.
+    files = list(LOGS.glob("opp_pool_*.json"))
+    return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
 def load_bench() -> pd.Series:
     """沪深300 收盘（SH.000300 none 复权）→ Series(date->close)，模块级缓存"""
     global _bench_cache
     if _bench_cache is None:
-        con = sqlite3.connect(BARS_DB)
-        rows = con.execute(
-            "SELECT date, close FROM daily_bar WHERE code='SH.000300' AND adjust='none' ORDER BY date").fetchall()
-        con.close()
-        _bench_cache = pd.Series({pd.Timestamp(d): float(c) for d, c in rows if c})
+        df = read_bars("code,date,close", adjust="none", symbols=["SH.000300", "000300.SH"])
+        df = df.drop_duplicates("date", keep="last")
+        _bench_cache = pd.Series({pd.Timestamp(r.date): float(r.close) for r in df.itertuples() if r.close})
     return _bench_cache
 
 
@@ -176,11 +167,11 @@ def _holdout_one(code: str) -> dict:
     信号日 t0（季初首交易日）→ T+1 开盘买入 → 持有 1/2/3 年 → 到期最近交易日收盘卖出
     字段对齐 AI-1 版：n/winrate/avg_ret/med_ret/max_dd/pl_ratio/bench_avg/excess_avg
     """
-    con = sqlite3.connect(BARS_DB)
-    rows = con.execute(
-        "SELECT date, open, close FROM daily_bar WHERE code=? AND adjust='qfq' "
-        "AND date>='2019-12-01' ORDER BY date", (code,)).fetchall()
-    con.close()
+    global _stock_bars_cache
+    if _stock_bars_cache is None:
+        _stock_bars_cache = read_bars("code,date,open,close")
+    stock = _stock_bars_cache[_stock_bars_cache["code"] == code]
+    rows = list(stock[["date", "open", "close"]].itertuples(index=False, name=None))
     if len(rows) < 300:
         return None
     g = pd.DataFrame(rows, columns=["date", "open", "close"])
@@ -299,8 +290,16 @@ def build(pool_path: Path = None) -> tuple:
     pool = json.loads(pool_path.read_text(encoding="utf-8"))
     pitch = pool.get("pitch") or []
     if not pitch:
-        return {"error": f"{pool_path.name} 中无 pitch 候选（scan.py --pitch 四重过滤后为空）",
-                "date": pool.get("date")}, None
+        if not pool.get("date") or not pool.get("research_scope") or pool.get("status") != "no_qualifying_signals":
+            return {"error": "空候选输入缺少真实扫描证据，未冒充成功"}, None
+        result = {"date": pool["date"], "pool_date": pool["date"],
+                  "generated_at": datetime.now().isoformat(timespec="seconds"), "source_pool": pool_path.name,
+                  "status": "empty_valid", "n": 0, "pitch": [], "research_scope": scope_metadata(),
+                  "meta": {"reason": "真实扫描已完成，当前规则没有合格Pitch候选；未沿用旧候选",
+                           "rules": pool.get("thresholds"), "scan_stats": pool.get("stats")}}
+        OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OUT_FILE.write_text(json.dumps(json_safe(result), ensure_ascii=False, indent=1, allow_nan=False), encoding="utf-8")
+        return result, OUT_FILE
 
     risk_map = load_risk_map()
     beneish = load_beneish()
@@ -343,6 +342,7 @@ def build(pool_path: Path = None) -> tuple:
             "otype": o.get("otype"), "otype_name": o.get("otype_name"),
             # ★2026-08-13 #316 IC Memo 第一问「价值创造杠杆」机制链（registry.desc 透传）
             "mechanism": _type_mechanism(o.get("otype")),
+            "risk_data_available": bool(rk), "beneish_data_available": bool(bn.get("m_score") is not None),
             "score": o.get("score"), "note": o.get("note"),
             # ★2026-08-11 打分拆解透传（用户反馈：打分系统逻辑不明）——机会分四维 + 类型权重
             "gains": o.get("gains"), "prob": o.get("prob"), "risk": o.get("risk"),
@@ -387,11 +387,15 @@ def build(pool_path: Path = None) -> tuple:
             "stop_plan": _type_stop(o.get("otype"), o.get("score")),
         })
 
+    if not out_pitch:
+        return {"error": "候选日线不足，未生成空成功产物", "date": pool.get("date")}, None
     result = {
         "date": pool.get("date", datetime.now().strftime("%Y-%m-%d")),
         "pool_date": pool.get("date"),
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_pool": pool_path.name,
+        "research_scope": scope_metadata(),
+        "status": "ready" if all(p.get("beneish") for p in out_pitch) else "limited",
         "n": len(out_pitch),
         "pitch": out_pitch,
         "meta": {
@@ -400,10 +404,10 @@ def build(pool_path: Path = None) -> tuple:
             "avg_ret": "持有期总收益算术均值；med_ret 中位；max_dd 持有路径相对前高最大回撤（减法）",
             "bench": "沪深300（SH.000300 none 复权）同买入/卖出日；excess_avg = avg_ret - bench_avg",
             "data_limits": [
-                "行情 qfq 2019+；样本 2020-2026 每季 1 个（1y≈23 / 2y≈19 / 3y≈15）",
+                "各持有期只统计实际完整到期样本；数量见每项n，缺历史不补齐",
                 "★右删失：数据未覆盖完整持有期的买入样本已剔除",
                 "未处理一字涨停无法买入/停牌；极端收益 |ret|>=2 已剔除（_holding_stats 内置）",
-                "Beneish 为降级模式（GMI/SGI/LVGI/TATA 近似，DSRI/AQI/DEPI/SGAI 数据不足置中性）",
+                "Beneish状态取真实三表报告，缺项保持不可评分；风险数据缺失不代表无风险",
                 "risk_level 以 logs/stock_risk_map.json 为准（若当日未重扫则可能滞后于池内标记）",
             ],
         },
@@ -416,7 +420,7 @@ def build(pool_path: Path = None) -> tuple:
             print(f"  [短线因子] 一字板披露 {n_w} 只（当日不可买，T+1 再评估）")
     except Exception:
         pass
-    OUT_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+    OUT_FILE.write_text(json.dumps(json_safe(result), ensure_ascii=False, indent=1), encoding="utf-8")
     return result, OUT_FILE
 
 

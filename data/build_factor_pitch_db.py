@@ -25,7 +25,9 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 LOGS = BASE / "logs"
-DB = Path(r"data/cache/factor_pitch_perf.db")
+sys.path.insert(0, str(BASE))
+from data.cache import CACHE_DIR
+DB = CACHE_DIR / "factor_pitch_perf.db"
 
 sys.path.insert(0, str(BASE))
 
@@ -82,9 +84,7 @@ def build():
     entries = pool.get("entries", [])
     print(f"远期池: {len(entries)} 条")
 
-    pitch_map = load_pitch_factors_map()
-    dec_map = load_decisions_factors()
-    print(f"pitch_v2 归因可匹配: {len(pitch_map)} 只 | decisions 归因: {len(dec_map)} 只")
+    print('归因只使用入池登记时保存的因子快照；旧记录不按最新因子倒填')
 
     con = sqlite3.connect(DB)
     con.execute("""CREATE TABLE IF NOT EXISTS factor_pitch (
@@ -107,14 +107,13 @@ def build():
     per_factor = defaultdict(list)
     for e in entries:
         code = e["code"]
-        pm = dec_map.get(code) or pitch_map.get(code)
-        factors = (pm or {}).get("factors") or {}
+        factors = e.get('factors_snapshot') or {}
         if not factors:
             continue  # 无因子归因的旧批次（如实不入库，覆盖率见统计）
         n_covered += 1
-        otype = (pm or {}).get("otype") or e.get("otype", "")
-        fam = (pm or {}).get("signal_family") or ""
-        sp = (pm or {}).get("stop_plan") or e.get("stop_plan") or {}
+        otype = e.get("otype", "")
+        fam = e.get("signal_family_snapshot") or ""
+        sp = e.get("stop_plan") or {}
         fwd = e.get("fwd") or {}
         t1 = (fwd.get("t1") or {}).get("ret")
         t5 = (fwd.get("t5") or {}).get("ret")
@@ -126,7 +125,7 @@ def build():
         for fname, fval in factors.items():
             con.execute("""INSERT INTO factor_pitch VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (fname, code, e.get("entry_date", ""), otype, src,
-                         fam, (pm or {}).get("score") or e.get("score"), sp.get("stop_loss_pct"),
+                         fam, e.get("score"), sp.get("stop_loss_pct"),
                          t1, t5, t20, t60, 1 if t5 is not None else 0,
                          mkt1, excess, src))
             per_factor[fname].append({"t1": t1, "t5": t5, "excess": excess})

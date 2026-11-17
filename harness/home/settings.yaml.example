@@ -1,0 +1,17 @@
+# Custom relay provider. Keys are stored only in .credentials.yaml.
+agent-default-model:
+  provider: lemonapi
+  model: glm-5.3
+llm-pi-ai:
+  providers:
+    lemonapi:
+      displayName: Lemon API
+      api: openai-completions
+      baseURL: https://new.lemonapi.site/v1
+      apiKeyEnv: LEMONAPI_API_KEY
+      models:
+      - id: glm-5.3
+        name: GLM-5.3
+        contextWindow: 32768
+        maxTokens: 4096
+        reasoningEfforts: false

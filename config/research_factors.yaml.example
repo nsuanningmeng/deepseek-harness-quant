@@ -1,0 +1,38 @@
+# Local research only. No live-paper execution or trading parameters are changed.
+schema_version: 1
+output_dir: data/factorpool/output
+report_dir: report
+runtime_dir: runtime/research
+start: '2019-01-01'
+scope: current_hs300
+allowed_source_prefixes: [tushare]
+minimum_history_sessions: 400
+minimum_cross_section: 30
+minimum_mature_sections: 120
+holding_horizons: [20, 60, 120]
+primary_horizon: 20
+ic_windows: [20, 60, 120]
+top_fraction: 0.2
+correlation_sessions: 60
+crowding_sessions: 252
+turnover_window: 20
+costs:
+  commission_bps_each_side: 3.0
+  slippage_bps_each_side: 5.0
+  sell_stamp_duty_bps: 5.0
+health_thresholds:
+  effective_icir: 0.5
+  weak_icir: 0.1
+  effective_hac_t: 2.0
+  effective_ic_win_rate: 0.55
+  maximum_crowding_percentile: 90
+  reduced_risk_coefficient: 0.5
+  insufficient_risk_coefficient: 0.0
+factors:
+  lowvol_60: {name_cn: '60日低波动', category: smart_beta, family: '低波', direction: -1, lookback: 61, usage: '低波动研究参考'}
+  near_high_250: {name_cn: '接近250日高点', category: a_share_alpha, family: '位置', direction: 1, lookback: 250, usage: '价格位置研究参考'}
+  mom_20: {name_cn: '20日动量反转', category: a_share_alpha, family: '反转动量', direction: -1, lookback: 21, usage: '短期反转研究参考'}
+  mom_120: {name_cn: '120日动量反转', category: a_share_alpha, family: '反转动量', direction: -1, lookback: 121, usage: '中期反转研究参考'}
+  rps_120: {name_cn: '120日相对强度反转', category: a_share_alpha, family: '反转动量', direction: -1, lookback: 121, usage: '与mom_120同公式，不作为独立确认'}
+  new_high_250: {name_cn: '250日新高', category: a_share_alpha, family: '位置', direction: 0, lookback: 250, usage: '原引擎停用，保留原始值及诊断，不参与选股'}
+  turn_low: {name_cn: '20日低换手', category: smart_beta, family: '换手', direction: -1, lookback: 20, usage: '低换手研究参考，仅2019年起有效'}

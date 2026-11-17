@@ -30,8 +30,9 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-MACRO_DB = Path(r"data\cache\macro.db")
-EPU_DB = BASE / "data" / "cache" / "policy" / "epu.db"
+from factors.research_context import cache_dir, connect as research_connect
+MACRO_DB = cache_dir() / "macro.db"
+EPU_DB = cache_dir() / "policy" / "epu.db"
 
 WEIGHTS = {"epu": -0.35, "epu_chg3m": -0.20, "sf_yoy": 0.30, "spread": 0.15}
 
@@ -39,14 +40,14 @@ WEIGHTS = {"epu": -0.35, "epu_chg3m": -0.20, "sf_yoy": 0.30, "spread": 0.15}
 def load_panel() -> pd.DataFrame:
     """构造政策面板（月度）：month, epu, epu_chg_3m, sf_yoy_growth, spread"""
     # EPU
-    con = sqlite3.connect(str(EPU_DB))
+    con = research_connect(EPU_DB)
     epu = pd.read_sql_query("SELECT month, epu FROM epu_monthly", con)
     con.close()
     epu["month"] = pd.to_datetime(epu["month"]).dt.strftime("%Y-%m")
     epu = epu.sort_values("month").reset_index(drop=True)
     epu["epu_chg_3m"] = epu["epu"] - epu["epu"].shift(3)
     # 社融
-    con = sqlite3.connect(str(MACRO_DB))
+    con = research_connect(MACRO_DB)
     sf = pd.read_sql_query("SELECT month, sf_increment FROM social_finance", con)
     by = pd.read_sql_query("SELECT date, y10, y2 FROM bond_yield", con)
     con.close()
@@ -71,7 +72,8 @@ def load_panel() -> pd.DataFrame:
 
 
 def zscore(s: pd.Series) -> pd.Series:
-    return (s - s.mean()) / s.std()
+    history = s.expanding(min_periods=12)
+    return (s - history.mean()) / history.std().replace(0, np.nan)
 
 
 def compute_score(panel: pd.DataFrame) -> pd.DataFrame:
@@ -88,6 +90,8 @@ def compute_score(panel: pd.DataFrame) -> pd.DataFrame:
     )
 
     def bucket(s):
+        if pd.isna(s):
+            return "数据不足"
         if s > 0.5:
             return "进攻区"
         if s < -0.5:
@@ -102,7 +106,7 @@ def backtest(panel: pd.DataFrame):
     """评分 → 次月收益检验（需市场收益，独立构造）"""
     import sqlite3 as sq
 
-    con = sq.connect(r"data/cache/bars.db")
+    con = research_connect(cache_dir() / "bars.db")
     bars = pd.read_sql(
         "SELECT date, code, close, is_st FROM daily_bar WHERE adjust='qfq' AND date>='2015-01-01' AND is_st=0",
         con,

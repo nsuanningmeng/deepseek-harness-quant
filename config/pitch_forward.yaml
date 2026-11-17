@@ -1,0 +1,21 @@
+# Separate, post-close-settled paper comparison.
+initial_cash: 50000
+top_n: 6
+exit_grace: 10
+fees:
+  commission_rate: 0.00026
+  sell_tax_rate: 0.0005
+  slippage_rate: 0.001
+strategies:
+  challenger:
+    label: "Top 6 · 10 日 · 85% 仓位系数"
+    hold: 10
+    size: 0.85
+    stop: null
+    target: null
+  baseline:
+    label: "Top 6 · 5 日 · 2× ATR 止损"
+    hold: 5
+    size: 1
+    stop: 2
+    target: null

@@ -1,0 +1,133 @@
+mode: paper
+council:
+  enabled: false
+  config_file: config/paperlive_council.yaml
+activation:
+  enabled: false
+  expected_initial_cash: 50000
+  expected_universe_count: 300
+  research_config: config/research.yaml
+  pipeline_config: config/research_pipeline.yaml
+  ai_verification_file: runtime/research/ai-verification.json
+  ai_verification_max_age_seconds: 86400
+  ai_probe_retry_seconds: 3600
+  ai_probe_max_tokens: 128
+  research_summary_steps: [signal, traffic_light, factor_pool]
+  research_summary_max_characters: 12000
+  waiting_stop_text: "等待数据验收后自动启动；用户指定50000元虚拟资金。\n"
+  required_products: [pitch_v2, opp_pool, beneish, sim_tracks, pitch_track, regime, traffic_light, signal, audit, factor_pool, pool_layers]
+runtime_dir: runtime/paperlive
+market:
+  universe: hs300
+  refresh_seconds: 10
+  universe_refresh_seconds: 21600
+  request_timeout: 10
+  max_quote_age_seconds: 30
+  max_future_seconds: 3
+  min_listing_days: 180
+  trading_sessions:
+  - - 09:30
+    - '11:30'
+  - - '13:00'
+    - '14:57'
+  close_time: '15:00'
+  closed_refresh_seconds: 300
+  heartbeat_grace_seconds: 60
+  close_observation_seconds: 300
+  provider: tushare
+  source_label: Tushare Pro 实时行情、成分与交易日历
+broker:
+  initial_cash: 1000000
+  commission_rate: 0.0003
+  min_commission: 5
+  stamp_tax_rate: 0.0005
+  transfer_fee_rate: 1.0e-05
+  slippage_bps: 5
+  max_book_fraction: 0.1
+risk:
+  max_symbol_weight: 0.15
+  max_total_weight: 0.75
+  max_order_notional: 150000
+  max_positions: 10
+  max_daily_orders: 20
+  max_drawdown: 0.15
+  kill_switch_file: runtime/paperlive/STOP
+strategy:
+  mode: ai
+  ai_interval_seconds: 1800
+  max_plan_age_seconds: 90
+  max_orders_per_plan: 3
+  max_candidates: 40
+ai:
+  provider: lemonapi
+  settings_file: harness/home/settings.yaml
+  credentials_file: harness/home/.credentials.yaml
+  max_tokens: 2000
+  timeout_seconds: 60
+  allowed_origin: https://new.lemonapi.site
+ui:
+  label: 实时模拟盘
+  history_limits:
+    orders: 200
+    fills: 500
+    curve: 1000
+boards:
+  MAIN:
+    min_buy: 100
+    buy_step: 100
+    max_order: 1000000
+    price_tick: 0.01
+  CHINEXT:
+    min_buy: 100
+    buy_step: 100
+    max_order: 300000
+    price_tick: 0.01
+  STAR:
+    min_buy: 200
+    buy_step: 1
+    max_order: 100000
+    price_tick: 0.01
+tushare:
+  credentials_file: runtime/paperlive/.data-credentials.yaml
+  token_env: TUSHARE_TOKEN
+  index_code: 000300.SH
+  index_max_age_days: 45
+  query_batch_size: 80
+  min_call_interval_seconds: 0.25
+  probe_symbol: 600000.SH
+  required_checks:
+  - endpoint: trade_cal
+    label: 交易日历
+    fields: cal_date,is_open
+    params:
+      exchange: SSE
+      start_date: $today
+      end_date: $today
+  - endpoint: stock_basic
+    label: 证券基础资料
+    fields: ts_code,name,market,list_date
+    params:
+      exchange: ''
+      list_status: L
+  - endpoint: index_weight
+    label: 沪深300成分与权重
+    fields: index_code,con_code,trade_date,weight
+    params:
+      index_code: $index_code
+      start_date: $start_date
+      end_date: $today
+  - endpoint: stk_limit
+    label: 当日涨跌停价格
+    fields: ts_code,trade_date,pre_close,up_limit,down_limit
+    params:
+      ts_code: $symbol
+      trade_date: $today
+  - endpoint: rt_k
+    label: 实时盘口与快照时间（A股日线RT）
+    fields: ts_code,name,pre_close,high,open,low,close,vol,amount,num,ask_price1,ask_volume1,bid_price1,bid_volume1,trade_time
+    params:
+      ts_code: $symbol
+  links:
+    token: https://tushare.pro/document/1?doc_id=39
+    permission: https://tushare.pro/document/2?doc_id=290
+    rt_k: https://tushare.pro/document/1?doc_id=372

@@ -1,0 +1,14 @@
+research_config: config/research.yaml
+output_file: output/style_diagnostic.json
+ui_output_directory: data/factorpool/output/ui_data
+scope: current_hs300
+strength_window: 60
+smooth_window: 20
+large_fraction: 0.2
+small_fraction: 0.2
+minimum_members: 200
+minimum_group_members: 20
+minimum_universe_coverage: 0.9
+history_months: 24
+neutral_band: 0.0
+labels: {large: 沪深300内偏大盘相对强, small: 沪深300内偏小盘相对强, neutral: 沪深300内均衡}

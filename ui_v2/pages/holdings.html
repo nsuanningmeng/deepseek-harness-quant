@@ -39,6 +39,7 @@
 <body style="background:var(--bg);margin:0">
 <div id="sidebar"></div>
 <div class="v2-wrap">
+  <div class="v2-card mini" style="line-height:1.9">本页展示历史研究审批组合的持仓记录。实时 AI 虚拟账户的资金、订单与收益请查看 <a href="/paperlive">实时模拟盘</a>。</div>
   <div class="v2-h"><span class="bar"></span><h1>持仓</h1><span class="sub">绩效 · 状态机分组（持有→预警→触发/止盈→卖出）· 信号详情内嵌 </span></div>
 
   <!-- KPI 区 -->
@@ -132,7 +133,7 @@
   }
 
   function loadAll() {
-    LW.api.get('/api/live/holdings').then(function (d) {
+    LW.api.get('/api/live/holdings',{bypass:true,staleFallback:false}).then(function (d) {
       var pf = d.portfolio || {};
       var pnl = d.pnl || {};
       var pr = d.position_risk || {};
@@ -141,6 +142,8 @@
       var tp = d.take_profit || {};
       var sa = d.stop_alerts || {};
       var sig = d.daily_signal || {};
+      var recorded = d.portfolio_recorded !== false;
+      var signalSummary = d.signal_summary || {};
       var positions = pf.positions || [];
       // ★2026-08-14 超限透明：后端已分离 _held/_over；前端 KPI 只数真实持仓（holding），
       //   over_limit（超 5 只纪律拒绝）单独提示条——原混在一起显示 6/5 且无标注
@@ -149,7 +152,8 @@
       var overPos = pf._over && pf._over.length ? pf._over
                    : positions.filter(function (p) { return p.status === 'over_limit'; });
       if (pf._held == null) { heldPos = positions; overPos = []; }   // 旧后端兼容
-      var n = heldPos.length;
+      var n = recorded ? heldPos.length : null;
+      var maxPositions = pf.max_positions != null ? pf.max_positions : null;
 
       /* KPI 4 卡 */
       var tv = pnl.total_value != null && !isNaN(pnl.total_value) ? pnl.total_value : null;
@@ -165,10 +169,10 @@
       var nWatch = riskList.filter(function (r) { return (r.risk_level || r.status) === 'WATCH'; }).length;
       function delta(v) { return v == null ? '<span class="d-flat">—</span>' : (v > 0 ? '<span class="d-up">' + Math.abs(v).toFixed(2) + '%</span>' : v < 0 ? '<span class="d-down">' + Math.abs(v).toFixed(2) + '%</span>' : '<span class="d-flat">0%</span>'); }
       var kpis = [
-        { lb: '持仓数', vl: n + ' / ' + (pf.max_positions || 5), dt: '剩余 ' + Math.max(0, (pf.max_positions || 5) - n) + ' 名额', num: null },
+        { lb: '研究审批持仓数', vl: (n == null?'—':n) + ' / ' + (maxPositions == null?'—':maxPositions), dt: !recorded ? '尚无历史组合记录' : maxPositions != null ? '剩余 ' + Math.max(0, maxPositions - n) + ' 名额' : '持仓上限尚未读取', num: null },
         { lb: '持仓市值', vl: tv != null ? (tv / 10000).toFixed(2) + ' 万' : '—', dt: tr != null ? '收益 ' + delta(tr) : '成本 ' + (pnl.total_cost != null && !isNaN(pnl.total_cost) ? pnl.total_cost.toFixed(0) : '—'), num: tv != null ? (tv / 10000).toFixed(2) + ' 万' : null },
         { lb: '组合收益', vl: sretReal != null ? (sretReal >= 0 ? '+' : '') + sretReal.toFixed(2) + '%' : '—', dt: (sretNote ? sretNote + ' · ' : '') + (ex != null ? '超额 ' + delta(ex) : '样本积累中'), num: sretReal != null ? (sretReal >= 0 ? '+' : '') + sretReal.toFixed(2) + '%' : null },
-        { lb: '风控', vl: (riskList.length ? (riskList.length - nWatch) + '/' + riskList.length : '—'), dt: nWatch > 0 ? nWatch + ' 只 WATCH' : '全部 PASS', num: null }
+        { lb: '风控', vl: (riskList.length ? (riskList.length - nWatch) + '/' + riskList.length : '—'), dt: !riskList.length ? '尚无实际持仓风控记录' : nWatch > 0 ? nWatch + ' 只 WATCH' : '本次记录无WATCH项', num: null }
       ];
       document.getElementById('kpi-box').innerHTML = kpis.map(function (k, i) {
         var vlHtml = k.num != null
@@ -183,25 +187,35 @@
       }
 
       /* regime + 净值 */
-      document.getElementById('regime-box').innerHTML =
-        R._f(sig.regime_label, '—') + ' · ' + (sig.regime_level === 'full' ? '满仓信号' : sig.regime_level === 'half' ? '半仓信号' : '防守信号') +
-        ' · 现金 ' + pct(sig.regime_cash_ratio, 0);
+      if (sig.kind === 'research_summary') {
+        var counts = signalSummary.counts || {}, regime = sig.regime || {};
+        document.getElementById('regime-box').textContent = '研究总结 · '+(sig.date || '日期未核验')+' · '+(regime.level || sig.regime_label || '择时待核验')+
+          (regime.pos != null?' · 研究仓位 '+pct(regime.pos,0):'')+' · '+
+          [['watch','观察'],['candidate','候选'],['decision','决策研究'],['pitch','Pitch']].map(function(pair){return pair[1]+' '+(counts[pair[0]] == null?'—':counts[pair[0]]);}).join(' · ')+
+          '。'+(signalSummary.note || sig.note || '研究层不代表实际持仓、委托或成交。');
+      } else {
+        var level = ({full:'满仓研究信号',half:'半仓研究信号',exit:'防守研究信号'})[sig.regime_level] || '仓位信号尚未核验';
+        document.getElementById('regime-box').textContent = (sig.regime_label || '择时尚未核验')+' · '+level+' · 研究现金比例 '+pct(sig.regime_cash_ratio,0);
+      }
       var nav = perf.nav || [];
       var bench = perf.bench_nav || [];
       var navBox = document.getElementById('nav-wrap');
-      if (nav.length) {
+      if (recorded && nav.length) {
         navBox.innerHTML = navLineSvg(nav, bench) +
           '<div class="mini" style="display:flex;gap:16px;margin-top:8px">' +
           '<span style="display:inline-flex;align-items:center;gap:5px"><span style="display:inline-block;width:14px;height:3px;background:#5e6ad2;border-radius:2px"></span>组合净值</span>' +
           '<span style="display:inline-flex;align-items:center;gap:5px"><span style="display:inline-block;width:14px;height:3px;background:#3f3f46;border-radius:2px"></span>基准</span></div>';
         document.getElementById('perf-sub').innerHTML = (stats.days || 0) + ' 交易日 · 最大回撤 ' + pct(stats.max_dd, 1) + ' · 基准 ' + (stats.bench_ret != null ? stats.bench_ret.toFixed(2) + '%' : '—');
+      } else {
+        navBox.textContent = recorded ? '尚无可核验的历史组合净值，等待真实记录积累。' : '尚无历史审批组合记录；研究总结不生成账户净值。';
+        document.getElementById('perf-sub').textContent = '';
       }
 
       /* 持仓卡片（人工/程序分组）★2026-08-14 超限透明 + 实时价标注 */
       var posBox = document.getElementById('pos-box');
       if (!heldPos.length) {
-        posBox.innerHTML = '<div class="empty-hero"><div class="ico">' + (IC.bar || '') + '</div><div class="tx">当前空仓</div>' +
-          '<div class="sub">' + R._f(pf.cleared_note, '无持仓记录') + ' — 宁缺毋滥，等待高质量 Pitch</div></div>';
+        posBox.innerHTML = '<div class="empty-hero"><div class="ico">' + (IC.bar || '') + '</div><div class="tx">'+(recorded?'历史审批组合当前空仓':'尚无历史审批组合记录')+'</div>' +
+          '<div class="sub">实时AI虚拟账户的持仓与委托请查看实时模拟盘。研究候选不会自动计入本页持仓。</div></div>';
       } else {
         function posCard(p, state) {
           var src = p.source === 'deck' ? '程序' : '人工';

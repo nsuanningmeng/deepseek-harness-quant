@@ -28,15 +28,16 @@
 
   function renderBar(bar, td, pd) {
     var th = td.temp_hist || [], wh = td.width_hist || [], ch = td.crowd_hist || [], sh = td.score_hist || [];
-    var temp = last(th), width = last(wh), crowd = last(ch), score = last(sh);
+    var sentiment = td.sentiment && td.sentiment.score;
+    var width = last(wh), breadth=td.breadth || {}, crowd = td.crowding && td.crowding.pctile_unit === 'fraction' ? td.crowding.pctile : td.crowd_hist_unit === 'fraction' ? last(ch) : null, score = last(sh);
     var pools = (pd && pd.pools) || {};
     var opp = (pools.opp_pool && pools.opp_pool.n != null) ? pools.opp_pool.n : '—';
     var pitch = (pools.pitch && pools.pitch.n != null) ? pools.pitch.n : '—';
     // 彭博式条目（红=机会 绿=风险）
     var items = [
       ['择时', score != null ? score.toFixed(1) : '—', score != null ? (score >= 70 ? '#ff4d4f' : (score >= 55 ? '#faad14' : '#52c41a')) : '#64748b'],
-      ['温度', temp != null ? temp.toFixed(1) + '/100' : '—', temp != null ? (temp <= 30 ? '#ff4d4f' : (temp <= 60 ? '#faad14' : '#52c41a')) : '#64748b'],
-      ['宽度', width != null ? (width * 100).toFixed(0) + '%' : '—', width != null ? (width <= 0.2 ? '#ff4d4f' : '#38bdf8') : '#64748b'],
+      ['情绪评分', sentiment != null ? Number(sentiment).toFixed(1) + '/100' : '尚未核验', '#38bdf8'],
+      [breadth.score != null?'宽度评分':'宽度', breadth.score != null ? Number(breadth.score).toFixed(1)+'/100' : width != null ? (width * 100).toFixed(0) + '%' : '尚未核验', '#38bdf8'],
       ['拥挤度', crowd != null ? (crowd * 100).toFixed(1) + '%' : '—', crowd != null ? (crowd >= 0.8 ? '#ff4d4f' : (crowd >= 0.5 ? '#faad14' : '#52c41a')) : '#64748b'],
       ['机会', opp, '#ff4d4f'],
       ['Pitch', pitch, '#ff4d4f']
@@ -58,8 +59,8 @@
 
   function loadBar(bar) {
     Promise.all([
-      fetch('/api/live/timing_dash').then(function (r) { return r.json(); }),
-      fetch('/api/live/portal_dash').then(function (r) { return r.json(); })
+      LW.api.get('/api/live/timing_dash',{bypass:true,staleFallback:false}),
+      LW.api.get('/api/live/portal_dash',{bypass:true,staleFallback:false})
     ]).then(function (res) {
       renderBar(bar, res[0] || {}, res[1] || {});
     }).catch(function () {});
@@ -69,18 +70,13 @@
   var rotators = document.querySelectorAll('.lt-rotator');
   function loadRotator(rot) {
     var items = [];
-    fetch('/api/live/brief').then(function (r) { return r.json(); }).then(function (d) {
+    LW.api.get('/api/live/brief',{staleFallback:false}).then(function (d) {
       items = (d && d.items) || [];
-      fetch('/api/live/alerts').then(function (r) { return r.json(); }).then(function (a) {
+      LW.api.get('/api/live/alerts',{staleFallback:false}).then(function (a) {
         var al = (a && a.alerts) || [];
         al.forEach(function (x) {
           if (false && x.level === 'high') items.unshift({ cat: '告警 ' + x.cat, msg: x.msg, level: 'high' });
         });
-        // 倒计时项置顶（T+5 复核 08-14）
-        var t5 = daysTo('2026-08-14');
-        if (t5 != null) {
-          items.unshift({ cat: 'T+5 复核', msg: t5 + ' 天后首批 5 只到期自动复核（08-14）', level: 'mid' });
-        }
         if (items.length) startRotate(rot, items);
       }).catch(function () {});
     }).catch(function () {});

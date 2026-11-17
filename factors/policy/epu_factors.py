@@ -27,7 +27,8 @@ sys.path.insert(0, str(BASE))
 import numpy as np
 import pandas as pd
 
-POLICY_DB = BASE / "data" / "cache" / "policy" / "epu.db"
+from factors.research_context import cache_dir, connect as research_connect
+POLICY_DB = cache_dir() / "policy" / "epu.db"
 
 # 因子族注册信息（供因子池 lifecycle 消费）
 EPU_FAMILY = {
@@ -48,7 +49,7 @@ EPU_FAMILY = {
 
 def load_epu_monthly() -> pd.DataFrame:
     """读 epu.db → DataFrame(index=YYYY-MM, cols=epu,epu_hl,epu_fiscal,epu_monetary)"""
-    con = sqlite3.connect(str(POLICY_DB))
+    con = research_connect(POLICY_DB)
     df = pd.read_sql_query("SELECT month, epu, epu_hl, epu_fiscal, epu_monetary FROM epu_monthly", con)
     con.close()
     df["month"] = pd.to_datetime(df["month"]).dt.strftime("%Y-%m")

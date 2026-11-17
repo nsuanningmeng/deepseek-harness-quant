@@ -15,6 +15,11 @@ quantstats>=0.0.81         # 绩效指标（实测通过）
 numpy>=1.26
 pandas>=2.2
 pyyaml>=6.0                # 读取 config/params.yaml
+requests>=2.31             # HTTP 数据源
+scipy>=1.11                # 因子统计
+tqdm>=4.66                 # 行情下载进度
+pyarrow>=14                # Parquet 行情缓存
+psutil>=5.9                # 跨平台进程与计划任务状态
 
 # ---- 可选 ----
 matplotlib>=3.8            # 图表

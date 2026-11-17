@@ -36,9 +36,11 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
-QD_DB = r"data\cache\finance_quality.db"
-FIN_DB = r"data\cache\finance.db"
+from factors.research_context import cache_dir, connect as research_connect, latest_published, universe, scope_metadata
+QD_DB = cache_dir() / "finance_quality.db"
+FIN_DB = cache_dir() / "finance.db"
 OUT = BASE / "logs" / "stock_risk_map_v2.json"   # v2（接入 Beneish 完整版 2026-08-09；v1 文件被外包占用锁）
 # ★2026-08-11 写保护免疫：固定名多次写被锁（实测 scan_all PermissionError）→ 每次写时间戳文件；
 #   读取端（deck_server /api/risk glob、portfolio._risk_map）取最新；固定名仅首写兼容
@@ -67,21 +69,14 @@ RED_FLAGS = {
 
 
 def _conn_qd():
-    return sqlite3.connect(QD_DB)
+    return research_connect(QD_DB)
 
 
 def latest_period(con) -> str:
     """取"最新且覆盖≥1000 只"的报告期（2026-08-09 修复：原逻辑在最新期<1000 时
     回退到"覆盖最全期"=2024-06-30，但 2026-03-31 已覆盖 1767 只 → 直接取最新覆盖期，时效性+2 年）"""
-    r = con.execute(
-        "SELECT period FROM quality WHERE period < '2026-07-01' "
-        "GROUP BY period HAVING COUNT(*) >= 1000 ORDER BY period DESC LIMIT 1").fetchone()
-    if r:
-        return r[0]
-    r = con.execute(
-        "SELECT period, COUNT(*) c FROM quality WHERE period < '2026-07-01' "
-        "GROUP BY period ORDER BY c DESC LIMIT 1").fetchone()
-    return r[0] if r else None
+    row = con.execute("SELECT MAX(period) FROM quality WHERE period <= date('now')").fetchone()
+    return row[0] if row and row[0] else None
 
 
 def _check_row(code: str, period: str, roe, gp, cr, liab, cfo, m_level: str = None) -> dict:
@@ -93,6 +88,12 @@ def _check_row(code: str, period: str, roe, gp, cr, liab, cfo, m_level: str = No
                 "flags": [{"id": "dirty_data", "desc": "质量数据口径异常（待主服务器恢复重拉）",
                            "weight": 0, "raw": {"liab": liab, "gp": gp}}],
                 "period": period}
+    import math
+    values = {"roe": roe, "gp_margin": gp, "current_ratio": cr, "liability": liab, "cfo": cfo}
+    missing = [k for k, v in values.items() if v is None or not math.isfinite(float(v))]
+    if len(missing) == len(values):
+        return {"code": code, "score": None, "level": "NO_DATA", "flags": [], "period": period,
+                "missing": missing, "ready": False}
     flags = []
     score = 0
     for fid, spec in RED_FLAGS.items():
@@ -121,22 +122,20 @@ def _check_row(code: str, period: str, roe, gp, cr, liab, cfo, m_level: str = No
         flags = [f for f in flags if f["id"] != "r4_roe_no_cfo"]
     score = min(score, 100)
     level = "PASS" if score < 40 else ("WATCH" if score < 60 else "BLOCK")
-    return {"code": code, "score": score, "level": level, "flags": flags, "period": period}
+    return {"code": code, "score": score, "level": level if not missing else ("BLOCK" if level == "BLOCK" else "WATCH"),
+            "flags": flags, "period": period, "missing": missing, "ready": not missing,
+            "beneish_available": m_level is not None}
 
 
 def check_one(code: str) -> dict:
     """单只股票风控检查 → {code, score, level, flags[], period}"""
-    con = _conn_qd()
-    period = latest_period(con)
-    row = con.execute(
-        "SELECT roe_avg, gp_margin, current_ratio, liability_to_asset, cfo_to_np "
-        "FROM quality WHERE code=? AND period=?",
-        (code, period)).fetchone()
-    con.close()
-    if not row:
-        return {"code": code, "score": None, "level": "NO_DATA",
-                "flags": [{"id": "no_data", "desc": "质量数据未覆盖", "weight": 0}],
-                "period": period}
+    df = latest_published(QD_DB, "quality", datetime.now().strftime("%Y-%m-%d"))
+    df = df[df["code"] == code]
+    if df.empty:
+        return {"code": code, "score": None, "level": "NO_DATA", "flags": [], "period": None}
+    rec = df.iloc[0]
+    row = tuple(rec[c] for c in ("roe_avg", "gp_margin", "current_ratio", "liability_to_asset", "cfo_to_np"))
+    period = rec["period"]
     # R6：Beneish M-Score（★2026-08-09 升级：优先完整版 beneish_full（本地三表 8 指标），
     #   失败/无数据时回落降级版 risk.beneish；两者均无 → None 跳过 R6）
     m_level = None
@@ -146,24 +145,16 @@ def check_one(code: str) -> dict:
         m_level = br.get("level") if br and br.get("m_score") is not None else None
     except Exception:
         m_level = None
-    if m_level is None:
-        try:
-            from risk.beneish import check_one as beneish_check
-            br = beneish_check(code)
-            m_level = br.get("level") if br and br.get("m_score") is not None else None
-        except Exception:
-            m_level = None
     return _check_row(code, period, *row, m_level=m_level)
 
 
 def scan_all(limit: int = None) -> dict:
     """全市场批量（单连接一次取全部，高效稳定）"""
-    con = _conn_qd()
-    period = latest_period(con)
-    rows = con.execute(
-        "SELECT code, roe_avg, gp_margin, current_ratio, liability_to_asset, cfo_to_np "
-        "FROM quality WHERE period=?", (period,)).fetchall()
-    con.close()
+    df = latest_published(QD_DB, "quality", datetime.now().strftime("%Y-%m-%d"))
+    df = df[df["code"].isin(universe())]
+    if df.empty:
+        raise ValueError("研究池没有已公告质量数据，未生成空风控报告")
+    rows = list(df[["code", "period", "roe_avg", "gp_margin", "current_ratio", "liability_to_asset", "cfo_to_np"]].itertuples(index=False, name=None))
     # R6：Beneish 批量映射（★优先完整版 beneish_full 全量报告，回落降级版 compute_map）
     m_map = {}
     try:
@@ -173,21 +164,16 @@ def scan_all(limit: int = None) -> dict:
                  if x.get("m_score") is not None}
     except Exception:
         pass
-    if not m_map:
-        try:
-            from risk.beneish import compute_map
-            m_map = {k: v.get("level") for k, v in compute_map().items() if v.get("m_score") is not None}
-        except Exception:
-            m_map = {}
     if limit:
         rows = rows[:limit]
     results = [_check_row(code, period, roe, gp, cr, liab, cfo, m_level=m_map.get(code))
-               for code, roe, gp, cr, liab, cfo in rows]
+               for code, period, roe, gp, cr, liab, cfo in rows]
     results.sort(key=lambda x: -(x["score"] or -1))
     stats = {"total": len(results), "PASS": 0, "WATCH": 0, "BLOCK": 0, "NO_DATA": 0}
     for r in results:
         stats[r["level"]] = stats.get(r["level"], 0) + 1
-    out = {"date": datetime.now().strftime("%Y-%m-%d"), "stats": stats, "results": results}
+    out = {"date": datetime.now().strftime("%Y-%m-%d"), "stats": stats, "results": results, "research_scope": scope_metadata(),
+           "status": "ready" if all(r.get("ready") and r.get("beneish_available") for r in results) else "limited"}
     OUT.parent.mkdir(parents=True, exist_ok=True)
     # ★2026-08-11 写保护免疫：时间戳文件主写（读取方 glob 取最新）；固定名失败不阻断（可能被锁）
     # ★2026-08-14 #429 幂等：quality 表未更新时本次结果与上次相同 → 跳过写时间戳文件
@@ -207,11 +193,11 @@ def scan_all(limit: int = None) -> dict:
         _unchanged = False
     if not _unchanged:
         try:
-            OUT_TS.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+            OUT_TS.write_text(json.dumps(json_safe(out), ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception:
             pass
     try:
-        OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+        OUT.write_text(json.dumps(json_safe(out), ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception:
         pass
     return out
@@ -231,7 +217,7 @@ def main():
     args = ap.parse_args()
     if args.code:
         r = check_one(args.code)
-        print(json.dumps(r, ensure_ascii=False, indent=1))
+        print(json.dumps(json_safe(r), ensure_ascii=False, indent=1))
     elif args.scan:
         r = scan_all()
         print(f"全市场风控扫描: {r['stats']}")

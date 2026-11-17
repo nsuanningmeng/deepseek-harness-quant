@@ -21,6 +21,43 @@ import yaml
 from autotrade.models import D
 
 
+@lru_cache(maxsize=1)
+def _reviewed_symbol_boards():
+    """Exact reviewed code changes, separate from account quantity/risk policy.
+
+    The example is the reviewed baseline, as for _reviewed_boundaries. A local
+    copy can disable entries but cannot accidentally authorize additional codes
+    or a different board. Changing the reviewed files requires a code reload.
+    No listing date, limit percentage or trading authorization is supplied here.
+    """
+    root = Path(__file__).resolve().parents[1] / "config"
+    baseline_path = root / "security_board_overrides.yaml.example"
+    active_path = root / "security_board_overrides.yaml"
+    try:
+        baseline = yaml.safe_load(baseline_path.read_text(encoding="utf-8"))
+        active = yaml.safe_load(active_path.read_text(encoding="utf-8")) if active_path.exists() else baseline
+        if (not isinstance(baseline, dict) or not isinstance(active, dict) or
+                baseline.get("schema_version") != 1 or active.get("schema_version") != 1):
+            raise ValueError("invalid identity schema")
+        reviewed, selected = baseline["overrides"], active["overrides"]
+        if not isinstance(reviewed, dict) or not isinstance(selected, dict):
+            raise ValueError("invalid identity mapping")
+        for symbol, entry in reviewed.items():
+            if (not isinstance(symbol, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", symbol)
+                    or not isinstance(entry, dict) or entry.get("security_type") != "ordinary_a_share"
+                    or entry.get("board") not in {"MAIN", "CHINEXT", "STAR", "BSE"}
+                    or not isinstance(entry.get("sources"), list) or not entry["sources"]
+                    or any(not isinstance(source, str) or not source.startswith("https://disc.static.szse.cn/")
+                           for source in entry["sources"])):
+                raise ValueError("invalid reviewed identity")
+        for symbol, entry in selected.items():
+            if symbol not in reviewed or entry != reviewed[symbol]:
+                raise ValueError("unreviewed identity override")
+        return MappingProxyType({symbol: entry["board"] for symbol, entry in selected.items()})
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
+        raise ValueError("invalid_reviewed_security_board_overrides") from None
+
+
 def board_for_symbol(symbol: str) -> str:
     """Recognize only the ordinary A-share code families supported by this engine."""
     if not isinstance(symbol, str):
@@ -33,6 +70,9 @@ def board_for_symbol(symbol: str) -> str:
         return "STAR"
     if re.fullmatch(r"(?:43|83|87|88|92)[0-9]{4}\.BJ", symbol):
         return "BSE"
+    reviewed = _reviewed_symbol_boards()
+    if symbol in reviewed:
+        return reviewed[symbol]
     raise ValueError("only recognized ordinary A-share symbols are supported")
 
 

@@ -39,6 +39,12 @@ QMT/XtQuant 已实现连接、查询、回调、对账和受控提交/撤单代�
 
 新用户直接走 [一键部署](docs/一键部署.md)。接入 AI API 后，数据源、配置、验证全交给 AI 向导，不必读本页其余内容。
 
+## 盘中实时模拟与状态核验
+
+[PaperLive 操作说明](paperlive/README.md)涵盖双角色提案、独立风控、实时盘口撮合和 macOS 服务。查看 `/paperlive` 上的激活条件，在本机按 `config/paperlive.yaml.example` 准备部署配置与服务凭据。两种模拟系统各自使用独立账本。
+
+安装 Python 项目依赖后，使用 `npm --prefix harness ci` 安装 HARNESS 的 Node.js 依赖，再运行 `python validation/run_isolated_tests.py` 完成隔离回归。研究及历史分钟数据按数据接入说明自行获取。
+
 ## 接入 DeepSeek API
 
 接入 API 后，语言模型接管驱动层。控制、挖因子、审计、魔改，全部解锁。不接入，则只有写死引擎，没有 AI。

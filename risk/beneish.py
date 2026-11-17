@@ -43,8 +43,9 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-QD_DB = r"data\cache\finance_quality.db"
-FIN_DB = r"data\cache\finance.db"
+from factors.research_context import cache_dir, connect as research_connect
+QD_DB = cache_dir() / "finance_quality.db"
+FIN_DB = cache_dir() / "finance.db"
 OUT = BASE / "logs" / "beneish_report.json"
 
 # 阈值（需求指定）
@@ -57,14 +58,14 @@ COEF = {"dsri": 0.920, "gmi": 0.528, "aqi": 0.404, "sgi": 0.892,
 
 
 def _conn(db):
-    return sqlite3.connect(db)
+    return research_connect(db)
 
 
 def _latest_two_periods() -> list:
     """quality 表最新两个覆盖期（最新期覆盖≥1000 才作为 cur；否则用覆盖最全两期）"""
     con = _conn(QD_DB)
     rows = con.execute(
-        "SELECT period, COUNT(*) FROM quality WHERE period < '2026-07-01' "
+        "SELECT period, COUNT(*) FROM quality WHERE period <= date('now') "
         "GROUP BY period ORDER BY period DESC").fetchall()
     con.close()
     if not rows:

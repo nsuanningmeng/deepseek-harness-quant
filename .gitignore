@@ -35,7 +35,8 @@ data/trash/
 # ---- 运行产物 ----
 logs/
 output/
-report/
+/report/*
+!/report/daily_signal.py
 deck/dashboard_*_20*.html
 deck/*.json
 
@@ -62,3 +63,9 @@ harness/home/profiles/node_modules/
 # ---- 内部维护文档（含本机路径，不进公开仓库） ----
 docs/上传GitHub.md
 docs/发布清单_v1.0.9.md
+
+# ---- Private PaperLive and research artifacts ----
+/config/paperlive.yaml
+/data/research/financials/
+/harness/home/storages/
+/docs/*交接*

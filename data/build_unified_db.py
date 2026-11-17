@@ -22,7 +22,10 @@ from datetime import datetime
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
-CACHE = Path(r"data/cache")
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+from data.cache import CACHE_DIR
+CACHE = CACHE_DIR
 UNIFIED = CACHE / "unified.db"
 OLD_FP = CACHE / "factor_pitch_perf.db"
 REPORT = BASE / "report"
@@ -117,34 +120,23 @@ def build_macro_series(con):
         PRIMARY KEY (series, period))""")
     con.execute("DELETE FROM macro_series")
     n = 0
-    for dbn, tbl, series_map in [
-        ("macro.db", "social_finance", {"social_finance": "sf_increment"}),
-        ("macro.db", "bond_yield", {"bond_yield": "y10"}),
-    ]:
-        p = CACHE / dbn
-        if not p.exists():
-            continue
-        try:
-            src = sqlite3.connect(f"file:{p}?mode=ro&immutable=1", uri=True)
-            for series, col in series_map.items():
-                for row in src.execute(f"SELECT {col} FROM {tbl}").fetchall():
-                    if row[0] is not None:
-                        con.execute("INSERT OR REPLACE INTO macro_series VALUES (?,?,?)",
-                                    (series, row[0], row[0]))
-            # bond_yield 存 y10+y2 两列 → 按列展开
-            if tbl == "bond_yield":
-                for r in src.execute("SELECT * FROM bond_yield").fetchall():
-                    if r[1] is not None:
-                        con.execute("INSERT OR REPLACE INTO macro_series VALUES (?,?,?)",
-                                    ("y10", r[0], r[1]))
-                        n += 1
-                    if r[2] is not None:
-                        con.execute("INSERT OR REPLACE INTO macro_series VALUES (?,?,?)",
-                                    ("y2", r[0], r[2]))
-                        n += 1
-            src.close()
-        except Exception:
-            pass
+    sources = [
+        (CACHE / 'macro.db', 'social_finance', 'month', {'social_finance': 'sf_increment'}),
+        (CACHE / 'macro.db', 'bond_yield', 'date', {'y10': 'y10', 'y2': 'y2'}),
+        (CACHE / 'policy/epu.db', 'epu_monthly', 'month', {'epu': 'epu'}),
+    ]
+    for path, table, date_col, columns in sources:
+        if not path.exists():
+            raise ValueError('宏观源库缺失: ' + path.name)
+        with sqlite3.connect(f'file:{path}?mode=ro', uri=True) as source:
+            for series, column in columns.items():
+                rows = [(series, str(day), value) for day, value in source.execute(
+                    f'SELECT {date_col},{column} FROM {table}') if value is not None]
+                if not rows:
+                    raise ValueError('宏观序列为空: ' + series)
+                con.executemany('INSERT OR REPLACE INTO macro_series VALUES (?,?,?)', rows)
+                n += len(rows)
+
     return n
 
 
@@ -199,8 +191,18 @@ def build_minute_factors(con):
     con.execute("""CREATE TABLE IF NOT EXISTS minute_factors (
         name TEXT PRIMARY KEY, size_bytes INTEGER, mtime TEXT, note TEXT)""")
     con.execute("DELETE FROM minute_factors")
-    root = Path(r"data/minute")
+    root = BASE / "data/minute"
     n = 0
+    actual = CACHE / 'minute.db'
+    if actual.exists():
+        with sqlite3.connect(f'file:{actual}?mode=ro', uri=True) as source:
+            count, latest, symbols = source.execute('SELECT COUNT(*), MAX(trade_time),COUNT(DISTINCT code) FROM minute_5m').fetchone()
+        if not count:
+            raise ValueError('Tushare 5分钟行情库为空')
+        con.execute('INSERT OR REPLACE INTO minute_factors VALUES (?,?,?,?)',
+                    ('minute.db::minute_5m', actual.stat().st_size, str(latest),
+                     f'Tushare 历史5分钟已下载 {symbols} 只股票、{count} 行；完整性另见初始化覆盖记录，不能用于还原1分钟竞价'))
+        n += 1
     for f in root.glob("*.parquet"):
         try:
             con.execute("INSERT OR REPLACE INTO minute_factors VALUES (?,?,?,?)",
@@ -234,9 +236,9 @@ def build_dual_source(con):
     con.execute("DELETE FROM dual_source")
     n = 0
     for grp, dbn, tbl, date_col, note in [
-        ("finance", "finance.db", "finance_report", "period", "baostock 单季（旧）"),
+        ("finance", "finance.db", "finance_report", "period", "Tushare三表派生单季；实际公告日期"),
         ("finance", "finance_ts.db", "financials_ts", "ann_date", "Tushare 三表 PIT（新）"),
-        ("quality", "finance_quality.db", "quality", None, "质量表（baostock/tushare 双源写入）"),
+        ("quality", "finance_quality.db", "quality", None, "Tushare财务指标与三表派生质量；同源兼容表，不是独立双源验证"),
     ]:
         p = CACHE / dbn
         if not p.exists():
@@ -273,6 +275,8 @@ def main():
             for row in old.execute(f"SELECT * FROM {tbl}"):
                 con.execute(f"INSERT INTO {tbl} VALUES ({','.join('?'*len(cols))})", row)
         old.close()
+    if not OLD_FP.exists():
+        raise ValueError("因子前向归因库尚未初始化")
     n_fp = con.execute("SELECT COUNT(*) FROM factor_pitch").fetchone()[0]
     # ★2026-08-14 Phase2：基础整合层
     n_macro = build_macro_series(con)
@@ -280,7 +284,18 @@ def main():
     n_min = build_minute_factors(con)
     n_dual = build_dual_source(con)
     con.commit()
+    table_counts = {name: con.execute(f'SELECT COUNT(*) FROM [{name}]').fetchone()[0]
+                    for name in ('asset_inventory', 'data_lineage', 'factor_pitch', 'factor_agg',
+                                 'macro_series', 'event_series', 'minute_factors', 'dual_source')}
     con.close()
+    from autotrade.monitoring import atomic_json
+    bootstrap = json.loads((BASE / 'runtime/research/bootstrap-manifest.json').read_text())
+    atomic_json(BASE / 'runtime/research/unified-manifest.json', {
+        'status': 'complete', 'data_date': bootstrap['coverage']['daily']['end'],
+        'source': 'verified-local-research-cache', 'database': 'data/cache/unified.db',
+        'tables': table_counts,
+        'note': '市场知识库随后向本库增加独立快照表；前向因子表可以已初始化但尚无到期样本。',
+    })
     print(f"✅ unified.db 建成: {UNIFIED}")
     print(f"  asset_inventory {n_inv} 行 | data_lineage {n_line} 库 | factor_pitch {n_fp} 行")
     print(f"  ★Phase2: macro_series {n_macro} | event_series {n_event} | minute_factors {n_min} | dual_source {n_dual}")

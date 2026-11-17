@@ -1,6 +1,12 @@
-# DSHQuant × DeepSeek HARNESS 宿主组合补丁层
-# 通过 insert 追加量化桥接插件（loader patch 语义：insert 到根 entry list）
-# 相对路径以本文件所在目录（DSH_HOME/profiles/web/）为基准
 - insert:
-    - id: dsq-quant-bridge
-      name: ./plugins/dsq-quant-bridge.js
+  - id: dsq-quant-bridge
+    name: ./plugins/dsq-quant-bridge.js
+- id: session-telemetry-otel
+  disabled: true
+- id: directory-picker
+  disabled: true
+- insert:
+  - id: directory-picker-browse
+    name: '@deepseek-ai/dsh-host-directory-picker-browse'
+  - id: directory-picker-browse-ui
+    name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'

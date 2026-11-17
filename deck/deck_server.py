@@ -23,6 +23,7 @@ API：
   GET  /api/sim         → logs/sim_tracks.json         模拟盘双轨
 """
 import json
+import logging
 import re
 
 # ★2026-08-13 黑框隐藏（总指挥要求：计划任务/常驻进程不弹黑框，运行完自动关闭不留窗）
@@ -39,8 +40,14 @@ import sys
 import threading
 import time
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
+
+
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    # A page loads several assets and APIs alongside the local status probes.
+    request_queue_size = 64
+
 
 BASE = Path(__file__).resolve().parent.parent
 LOGS = BASE / "logs"
@@ -156,12 +163,8 @@ def _resolve_route(path: str) -> Path:
     if pat:
         # ★排除测试/归档文件（test/done/calib 等），取真实产出最新
         # ★2026-08-12 百轮后#124：改 mtime 排序（文件名 ASCII 排序会被 _v2 后缀干扰）
-        matches = [m for m in sorted(LOGS.glob(pat), key=lambda x: x.stat().st_mtime)
+        matches = [m for m in sorted(f.parent.glob(pat), key=lambda x: x.stat().st_mtime)
                    if not any(t in m.name for t in ("test", "done", "calib", "_old"))]
-        if not matches and str(f).startswith(str(OUTPUT)):
-            # ★2026-08-10 产出在 output/ 的路径（daily_signal 等）也搜 output 目录
-            matches = [m for m in sorted(OUTPUT.glob(pat), key=lambda x: x.stat().st_mtime)
-                       if not any(t in m.name for t in ("test", "done", "calib", "_old"))]
         if matches:
             return matches[-1]
     # ★2026-08-11 审批链路修复：/api/pool 读最新含 pitch 的 opp_pool_*.json（原固定名 opportunity_pool.json 是 08-08 旧数据）
@@ -172,6 +175,83 @@ def _resolve_route(path: str) -> Path:
         return f
     return f
 
+
+
+def _harness_status() -> dict:
+    """只读探测 HARNESS 实际在线状态；研究任务记录仍以已有快照为准。"""
+    from datetime import timedelta, timezone
+    import urllib.request
+
+    updated_at = datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+    snapshot = {}
+    snapshot_path = BASE / "output" / "harness_state.json"
+    if snapshot_path.is_file():
+        try:
+            stored = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            if isinstance(stored, dict):
+                snapshot = stored
+        except (ValueError, OSError):
+            pass
+    out = {key: snapshot[key] for key in ("goal", "rounds", "links") if key in snapshot}
+    package = {}
+    package_path = BASE / "harness" / "node_modules" / "@deepseek-ai" / "dsh" / "package.json"
+    try:
+        loaded_package = json.loads(package_path.read_text(encoding="utf-8"))
+        if isinstance(loaded_package, dict):
+            package = loaded_package
+    except (ValueError, OSError):
+        pass
+    settings = {}
+    home = BASE / "harness" / "home"
+    try:
+        import yaml
+        loaded = yaml.safe_load((home / "settings.yaml").read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            settings = loaded
+    except Exception:
+        pass
+    selected = settings.get("agent-default-model") or {}
+    selected = selected if isinstance(selected, dict) else {}
+    provider, model = selected.get("provider"), selected.get("model")
+    provider = provider if isinstance(provider, str) else None
+    model = model if isinstance(model, str) else None
+    adapter = settings.get("llm-pi-ai") or {}
+    providers = adapter.get("providers") if isinstance(adapter, dict) else {}
+    providers = providers if isinstance(providers, dict) else {}
+    provider_config = providers.get(provider) or {}
+    env_name = provider_config.get("apiKeyEnv") if isinstance(provider_config, dict) else None
+    env_name = env_name if isinstance(env_name, str) else None
+    root_ids, online = [], False
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        with opener.open(urllib.request.Request("http://127.0.0.1:3080/quant/agents",
+                                               headers={"Accept": "application/json"}), timeout=2) as response:
+            if response.headers.get_content_type() == "application/json":
+                live = json.loads(response.read().decode("utf-8"))
+                if isinstance(live, dict) and live.get("ok") is True and isinstance(live.get("rootIds"), list):
+                    root_ids = [value for value in live["rootIds"] if isinstance(value, str)]
+                    online = True
+    except Exception:
+        pass
+    name = package.get("name") or "HARNESS"
+    version = package.get("version")
+    out.update({
+        "harness": {"online": online, "name": name, "rev": version, "updated_at": updated_at,
+                    "status": "online" if online else "unreachable", "root_sessions": len(root_ids)},
+        "agent": {"model": f"{provider}/{model}" if provider and model else model,
+                  "provider": provider, "session_id": root_ids[0] if root_ids else None,
+                  "framework": f"{name} {version}" if version else name,
+                  "role": "根会话" if root_ids else "尚无根会话", "updated_at": updated_at,
+                  "credentials_file_present": (home / ".credentials.yaml").is_file(),
+                  "credential_environment_present": bool(env_name and os.environ.get(env_name))},
+        "requiresSession": online and not root_ids,
+    })
+    return out
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -219,8 +299,77 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         return json.loads(self.rfile.read(n).decode("utf-8"))
 
+    def _proxy_harness(self, path: str, method: str):
+        """兼容控制页旧路由；上游 SPA/登录页不能冒充成功的 JSON API。"""
+        import urllib.error
+        import urllib.request
+
+        relative = path[len("/api/proxy/"):]
+        for legacy, native in (("quantapi/", "quant/"), ("niuapi/", "quant/niu/")):
+            if relative.startswith(legacy):
+                relative = native + relative[len(legacy):]
+                break
+        if relative in {"quant/unlock", "quant/delete", "quant/delete-batch", "quant/clear-all", "quant/restore-all"}:
+            return self._send_json({"ok": False, "error": "当前 HARNESS 桥接不支持此会话管理操作，请使用原生会话界面"}, 501)
+        target = "http://127.0.0.1:3080/" + relative
+        if "?" in self.path:
+            target += "?" + self.path.split("?", 1)[1]
+        body = None
+        if method == "POST":
+            try:
+                body = json.dumps(self._read_json()).encode("utf-8")
+            except (ValueError, UnicodeError):
+                return self._send_json({"ok": False, "error": "请求正文必须为 JSON"}, 400)
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        # 固定回环地址，绕过系统外网代理；不跟随可能离开本机的重定向。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        request = urllib.request.Request(target, data=body, method=method,
+                                         headers={"Accept": "application/json", "Content-Type": "application/json"})
+        try:
+            try:
+                response = opener.open(request, timeout=60 if method == "POST" else 40)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                content_type = response.headers.get_content_type()
+                raw = response.read()
+                if content_type != "application/json" and not content_type.endswith("+json"):
+                    return self._send_json({"ok": False, "error": "HARNESS 未返回 JSON：接口不存在、尚未加载或需要在原生界面完成登录",
+                                            "upstream_status": response.code, "upstream_content_type": content_type},
+                                           response.code if response.code >= 400 else 502)
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                except (ValueError, UnicodeError):
+                    return self._send_json({"ok": False, "error": "HARNESS 返回了无效 JSON", "upstream_status": response.code}, 502)
+                return self._send_json(data, response.code)
+        except Exception:
+            return self._send_json({"ok": False, "error": "HARNESS 服务暂不可达，请检查本机 3080 服务"}, 502)
+
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/api/research_update":
+            try:
+                from data.research_service import public_status
+                return self._send_json(public_status())
+            except Exception:
+                return self._send_json({"ok": False, "status": "unavailable", "error": "研究更新状态暂不可读"}, 503)
+        if path in ("/paperlive", "/paperlive.html"):
+            return self._v2_page("paperlive.html", "paper live page missing")
+        if path in ("/data-settings", "/data-settings.html"):
+            return self._v2_page("data-settings.html", "data settings page missing")
+        if path == "/api/paperlive/data-settings":
+            from paperlive.data_settings import public_settings
+            return self._send_json(public_settings())
+        if path == "/api/paperlive/state":
+            try:
+                from paperlive.runtime import read_state
+                return self._send_json(read_state())
+            except Exception as exc:
+                return self._send_json({"ok": False, "error": "实时模拟账户状态暂不可读：" + str(exc)[:150]}, 503)
         if path == "/api/portfolio":     # ★T-2：持仓（strategy/portfolio.py）
             try:
                 sys.path.insert(0, str(BASE))
@@ -265,13 +414,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/pitchtrack" or path == "/pitchtrack.html":   # ★2026-08-15 主观多池远期（5 池对比 + 牛散决策者分组）
             return self._v2_page("pitchtrack.html", "pitchtrack missing")
         if path == "/api/harness":   # ★2026-08-15 harness 状态快照（output/harness_state.json，agent 维护）
-            try:
-                _hs = BASE / "output" / "harness_state.json"
-                if _hs.exists():
-                    return self._send_json(json.loads(_hs.read_text(encoding="utf-8")))
-                return self._send_json({"harness": {"online": False}, "error": "harness_state.json 未生成"}, 404)
-            except Exception as e:
-                return self._send_json({"error": str(e)}, 500)
+            return self._send_json(_harness_status())
         if path == "/api/build_mode":   # ★2026-08-16 构建模式（dev=开发版徽章 / release=公测发布版无徽章；config/ui_build.json 驱动）
             try:
                 _bm = BASE / "config" / "ui_build.json"
@@ -323,31 +466,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "skills": skills, "presets": presets})
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
-        if path.startswith("/api/proxy/"):   # ★2026-08-16 反向代理 GET → :3080 HARNESS（前端同源访问，零跨源）
-            import urllib.request as _ur
-            import urllib.error as _ue
-            _tgt = "http://127.0.0.1:3080/" + path[len("/api/proxy/"):]
-            if "?" in self.path:
-                _tgt += "?" + self.path.split("?", 1)[1]
-            try:
-                _r = _ur.urlopen(_ur.Request(_tgt), timeout=40)
-                _data = _r.read()
-                try:
-                    return self._send_json(json.loads(_data.decode("utf-8")))
-                except Exception:
-                    self.send_response(_r.status)
-                    self.send_header("Content-Type", _r.headers.get("Content-Type", "application/json"))
-                    self.end_headers()
-                    self.wfile.write(_data)
-                    return
-            except _ue.HTTPError as e:
-                _d = e.read()
-                try:
-                    return self._send_json(json.loads(_d.decode("utf-8")), e.code)
-                except Exception:
-                    return self._send_json({"ok": False, "error": "proxy upstream " + str(e.code)}, e.code)
-            except Exception as e:
-                return self._send_json({"ok": False, "error": "proxy: " + str(e)}, 502)
+        if path.startswith("/api/proxy/"):
+            return self._proxy_harness(path, "GET")
         if path == "/api/subj_quant":   # ★2026-08-14 主观量化融合系统状态（标签+否决+胜率徽章）
             try:
                 sys.path.insert(0, str(BASE))
@@ -408,7 +528,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 sys.path.insert(0, str(BASE))
                 from backtest.bt_report import list_archives
-                return self._send_json({"ok": True, **list_archives()})
+                data = list_archives()
+                if not data.get("latest") and not data.get("history"):
+                    from deck.research_views import unavailable
+                    return self._send_json({**unavailable("尚无已完成并核验来源的历史研究或独立策略归档"), **data})
+                return self._send_json({"ok":True,"state":"ready","initialized":True,"ready":True,**data})
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
         if path == "/api/live/backtest_strategies":   # ★2026-08-16 回测策略目录（前端菜单动态生成：筛选/选择）
@@ -418,6 +542,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "strategies": list_strategies()})
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
+        if path == "/api/live/pitch_forward":
+            try:
+                from backtest.pitch_forward import public_status
+                return self._send_json(public_status())
+            except Exception:
+                logging.exception("Pitch forward status unavailable")
+                return self._send_json({"ok": False, "error": "前瞻模拟状态暂不可用"}, 503)
+        if path == "/api/live/pitch_scan":
+            try:
+                if str(BASE) not in sys.path:
+                    sys.path.insert(0, str(BASE))
+                from deck.pitch_scan_jobs import jobs
+                return self._send_json(jobs.status())
+            except Exception:
+                logging.exception("Pitch scan status unavailable")
+                return self._send_json({"ok": False, "error": "短线 Pitch 扫参状态暂不可用"}, 503)
         if path == "/api/live/backtest_run":   # ★2026-08-14 动态回测（因子页「回测」Tab 按参数即时跑）
             try:
                 import urllib.parse
@@ -495,18 +635,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, p.read_bytes() if p.exists() else b"page missing", "text/html; charset=utf-8")
         if path == "/api/system_live":   # ★2026-08-10 实时系统状态（动态聚合，dashboard_live.html 每 5s 轮询）
             try:
-                sys.path.insert(0, str(BASE / "deck"))
-                from system_live import collect
+                if str(BASE) not in sys.path:
+                    sys.path.insert(0, str(BASE))
+                from deck.system_live import collect
                 return self._send_json(collect())
             except Exception as e:
                 return self._send_json({"error": str(e)}, 500)
         if path == "/api/manual_update":   # ★2026-08-10 手动全域更新（POST；自动程序运行中自动拒绝）
-            try:
-                sys.path.insert(0, str(BASE))
-                from data.manual_update import start
-                return self._send_json(start())
-            except Exception as e:
-                return self._send_json({"error": str(e)}, 500)
+            return self._send_json({"ok":False,"error":"GET不启动研究任务，请从本机页面提交更新请求",
+                                    "update_endpoint":"/api/research_update","method":"POST"},405)
         if path == "/api/update_status":   # ★2026-08-10 手动更新状态（busy/上次结果/日志）
             try:
                 sys.path.insert(0, str(BASE))
@@ -567,6 +704,7 @@ class Handler(BaseHTTPRequestHandler):
                 or path == "/api/live/factor_ranking" \
                 or path == "/api/live/db_view" \
                 or path == "/api/live/factor_ui_pack" \
+                or path == "/api/live/minute" \
                 or path == "/api/live/rotation_calendar" \
                 or path == "/api/live/auction" \
                 or path == "/api/live/realtime" \
@@ -600,6 +738,7 @@ class Handler(BaseHTTPRequestHandler):
                       "factor_ranking": live_api.live_factor_ranking,
                       "db_view": live_api.live_db_view,
                       "factor_ui_pack": live_api.live_factor_ui_pack,
+                      "minute": live_api.live_minute,
                       "rotation_calendar": live_api.live_rotation_calendar,
                       "auction": live_api.live_auction,
                       "realtime": live_api.live_realtime,   # ★2026-08-14 盘中实时行情
@@ -693,6 +832,9 @@ class Handler(BaseHTTPRequestHandler):
             files = sorted(_glob.glob(str(BASE / "deck" / "dashboard_techpitch_*.html")), key=lambda x: Path(x).stat().st_mtime)
             p = Path(files[-1]) if files else BASE / "deck" / "dashboard_techpitch.html"
             return self._send(200, p.read_bytes() if p.exists() else b"dashboard_techpitch.html missing", "text/html; charset=utf-8")
+        if path == "/api/pool_hist":
+            from deck.research_views import opportunity_pool_history
+            return self._send_json(opportunity_pool_history())
         if path in ROUTES:
             f = _resolve_route(path)
             if f is None or not f.exists():
@@ -709,7 +851,8 @@ class Handler(BaseHTTPRequestHandler):
                 import glob as _gr
                 _fs = sorted(_gr.glob(str(BASE / "report" / "daily_report_*.md")), key=lambda x: Path(x).stat().st_mtime)
                 if not _fs:
-                    return self._send_json({"ok": False, "error": "日报未生成（等 19:00 自动化）"}, 404)
+                    return self._send_json({"ok":False,"state":"missing_data","initialized":False,"ready":False,
+                                            "error":"研究日报尚未生成，请等待本机研究更新流程完成"},404)
                 _md = Path(_fs[-1]).read_text(encoding="utf-8")
                 _date = re.search(r"daily_report_(\d{4}-\d{2}-\d{2})\.md", _fs[-1]).group(1) if re.search(r"daily_report_(\d{4}-\d{2}-\d{2})\.md", _fs[-1]) else ""
                 return self._send_json({"ok": True, "date": _date, "markdown": _md,
@@ -751,32 +894,106 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
-        if path.startswith("/api/proxy/"):   # ★2026-08-16 反向代理 POST → :3080（删除/批量/清空/发送全走这里）
-            import urllib.request as _ur
-            import urllib.error as _ue
-            _tgt = "http://127.0.0.1:3080/" + path[len("/api/proxy/"):]
+        if path == "/api/live/pitch_scan":
+            local_hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+            host = self.headers.get("Host")
+            if (host not in local_hosts or self.headers.get("Origin") != f"http://{host}"
+                    or self.headers.get("Sec-Fetch-Site") == "cross-site"):
+                return self._send_json({"ok": False, "error": "请从本机回测页面发起扫参"}, 403)
+            media_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if media_type != "application/json":
+                return self._send_json({"ok": False, "error": "请求需要 JSON"}, 415)
             try:
-                _body = self._read_json()
-                _req = _ur.Request(_tgt, data=json.dumps(_body).encode("utf-8"),
-                                   headers={"Content-Type": "application/json"})
-                _r = _ur.urlopen(_req, timeout=60)
-                _data = _r.read()
-                try:
-                    return self._send_json(json.loads(_data.decode("utf-8")))
-                except Exception:
-                    self.send_response(_r.status)
-                    self.send_header("Content-Type", _r.headers.get("Content-Type", "application/json"))
-                    self.end_headers()
-                    self.wfile.write(_data)
-                    return
-            except _ue.HTTPError as e:
-                _d = e.read()
-                try:
-                    return self._send_json(json.loads(_d.decode("utf-8")), e.code)
-                except Exception:
-                    return self._send_json({"ok": False, "error": "proxy upstream " + str(e.code)}, e.code)
-            except Exception as e:
-                return self._send_json({"ok": False, "error": "proxy: " + str(e)}, 502)
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= 8192:
+                    raise ValueError("扫参请求长度无效")
+                payload = self._read_json()
+            except (ValueError, UnicodeError):
+                return self._send_json({"ok": False, "error": "扫参请求正文无效"}, 400)
+            try:
+                if str(BASE) not in sys.path:
+                    sys.path.insert(0, str(BASE))
+                from deck.pitch_scan_jobs import jobs
+                result, code = jobs.start(payload)
+                return self._send_json(result, code)
+            except ValueError as exc:
+                return self._send_json({"ok": False, "error": str(exc)[:240]}, 400)
+            except Exception:
+                logging.exception("Pitch scan could not start")
+                return self._send_json({"ok": False, "error": "短线 Pitch 扫参暂不可用"}, 503)
+        if path in ("/api/research_update", "/api/manual_update"):
+            from urllib.parse import urlsplit
+            host = self.headers.get("Host")
+            local_hosts = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+            origin = self.headers.get("Origin")
+            try:
+                parsed = urlsplit(origin or "")
+            except ValueError:
+                return self._send_json({"ok": False, "error": "更新请求来源无效"}, 403)
+            if (host not in local_hosts or not origin or parsed.scheme != "http" or parsed.netloc != host
+                    or parsed.path or parsed.query or parsed.fragment or parsed.username or parsed.password
+                    or self.headers.get("Sec-Fetch-Site") == "cross-site"):
+                return self._send_json({"ok": False, "error": "请从本机研究页面发起更新"}, 403)
+            if self.headers.get("Content-Type", "").split(";",1)[0].strip().lower() != "application/json":
+                return self._send_json({"ok": False, "error": "请求需要 JSON"}, 415)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= 1024:
+                    raise ValueError("更新请求长度无效")
+                body = self._read_json()
+                if body != {} or not isinstance(body, dict):
+                    raise ValueError("研究更新仅接受空对象，不支持强制盘中或更换数据源参数")
+                from data.research_service import request_update
+                result = dict(request_update(body))
+                status = result.pop("http_status", 200)
+                return self._send_json(result, status)
+            except (ValueError, UnicodeError, TypeError) as exc:
+                return self._send_json({"ok": False, "error": str(exc)[:160]}, 400)
+            except Exception:
+                return self._send_json({"ok": False, "status": "unavailable", "error": "研究更新服务暂不可用，未启动旧数据任务"}, 503)
+        if path in ("/api/paperlive/data-settings", "/api/paperlive/data-settings/check"):
+            from urllib.parse import urlsplit
+            expected = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+            origin = self.headers.get("Origin")
+            if (self.headers.get("Host") not in expected or not origin
+                    or urlsplit(origin).scheme != 'http' or urlsplit(origin).netloc not in expected
+                    or urlsplit(origin).path or self.headers.get("Sec-Fetch-Site") == 'cross-site'):
+                return self._send_json({"ok": False, "error": "请从本机数据源设置页操作"}, 403)
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self._send_json({"ok": False, "error": "请求需要 JSON"}, 415)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= 4096:
+                    raise ValueError("设置请求长度无效")
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    raise ValueError("设置参数必须为对象")
+                from paperlive.data_settings import save_token, check_connection
+                return self._send_json(check_connection() if path.endswith('/check') else save_token(body))
+            except ValueError as exc:
+                return self._send_json({"ok": False, "error": str(exc)[:160]}, 409)
+            except Exception:
+                return self._send_json({"ok": False, "error": "本机数据源设置暂不可用"}, 503)
+        if path in ("/api/paperlive/order", "/api/paperlive/cancel"):
+            origin = self.headers.get("Origin")
+            allowed = {f"http://127.0.0.1:{self.server.server_port}", f"http://localhost:{self.server.server_port}"}
+            if origin and origin not in allowed:
+                return self._send_json({"ok": False, "error": "仅允许本机控制台操作虚拟账户"}, 403)
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                return self._send_json({"ok": False, "error": "请求需要 JSON"}, 415)
+            try:
+                body = self._read_json()
+                if not isinstance(body, dict):
+                    raise ValueError("委托参数必须为对象")
+                from paperlive.runtime import manual_order, cancel_order
+                result = manual_order(body) if path.endswith("/order") else cancel_order(body)
+                return self._send_json({"ok": True, "result": result})
+            except (ValueError, KeyError, TypeError) as exc:
+                return self._send_json({"ok": False, "error": str(exc)[:200]}, 409)
+            except Exception:
+                return self._send_json({"ok": False, "error": "实时模拟账户操作暂不可用"}, 503)
+        if path.startswith("/api/proxy/"):
+            return self._proxy_harness(path, "POST")
         if path == "/api/import/install":   # ★2026-08-16 导入 skill / agent 预设（assets → 运行库）
             try:
                 rec = self._read_json()
@@ -830,13 +1047,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True})
             except Exception as e:
                 return self._send_json({"ok": False, "error": str(e)}, 500)
-        if path == "/api/manual_update":   # ★2026-08-10 手动全域更新（POST 触发；自动程序运行中自动拒绝）
-            try:
-                sys.path.insert(0, str(BASE))
-                from data.manual_update import start
-                return self._send_json(start())
-            except Exception as e:
-                return self._send_json({"error": str(e)}, 500)
         if path == "/api/decide":
             try:
                 rec = self._read_json()

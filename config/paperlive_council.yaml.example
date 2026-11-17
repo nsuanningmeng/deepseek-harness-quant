@@ -1,0 +1,10 @@
+schema_version: 1
+enabled: true
+catalog_file: config/niu_personas.yaml
+analyst_id: fengliu
+reviewer_id: methodology
+max_decisions: 3
+max_response_tokens: 2000
+max_duration_seconds: 80
+# One extra syntax-only request shared by both roles; original deadlines stay fixed.
+max_format_retries: 1

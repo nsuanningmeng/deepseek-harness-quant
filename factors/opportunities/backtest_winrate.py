@@ -27,16 +27,19 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE))
+from factors.research_context import json_safe
 
 import numpy as np
 import pandas as pd
 
 from factors.opportunities.scan import triggers
 
-BARS_DB = r"data\cache\bars.db"
-FIN_DB = r"data\cache\finance.db"
-QD_DB = r"data\cache\finance_quality.db"
-BASIC_DB = r"data\cache\stock_basic.db"
+from factors.research_context import (cache_dir, read_bars, connect as research_connect,
+                                      universe, config as research_config, scope_metadata, valuations)
+BARS_DB = cache_dir() / "bars.db"
+FIN_DB = cache_dir() / "finance.db"
+QD_DB = cache_dir() / "finance_quality.db"
+BASIC_DB = cache_dir() / "stock_basic.db"
 OUT = BASE / "logs" / "opportunity_winrates.json"
 
 HORIZONS = {1: 1, 3: 3, 6: 6}          # 持有月数
@@ -65,34 +68,34 @@ def _disclose_date(period: str) -> date:
 
 def _load_all() -> tuple:
     """一次加载：日线（2018-06 起，窗口预留）、财报全量、质量全量、基础信息"""
-    con = sqlite3.connect(BARS_DB)
-    bars = pd.read_sql(
-        "SELECT code, date, open, close, volume, turn, is_st FROM daily_bar "
-        "WHERE adjust='qfq' AND date>='2009-06-01' "
-        "AND code NOT LIKE 'sh.%' AND code NOT LIKE 'sz.%'", con)
-    con.close()
+    bars = read_bars()
+    if bars.empty:
+        raise ValueError("研究范围没有日线数据")
     bars["date"] = pd.to_datetime(bars["date"])
     bars["code"] = bars["code"].astype("category")
 
-    con = sqlite3.connect(FIN_DB)
+    symbols = sorted(universe())
+    placeholders = ",".join("?" for _ in symbols)
+    code6 = [code[:6] for code in symbols]
+    con = research_connect(FIN_DB)
     fin = pd.read_sql(
-        "SELECT code, period, roe, sq_net_yoy, sq_rev_yoy FROM finance_report", con)
+        "SELECT code, period, pub_date, roe, sq_net_yoy, sq_rev_yoy FROM finance_report "
+        f"WHERE code IN ({placeholders})", con, params=code6)
     con.close()
-    fin["disclose"] = fin["period"].map(_disclose_date)
+    fin["disclose"] = pd.to_datetime(fin["pub_date"], errors="coerce")
     fin["period"] = pd.to_datetime(fin["period"])
     fin["disclose"] = pd.to_datetime(fin["disclose"])
 
-    con = sqlite3.connect(QD_DB)
+    con = research_connect(QD_DB)
     q = pd.read_sql(
         "SELECT code, period, pub_date, roe_avg, gp_margin, liability_to_asset, cfo_to_np "
-        "FROM quality", con)
+        f"FROM quality WHERE code IN ({placeholders})", con, params=symbols)
     con.close()
-    pub = q["pub_date"].fillna(q["period"])
-    q["pub"] = pd.to_datetime(pub, errors="coerce").fillna(pd.to_datetime(q["period"]))
+    q["pub"] = pd.to_datetime(q["pub_date"], errors="coerce")
     q["period"] = pd.to_datetime(q["period"])
 
-    con = sqlite3.connect(BASIC_DB)
-    basic = pd.read_sql("SELECT code, name, industry FROM stock_basic", con)
+    con = research_connect(BASIC_DB)
+    basic = pd.read_sql(f"SELECT code, name, industry FROM stock_basic WHERE code IN ({placeholders})", con, params=symbols)
     con.close()
     basic = basic.set_index("code")
 
@@ -164,7 +167,7 @@ def panel_from_pre(t: pd.Timestamp, pre: dict, fin_pit: dict, q_pit: dict,
                    st_codes: set, basic: pd.DataFrame) -> pd.DataFrame:
     """★预计算模式取面板：pre 全序列在 t 行取值 + 截面因子（财务/质量/估值/ST），
     与 compute_factors_pit 等价（等价性已验证 2026-08-09，触发数量一致）"""
-    f = pd.DataFrame(index=pre["close"].columns)
+    f = pd.DataFrame(index=pd.Index(pre["close"].columns.astype(str)))
     row = {k: v.loc[t] for k, v in pre.items()}
     f["close"] = row["close"]
     f["mom120"] = row["mom120"]
@@ -192,8 +195,8 @@ def panel_from_pre(t: pd.Timestamp, pre: dict, fin_pit: dict, q_pit: dict,
 
     qr = pd.DataFrame.from_dict(q_pit, orient="index")
     if not qr.empty:
-        f["liability"] = f.index.map(lambda c: qr["liab"].get(c))
-        f["cfo_to_np"] = f.index.map(lambda c: qr["cfo"].get(c))
+        f["liability"] = pd.to_numeric(f.index.map(lambda c: qr["liab"].get(c)), errors="coerce").astype(float)
+        f["cfo_to_np"] = pd.to_numeric(f.index.map(lambda c: qr["cfo"].get(c)), errors="coerce").astype(float)
         f["cfo_health"] = (f["cfo_to_np"] > 0).astype(int)
     else:
         f["liability"], f["cfo_to_np"], f["cfo_health"] = np.nan, np.nan, 0
@@ -201,11 +204,22 @@ def panel_from_pre(t: pd.Timestamp, pre: dict, fin_pit: dict, q_pit: dict,
     f["roe"] = pd.to_numeric(f["roe"], errors="coerce")
     f["sq_nyoy"] = pd.to_numeric(f["sq_nyoy"], errors="coerce")
     f["non_st"] = (~f.index.isin(st_codes)).astype(int)
+    f["non_lowprice"] = (f["close"] >= float(research_config()["min_price"])).astype(int)
     f["pb"] = np.nan
-    f["pe_ttm"] = 1.0
-    f["pb_pct"] = f["close"].rank(pct=True)
-    f["pe_pct"] = f["close"].rank(pct=True)
-    f["div_yield"] = 0.0
+    f["pe_ttm"] = np.nan
+    f["pb_pct"] = np.nan
+    f["pe_pct"] = np.nan
+    f["div_yield"] = np.nan
+    val = valuations(str(t)[:10])
+    if not val.empty:
+        val = val.set_index("code")
+        for col in ("pb", "pe_ttm"):
+            f[col] = pd.to_numeric(f.index.map(val[col]), errors="coerce").astype(float)
+        f["pb_pct"] = f["pb"].rank(pct=True)
+        f["pe_pct"] = f["pe_ttm"].where(f["pe_ttm"] > 0).rank(pct=True)
+        f["div_yield"] = pd.to_numeric(f.index.map(val["dv_ttm"]), errors="coerce").astype(float)
+    # Missing fundamentals do not become zero-valued members of a financial research universe.
+    f = f[f["code6"].isin(fr.index)]
     f = f.join(basic[["name", "industry"]], how="left")
     f["industry"] = f["industry"].fillna("未知")
     return f
@@ -216,8 +230,13 @@ def compute_factors_pit(px: pd.DataFrame, vx: pd.DataFrame,
                         basic: pd.DataFrame) -> pd.DataFrame:
     """PIT 版因子面板（输入为截至回测日的窗口数据；触发逻辑与 scan.py 完全一致）"""
     close = px.astype(float)
-    ret = close.pct_change()
-    f = pd.DataFrame(index=close.columns)
+    eligible = close.count() >= int(research_config()["min_history_days"])
+    close = close.loc[:, eligible]
+    vx = vx.reindex(columns=close.columns)
+    if close.empty:
+        return pd.DataFrame()
+    ret = close.pct_change(fill_method=None)
+    f = pd.DataFrame(index=pd.Index(close.columns.astype(str)))
 
     f["close"] = close.iloc[-1]
     f["mom120"] = (close.iloc[-1] / close.shift(120).iloc[-1] - 1)
@@ -252,8 +271,8 @@ def compute_factors_pit(px: pd.DataFrame, vx: pd.DataFrame,
 
     qr = pd.DataFrame.from_dict(q_pit, orient="index")
     if not qr.empty:
-        f["liability"] = f.index.map(lambda c: qr["liab"].get(c))
-        f["cfo_to_np"] = f.index.map(lambda c: qr["cfo"].get(c))
+        f["liability"] = pd.to_numeric(f.index.map(lambda c: qr["liab"].get(c)), errors="coerce").astype(float)
+        f["cfo_to_np"] = pd.to_numeric(f.index.map(lambda c: qr["cfo"].get(c)), errors="coerce").astype(float)
         f["cfo_health"] = (f["cfo_to_np"] > 0).astype(int)
     else:
         f["liability"], f["cfo_to_np"], f["cfo_health"] = np.nan, np.nan, 0
@@ -261,14 +280,25 @@ def compute_factors_pit(px: pd.DataFrame, vx: pd.DataFrame,
     f["roe"] = pd.to_numeric(f["roe"], errors="coerce")
     f["sq_nyoy"] = pd.to_numeric(f["sq_nyoy"], errors="coerce")
     f["non_st"] = (~f.index.isin(st_codes)).astype(int)
+    f["non_lowprice"] = (f["close"] >= float(research_config()["min_price"])).astype(int)
     # ★估值列（PIT 回测近似，2026-08-08 主程序 v1.1 引入真实估值后对齐）：
     #   历史 daily_basic 估值无本地缓存 → 用价格分位近似（与 scan.py 无估值数据时的
     #   降级语义一致）：pb 置 NaN（触发兜底不阻塞）、pe_ttm 置 1.0（正数满足 >0 检查）
     f["pb"] = np.nan
-    f["pe_ttm"] = 1.0
-    f["pb_pct"] = f["close"].rank(pct=True)
-    f["pe_pct"] = f["close"].rank(pct=True)
-    f["div_yield"] = 0.0
+    f["pe_ttm"] = np.nan
+    f["pb_pct"] = np.nan
+    f["pe_pct"] = np.nan
+    f["div_yield"] = np.nan
+    val = valuations(str(px.index[-1])[:10])
+    if not val.empty:
+        val = val.set_index("code")
+        for col in ("pb", "pe_ttm"):
+            f[col] = pd.to_numeric(f.index.map(val[col]), errors="coerce").astype(float)
+        f["pb_pct"] = f["pb"].rank(pct=True)
+        f["pe_pct"] = f["pe_ttm"].where(f["pe_ttm"] > 0).rank(pct=True)
+        f["div_yield"] = pd.to_numeric(f.index.map(val["dv_ttm"]), errors="coerce").astype(float)
+    # Missing fundamentals do not become zero-valued members of a financial research universe.
+    f = f[f["code6"].isin(fr.index)]
     f = f.join(basic[["name", "industry"]], how="left")
     f["industry"] = f["industry"].fillna("未知")
     return f
@@ -300,7 +330,7 @@ def _holding_stats(px: pd.Series, buy_i: int, buy_price: float,
             return None
         path = px.iloc[buy_i:sell_i + 1] / buy_price - 1
     else:
-        path = px.iloc[buy_i:] / buy_price - 1
+        return None  # Right censored: an unfinished holding period is not a calibration sample.
     # 脏数据防御：路径含 inf/NaN → 清理后长度不足即剔除
     path = path.replace([np.inf, -np.inf], np.nan).dropna()
     if len(path) < 2:
@@ -339,18 +369,25 @@ def run(start: str = "2019-01", end: str = None, with_pv_consensus: bool = False
 
     # 月度回测日（每月最后交易日）
     month_ends = []
-    cur = pd.Timestamp(start)
+    ready = dates[int(research_config()["min_history_days"]) - 1] if len(dates) >= int(research_config()["min_history_days"]) else None
+    if ready is None:
+        raise ValueError("日线预热历史不足")
+    cur = max(pd.Timestamp(start), ready) if start != "auto" else ready
     end = end or dates.max()
     end = pd.Timestamp(end)
+    cur = cur.to_period("M").to_timestamp()
     while cur <= end:
         mask = (dates >= cur) & (dates < _add_months(cur, 1))
-        if mask.any():
+        if mask.any() and cur.to_period("M") < pd.Period(datetime.now().strftime("%Y-%m"), freq="M"):
             month_ends.append(dates[mask][-1])
         cur = _add_months(cur, 1)
+    if not month_ends:
+        raise ValueError("没有预热后可回测月份")
     print(f"回测窗口 {month_ends[0].date()} ~ {month_ends[-1].date()}，共 {len(month_ends)} 期", flush=True)
 
     trig = triggers()
     # {otype: {months: [rets]}}
+    observations = []
     samples = {ot: {h: [] for h in HORIZONS} for ot in ORDER}
     if with_pv_consensus:
         samples["pv_consensus"] = {h: [] for h in HORIZONS}
@@ -360,7 +397,7 @@ def run(start: str = "2019-01", end: str = None, with_pv_consensus: bool = False
     # （near_high_250 最大差 0.38，breakout 触发 50 vs 44）→ 一致性优先，保留逐期窗口法。
     # precompute_tech/panel_from_pre 保留作精确口径对照工具（勿用于正式覆盖）。
     for k, t in enumerate(month_ends):
-        win = bars[(bars["date"] > t - pd.Timedelta(days=330)) & (bars["date"] <= t)]
+        win = bars[(bars["date"] > t - pd.Timedelta(days=500)) & (bars["date"] <= t)]
         px = win.pivot(index="date", columns="code", values="close").ffill()
         vx = win.pivot(index="date", columns="code", values="volume").fillna(0)
         st = _load_st_on(bars, t)
@@ -388,6 +425,11 @@ def run(start: str = "2019-01", end: str = None, with_pv_consensus: bool = False
                     r = _holding_stats(closes, buy_i, buy_price, gdates, h)
                     if r:
                         samples[ot][h].append(r)
+                        target = _add_months(gdates[buy_i], h)
+                        exit_date = gdates[gdates > target][0]
+                        observations.append({"otype": ot, "horizon_months": h, "code": str(code),
+                                             "signal_date": str(t.date()), "exit_date": str(exit_date.date()),
+                                             "ret": r[0], "max_dd": r[1]})
         # ★pv_consensus（第 7 类，B-6）：五强历史重算触发（外包 AI-1 2026-08-09）
         if with_pv_consensus and len(win) >= 2000:
             try:
@@ -412,6 +454,9 @@ def run(start: str = "2019-01", end: str = None, with_pv_consensus: bool = False
                 print(f"  [pv_consensus 触发失败] {str(e)[:60]}")
         if (k + 1) % 12 == 0:
             print(f"  完成 {k + 1}/{len(month_ends)} 期 ({t.date()})", flush=True)
+
+    if not observations:
+        raise ValueError("无真实完整到期样本，未生成成功校准文件")
 
     # 汇总
     result = {}
@@ -439,8 +484,9 @@ def run(start: str = "2019-01", end: str = None, with_pv_consensus: bool = False
         "period": f"{month_ends[0].date()} ~ {month_ends[-1].date()}",
         "n_months": len(month_ends),
         "horizons_months": [1, 3, 6],
-        "pit_rule": "财报按披露窗口对齐（Q1→4-30/H1→8-31/Q3→10-31/年报→次年4-30）；T+1 开盘买入",
-        "hardcoded_prev": WIN_HARDCODED,
+        "pit_rule": "财报按已存pub_date公告日期对齐；T+1开盘买入；完整持有期",
+        "historical_st_known_ratio": float(bars["is_st"].notna().mean()),
+        "research_scope": scope_metadata(),
         "pv_consensus": {
             "included": with_pv_consensus,
             "mode": pv_mode,
@@ -448,19 +494,20 @@ def run(start: str = "2019-01", end: str = None, with_pv_consensus: bool = False
         },
         "data_limits": [
             "行情 qfq 2019+（2010-2018 为 raw 未转 qfq，未混用）",
-            "quality 表（负债率/现金流）历史期自 2024-03 起 → 2024 前 value/quality_gap 触发样本偏少",
-            "估值列（pb/pe_ttm）回测用近似占位（历史 daily_basic 无本地缓存）：pb=NaN、pe_ttm=1.0、分位=价格分位，value 类触发语义≈价格分位低估+基本面，与 scan.py 无估值数据时一致",
-            "财务披露日为窗口近似（无 pub_date 精确对齐）",
+            "质量数据按真实pub_date筛选；缺覆盖的时点不补0、不触发财务类信号",
+            "估值只使用截至当期的本地daily_basic；缺失时value不触发",
+            "财务兼容表保留最新修订版本，历史原始修订版本尚未逐时点重建，存在修订偏差",
             "未处理一字涨停无法买入/停牌；极端收益（|ret|≥2）已剔除",
+            "历史is_st未知时仅剔除已知ST记录，不能声称已完整验证非ST；结果是有明确限制的历史研究",
             "pv_consensus 触发为 bars 历史重算近似（因子池 daily_scores 仅当日）",
         ],
         "note": "winrate 为持有期正收益占比；avg_ret 几何近似（算术均值）；max_dd 为持有路径最大回撤",
     }
-    out = {"date": datetime.now().strftime("%Y-%m-%d"), "meta": meta, "results": result}
+    out = {"date": datetime.now().strftime("%Y-%m-%d"), "kind": "historical_calibration", "status": "limited", "meta": meta, "results": result, "observations": observations}
     OUT.parent.mkdir(parents=True, exist_ok=True)
     out_path = out_path or OUT
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    out_path.write_text(json.dumps(json_safe(out), ensure_ascii=False, indent=1), encoding="utf-8")
     return out
 
 

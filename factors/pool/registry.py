@@ -31,7 +31,8 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(BASE))
 
-DB_PATH = BASE / "data" / "cache" / "factor_pool.db"
+from factors.research_context import cache_dir
+DB_PATH = cache_dir() / "factor_pool.db"
 
 STATUSES = ("candidate", "evaluating", "active", "monitoring", "retired")
 KINDS = ("cross_sectional", "time_series")

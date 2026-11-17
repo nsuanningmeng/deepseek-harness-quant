@@ -28,6 +28,7 @@
   }
 """
 import glob
+import hashlib
 import json
 import os
 import sqlite3
@@ -38,7 +39,8 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent.parent   # factors/opportunities/ → deepseek-harness-quant
 sys.path.insert(0, str(BASE))
 
-BARS_DB = Path(r"data/cache/bars.db")
+from factors.research_context import cache_dir
+BARS_DB = cache_dir() / "bars.db"
 FWD_HORIZONS = (1, 5, 20, 60)
 
 
@@ -48,17 +50,62 @@ def load_latest() -> dict:
     if files:
         try:
             return json.loads(Path(files[-1]).read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        except Exception as exc:
+            raise ValueError("最新远期池损坏，拒绝静默新建空历史") from exc
     return {"ts": "", "entries": []}
 
 
 def _write(pool: dict):
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     pool["ts"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     p = BASE / "logs" / f"pitch_track_pool_{ts}.json"
-    p.write_text(json.dumps(pool, ensure_ascii=False), encoding="utf-8")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pool["kind"] = "forward_observation"
+    pool["method"] = "登记日起未来收盘特征跟踪，不是实际成交收益；未经过的交易日保持null"
+    # A review is a new observation of the same history, never an overwrite of it.
+    with p.open("x", encoding="utf-8") as handle:
+        json.dump(pool, handle, ensure_ascii=False, allow_nan=False)
     return p
+
+
+def publish_reviewed_snapshot(pitch_file=None, *, core_cfg=None, now=None):
+    """Publish an actual no-op review without altering registered observations.
+
+    CLI append/update already read the current signal and local closing prices.
+    This additionally binds their saved history to the sealed official close
+    checkpoint, then publishes a new receipt even when no observation changed.
+    """
+    from data.daily_report_auto import _trade_date
+    from data.research_bootstrap import TZ
+    clock = now or datetime.now(TZ)
+    asof = _trade_date(core_cfg, now=clock)
+    pool = load_latest()
+    entries = pool.get("entries")
+    if not isinstance(entries, list) or any(not isinstance(e, dict) for e in entries):
+        raise ValueError("前向历史结构无效，拒绝发布复核快照")
+    if pitch_file is not None:
+        source = json.loads(Path(pitch_file).read_text(encoding="utf-8"))
+        if (source.get("pool_date") or source.get("date")) != asof:
+            raise ValueError("Pitch研究日期与已核验收盘日期不一致")
+    for entry in entries:
+        registered = datetime.strptime(entry["entry_date"], "%Y-%m-%d").date()
+        if registered > clock.astimezone(TZ).date():
+            raise ValueError("前向记录登记日期晚于真实今天")
+        for outcome in (entry.get("fwd") or {}).values():
+            if isinstance(outcome, dict) and outcome.get("date"):
+                outcome_date = datetime.strptime(outcome["date"], "%Y-%m-%d").date().isoformat()
+                if outcome_date > asof:
+                    raise ValueError("前向结果包含未完成收盘日，拒绝发布复核快照")
+    encoded = json.dumps(entries, ensure_ascii=False, sort_keys=True, allow_nan=False).encode("utf-8")
+    pool["data_date"] = asof
+    pool["review"] = {"kind": "closed_data_checkpoint_review", "reviewed_at": clock.isoformat(),
+                      "data_date": asof, "entry_count": len(entries),
+                      "entries_sha256": hashlib.sha256(encoded).hexdigest(),
+                      "source_pitch": Path(pitch_file).name if pitch_file else None,
+                      "history_policy": "已有登记日、因子快照和前向记录原样保留；不按新研究结果倒填"}
+    path = _write(pool)
+    print(f"Pitch 远期池: 复核 {len(entries)} 条真实历史（收盘数据 {asof}）→ {path.name}")
+    return path
 
 
 def append_pitch(pitch_file) -> dict:
@@ -81,32 +128,25 @@ def append_pitch(pitch_file) -> dict:
     except Exception:
         pass
     # ★entry_date 用 pool_date（pitch 基于的数据日期）而非 date（生成日）；异常回退 bars 最近交易日
-    entry_date = d.get("pool_date") or d.get("date") or datetime.now().strftime("%Y-%m-%d")
-    try:
-        # ★2026-08-11 修复：普通连接 D 盘 bars.db 等锁 20s+（实测 append_pitch 26.4s）→ immutable 秒开
-        # ★#143 双库合并探测：主库写保护后增量库含最新日（08-12 的 entry 不能被错截为 08-11）
-        from data.cache import DailyCache as _DC
-        _mx = _DC().latest_trade_date()
-        if not _mx:
-            con0 = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
-            _mx = con0.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0]
-            con0.close()
-        if _mx and entry_date > _mx:   # pool_date 虚标未来（如 08-10 > 08-07）→ 用最近交易日
-            entry_date = _mx
-    except Exception:
-        pass
+    entry_date = datetime.now().strftime("%Y-%m-%d")
+    registered_at = datetime.now().isoformat(timespec="seconds")
+    if d.get("status") == "empty_valid" and not d.get("pitch") and not pool["entries"]:
+        pool.update({"status": "waiting_signal", "source_pitch": str(Path(pitch_file).name),
+                     "source_asof": d.get("date"), "reason": "真实扫描无合格候选；远期记录等待未来真实信号登记"})
+        _write(pool)
+        return pool
     # 入池日收盘（bars.db，immutable 只读连接秒开）
     con = sqlite3.connect(f"file:{BARS_DB}?mode=ro&immutable=1", uri=True, timeout=3)
     # ★2026-08-11 问题 5：跨日重复累积（同 code 多条）→ 按 code 唯一去重，保留最早入池条目
     existing_codes = {e["code"] for e in pool["entries"]}
     added = 0
 
-    def _append(code, name, otype, score, risk, beneish, stop_plan=None, pool_type="auto_pitch"):
+    def _append(code, name, otype, score, risk, beneish, stop_plan=None, pool_type="auto_pitch", factor_snapshot=None, signal_family=""):
         nonlocal added
         if code in existing_codes:
             return
         row = con.execute(
-            "SELECT close FROM daily_bar WHERE code=? AND date=?",
+            "SELECT close FROM daily_bar WHERE code=? AND date=? AND adjust='qfq'",
             (code, entry_date)).fetchone()
         pool["entries"].append({
             "code": code, "name": name or code,
@@ -119,7 +159,11 @@ def append_pitch(pitch_file) -> dict:
             "pool_type": pool_type,
             # ★2026-08-11 审批状态标记（buy/drop/''；undo 撤回后置空）
             "decided": dec_map.get(code, ""),
-            "entry_date": entry_date, "entry_close": row[0] if row else None,
+            "entry_date": entry_date, "registered_at": registered_at,
+            "source_asof": d.get("pool_date") or d.get("date"), "entry_close": row[0] if row else None,
+            "factors_snapshot": dict(factor_snapshot or {}),
+            "signal_family_snapshot": signal_family,
+            "source_pitch": pitch_file.name,
             "fwd": {"t1": None, "t5": None, "t20": None, "t60": None, "latest": None},
             "age_days": 0,
         })
@@ -129,7 +173,7 @@ def append_pitch(pitch_file) -> dict:
     for p in d.get("pitch", []):
         _append(p["code"], p.get("name", p["code"]), p.get("otype", ""), p.get("score"),
                 p.get("risk_level", ""), (p.get("beneish") or {}).get("level", ""),
-                p.get("stop_plan") or {}, "auto_pitch")
+                p.get("stop_plan") or {}, "auto_pitch", p.get('factors'), p.get('signal_family', ''))
     # ★科技线主观确认入池：读 deck_decisions（action=buy 科技条目的 code）+ tech_pitch 交叉
     try:
         tech_pitch_f = sorted((BASE / "logs").glob("tech_pitch_*.json"))
@@ -183,7 +227,7 @@ def _merged_rows(code: str, date_from: str, conns: list) -> list:
     for _name, _c in conns:
         try:
             for _d, _cl in _c.execute(
-                    "SELECT date, close FROM daily_bar WHERE code=? AND date>=?",
+                    "SELECT date, close FROM daily_bar WHERE code=? AND date>=? AND adjust='qfq'",
                     (code, date_from)).fetchall():
                 if _cl:
                     merged[_d] = float(_cl)
@@ -209,7 +253,9 @@ def update_fwd() -> dict:
         pass
     try:
         from data.cache import CACHE_DIR
-        for _p in sorted(CACHE_DIR.glob("bars_incr_*.db"))[-3:]:
+        for _p in [CACHE_DIR / "bars_incr.db", *sorted(CACHE_DIR.glob("bars_incr_*.db"))]:
+            if not _p.exists():
+                continue
             try:
                 conns.append((_p.name, sqlite3.connect(f"file:{_p.as_posix()}?mode=ro&immutable=1",
                                                        uri=True, timeout=3)))
@@ -218,35 +264,14 @@ def update_fwd() -> dict:
     except Exception:
         pass
     changed = 0
-    # ★修复：entry_date 若为未来（>bars 最新）→ 回退最近交易日（2026-08-10 首版 bug）
-    # ★2026-08-13 #221：改用 DailyCache.latest_trade_date()（≥4000 只完整性门槛）——
-    #   原裸 MAX(date) 会读到 08-12 残缺占位日（183 只 baostock）→ 08-12 伪条目 entry_date
-    #   不大于 _mx → 未来日期防御失效（6 只 entry_close=None 无法计算收益）
-    try:
-        from data.cache import DailyCache as _DC2
-        _mx = _DC2().latest_trade_date()
-    except Exception:
-        _mx = None
-    if not _mx:
-        try:
-            _mx = max((_c.execute("SELECT MAX(date) FROM daily_bar").fetchone()[0] or "0000-00-00"
-                       for _n, _c in conns), default=None)
-        except Exception:
-            _mx = None
-    for e in pool["entries"]:
-        if e.get("entry_date", "") > (_mx or "9999"):
-            old_d = e["entry_date"]
-            e["entry_date"] = _mx
-            row = _merged_rows(e["code"], _mx, conns)
-            e["entry_close"] = row[0][1] if row else None
-            e["fwd"] = {"t1": None, "t5": None, "t20": None, "t60": None, "latest": None}
-            e["age_days"] = 0
-            changed += 1
+    # Never backdate a newly registered decision to an earlier market day.
     # 取入池日之后的所有交易日 close（跨库合并）
     for e in pool["entries"]:
         rows = _merged_rows(e["code"], e["entry_date"], conns)
         if not rows:
             continue
+        if not e.get("entry_close"):
+            e["observation_start"] = rows[0][0]
         entry_close = e.get("entry_close") or rows[0][1]
         if not entry_close:
             continue
@@ -363,7 +388,7 @@ def append_machine_top01(n_top: int = 5) -> dict:
     # ★2026-08-13 #321：机器池股票来自 ext_hits 共识（不在 pitch_v2）→ name 从全市场名表补
     _basic_names = {}
     try:
-        _bc = sqlite3.connect("file:data/cache/stock_basic.db?mode=ro&immutable=1", uri=True, timeout=3)
+        _bc = sqlite3.connect(f"file:{cache_dir() / 'stock_basic.db'}?mode=ro&immutable=1", uri=True, timeout=3)
         _basic_names = dict(_bc.execute("SELECT code, name FROM stock_basic").fetchall())
         _bc.close()
     except Exception:
@@ -546,7 +571,7 @@ def append_niu_select(persona: str, picks: list, date: str = "",
     # 名称补全（stock_basic）
     _basic_names = {}
     try:
-        _bc = sqlite3.connect("file:data/cache/stock_basic.db?mode=ro&immutable=1",
+        _bc = sqlite3.connect(f"file:{cache_dir() / 'stock_basic.db'}?mode=ro&immutable=1",
                               uri=True, timeout=3)
         _basic_names = dict(_bc.execute("SELECT code, name FROM stock_basic").fetchall())
         _bc.close()
@@ -760,7 +785,7 @@ def _append_ai_insight(picks: list, date: str, added: int, skip_reason: str = ""
         pass
 
 
-if __name__ == "__main__":
+def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="历史 Pitch 远期收益池")
     ap.add_argument("--append", type=str, default=None, help="pitch_v2 输出 json 路径（入池）")
@@ -772,7 +797,7 @@ if __name__ == "__main__":
     ap.add_argument("--niu", type=str, default=None, help="牛散决策入池（persona id）")
     ap.add_argument("--niu-picks", type=str, default="", help="牛散决策: code:action:priority:reason,code2:...")
     ap.add_argument("--pool-summary", action="store_true", help="按池分组汇总（5 池 + 牛散按决策者）")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.append:
         append_pitch(Path(args.append))
     if args.machine:
@@ -790,6 +815,8 @@ if __name__ == "__main__":
         append_niu_select(args.niu, picks)
     if args.update:
         update_fwd()
+    if args.append or args.update:
+        publish_reviewed_snapshot(args.append)
     if args.summary:
         print(json.dumps(summary(), ensure_ascii=False, indent=1))
     if args.pool_summary:
@@ -800,3 +827,7 @@ if __name__ == "__main__":
         # 默认：更新 + 汇总
         update_fwd()
         print(json.dumps(summary(), ensure_ascii=False, indent=1))
+
+
+if __name__ == "__main__":
+    main()

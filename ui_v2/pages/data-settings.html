@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>数据源设置 · Deepseek HARNESS Quant</title>
+<link rel="stylesheet" href="/v2/assets/ui_common.css">
+<link rel="stylesheet" href="/v2/assets/anim_common.css">
+<link rel="stylesheet" href="/v2/assets/app.css">
+<style>
+  .ds-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.ds-head .v2-h{margin:0}.ds-actions{display:flex;gap:10px;align-items:center}
+  .ds-intro{font-size:13px;color:#a1a1aa;line-height:1.9;margin:14px 0 18px}.ds-grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr);gap:14px;align-items:start}.ds-grid>.v2-card{min-width:0;margin:0}
+  .ds-status{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:17px}.ds-status h2{margin:0}.ds-badge{border:1px solid #494162;border-radius:20px;background:#272238;color:#c8bcf4;font-size:12px;padding:5px 11px;white-space:nowrap}.ds-badge.ok{border-color:#315247;background:#172e26;color:#83cba8}.ds-badge.warn{border-color:#63502e;background:#332a1c;color:#edce8a}
+  .ds-note{font-size:12px;color:#a1a1aa;line-height:1.9}.ds-key-label{display:block;font-size:12px;color:#d4d4d8;margin:18px 0 8px}.ds-input{box-sizing:border-box;display:block;width:100%;background:#141419;border:1px solid #393941;border-radius:8px;padding:12px 13px;color:#e4e4e7;font:inherit;font-size:13px}.ds-input:focus{outline:1px solid #8e80e0;border-color:#8e80e0}.ds-input:disabled{opacity:.5}.ds-form-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:15px}.ds-hint{font-size:11px;color:#8b8b97;line-height:1.8;max-width:420px}.ds-message{font-size:12px;line-height:1.8;min-height:22px;margin-top:14px;color:#c4b5fd}.ds-message.error{color:var(--gold,#f2c94c)}
+  .ds-kv{display:flex;align-items:baseline;justify-content:space-between;gap:15px;padding:9px 0;border-bottom:1px solid #292930;font-size:12px;line-height:1.7}.ds-kv:last-child{border:0}.ds-kv span{color:#a1a1aa}.ds-kv b{font-weight:500;text-align:right;overflow-wrap:anywhere}
+  .ds-docs{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.ds-docs a{font-size:12px;text-decoration:none;color:#c4b5fd;border:1px solid #3b3553;background:#211e30;border-radius:7px;padding:7px 10px}.ds-docs a:hover{background:#302943}
+  .ds-callout{border-left:3px solid #a08be5;background:#1d1a2a;border-radius:0 7px 7px 0;padding:12px 14px;font-size:12px;color:#c9c3d9;line-height:1.9;margin-top:16px}
+  .ds-check-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px}.ds-check-head h2{margin:0}.ds-check-message{font-size:12px;color:#a1a1aa;line-height:1.9;margin-bottom:13px;white-space:pre-wrap}.ds-table-wrap{overflow:auto}.ds-table{width:100%;border-collapse:collapse;font-size:12px}.ds-table th{color:#a1a1aa;background:#1a1a20;text-align:left;font-weight:500;white-space:nowrap}.ds-table th,.ds-table td{padding:11px 12px;border-bottom:1px solid #292930;vertical-align:top;line-height:1.7}.ds-table td small{display:block;color:#8c8c99;margin-top:3px}.ds-table .ds-error-cell{min-width:180px;max-width:460px;overflow-wrap:anywhere}.ds-result-ok{color:#83cba8}.ds-result-fail{color:var(--gold,#f2c94c)}.ds-result-wait{color:#a1a1aa}.ds-empty{padding:24px 10px;font-size:12px;color:#a1a1aa;text-align:center;line-height:1.8}.ds-footer{font-size:11px;color:#71717a;line-height:1.9;margin:18px 0}
+  @media(max-width:1050px){.ds-grid{grid-template-columns:minmax(0,1fr)}}
+</style>
+</head>
+<body style="background:var(--bg);margin:0">
+<div id="sidebar"></div>
+<main class="v2-wrap">
+  <div class="ds-head">
+    <div class="v2-h"><span class="bar"></span><h1>数据源设置</h1><span class="sub">用于当前实时模拟账户</span></div>
+    <div class="ds-actions"><a class="v2-btn" href="/paperlive">返回实时模拟盘</a><button class="v2-btn" id="settings-refresh" type="button">刷新状态</button></div>
+  </div>
+  <p class="ds-intro">在本机配置官方基础数据凭据。当前报价来源与所需检查项目由后台下发，已有 Token 不会在本页面回显。</p>
+  <div class="ds-grid">
+    <section class="v2-card">
+      <div class="ds-status"><h2 id="provider-title">Tushare 数据源</h2><span class="ds-badge warn" id="token-status">读取中</span></div>
+      <div class="ds-note">Token 仅保存在这台电脑，并仅发往 Tushare 官方 HTTPS 接口；混合行情源不会收到此 Token。输入内容不写入浏览器存储。</div>
+      <form id="token-form" autocomplete="off">
+        <label class="ds-key-label" for="tushare-token">Tushare Token</label>
+        <input class="ds-input" id="tushare-token" name="tushare-token" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="在此粘贴 Token" disabled>
+        <div class="ds-form-actions"><div class="ds-hint">保存后输入框会立即清空。需要更换 Token 时，再填入新的值即可。</div><button class="v2-btn" id="token-save" type="submit" disabled>保存到本机</button></div>
+      </form>
+      <div class="ds-message" id="settings-message" role="status" aria-live="polite">正在读取本机配置状态…</div>
+      <div class="ds-callout">保存 Token 只表示已配置官方基础数据凭据；当前报价来源与实时数据是否可用，以实际连接及自动启动条件验收为准。</div>
+    </section>
+    <section class="v2-card">
+      <h2>当前配置</h2>
+      <div class="ds-note" id="check-scope" style="margin-bottom:10px">检查范围待后台确认</div>
+      <div class="ds-kv"><span>数据源</span><b id="provider-label">—</b></div>
+      <div class="ds-kv"><span>Token 来源</span><b id="token-source">—</b></div>
+      <div class="ds-kv"><span>官方接口地址</span><b id="api-origin">—</b></div>
+      <div class="ds-kv"><span>最近验证</span><b id="last-checked">尚未验证</b></div>
+      <div class="ds-docs" id="settings-docs"></div>
+      <div class="ds-callout">休市时可以检查连接和接口权限；新鲜盘中报价是否正常，需要在交易时段再验证。系统不会用过期报价继续模拟撮合。</div>
+    </section>
+  </div>
+
+  <section class="v2-card" style="margin-top:14px">
+    <div class="ds-check-head"><h2>接口权限检查 <span class="tag" id="check-summary">等待验证</span></h2><button class="v2-btn" id="check-apis" type="button" disabled>验证接口权限</button></div>
+    <div class="ds-check-message" id="check-message">填写并保存 Token 后，点击“验证接口权限”。页面不会自动重复测试。</div>
+    <div class="ds-table-wrap" id="checks-table"><div class="ds-empty">所需接口列表加载中…</div></div>
+  </section>
+  <div class="ds-footer">接口返回失败、权限不足或休市时没有新鲜数据，都会在这里说明；不会据此生成模拟成交。</div>
+</main>
+<script src="/v2/core/api.js"></script>
+<script src="/v2/core/render.js"></script>
+<script src="/v2/components/icons.js"></script>
+<script src="/v2/components/search.js"></script>
+<script src="/v2/components/sidebar.js"></script>
+<script>
+(function () {
+  'use strict';
+  LW.sidebar.render('sidebar', {active:'paperlive'});
+  var latest = null, busy = false, fresh = false;
+  var byId = function (id) { return document.getElementById(id); };
+  function esc(value) { return String(value == null ? '' : value).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); }
+  function moment(value) { if(!value)return '尚未验证';var date=new Date(value);return Number.isNaN(date.getTime())?String(value):date.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}); }
+  function setMessage(text,error) { byId('settings-message').textContent=text;byId('settings-message').className='ds-message'+(error?' error':''); }
+  function controls() {
+    byId('settings-refresh').disabled=busy;
+    byId('tushare-token').disabled=busy||!fresh;
+    byId('token-save').disabled=busy||!fresh;
+    byId('check-apis').disabled=busy||!fresh||!latest||!latest.configured;
+  }
+  function sourceLabel(value) { return ({local_file:'本机凭据文件',environment:'服务环境变量',none:'尚未配置'})[value]||value||'—'; }
+  function phaseLabel(value) { return ({closed:'休市，待盘中验证',market_closed:'休市，待盘中验证',waiting_for_session:'等待交易时段',permission:'权限检查',realtime:'实时数据检查',ready:'就绪',not_ready:'尚未就绪',failed:'未通过',checked:'已检查',response_verified:'数据字段已验证',permission_denied:'缺少访问权限',outside_session:'等待服务时段',rate_limited:'调用频率受限',authentication:'凭据未通过验证',api_error:'接口暂不可用',awaiting_data:'等待数据',unavailable:'暂不可用'})[value]||'待确认'; }
+  function officialLink(value) {
+    try {var url=new URL(value);if(url.protocol!=='https:'||url.username||url.password)return null;if(url.hostname!=='tushare.pro'&&!url.hostname.endsWith('.tushare.pro'))return null;return url.href;}catch(error){return null;}
+  }
+  function renderChecks(state) {
+    var requirements=Array.isArray(state.requirements)?state.requirements:[],last=state.last_check,checks=last&&Array.isArray(last.checks)?last.checks:[],seen={},rows=[];
+    requirements.forEach(function(requirement){if(!requirement.endpoint||seen[requirement.endpoint])return;seen[requirement.endpoint]=true;rows.push({endpoint:requirement.endpoint,label:requirement.label||requirement.endpoint});});
+    checks.forEach(function(check){if(check.endpoint&&!seen[check.endpoint]){seen[check.endpoint]=true;rows.push({endpoint:check.endpoint,label:check.endpoint});}});
+    var completed=checks.filter(function(check){return check.ok===true;}).length;
+    byId('check-summary').textContent=last?'本次通过 '+completed+' / '+checks.length+' 项':'等待验证';
+    byId('last-checked').textContent=moment(last&&last.checked_at);
+    byId('check-message').textContent=last?(last.message||'请查看下方各接口的检查结果；休市时仍需等待交易时段验证报价新鲜度。'):(state.configured?'Token 已配置。点击“验证接口权限”发起一次检查。':'填写并保存 Token 后，点击“验证接口权限”。页面不会自动重复测试。');
+    if(!rows.length){byId('checks-table').innerHTML='<div class="ds-empty">服务尚未返回所需接口列表，请刷新状态后再试。</div>';return;}
+    var body=rows.map(function(requirement){var matching=checks.filter(function(check){return check.endpoint===requirement.endpoint;});if(!matching.length)matching=[null];return matching.map(function(check){var result=check?(check.ok===true?'通过':check.ok===false?'未通过':'待确认'):'待验证',tone=check?(check.ok===true?'ds-result-ok':check.ok===false?'ds-result-fail':'ds-result-wait'):'ds-result-wait';return '<tr><td>'+esc(requirement.label)+'<small>'+esc(requirement.endpoint)+'</small></td><td class="'+tone+'">'+esc(result)+'</td><td>'+esc(check&&check.rows!=null?check.rows:'—')+'</td><td>'+esc(phaseLabel(check&&check.phase))+'</td><td class="ds-error-cell">'+esc(check&&check.error?check.error:check?'—':'尚未发起检查')+'</td></tr>';}).join('');}).join('');
+    byId('checks-table').innerHTML='<table class="ds-table"><thead><tr><th>接口</th><th>结果</th><th>返回行数</th><th>阶段</th><th>说明</th></tr></thead><tbody>'+body+'</tbody></table>';
+  }
+  function render(state) {
+    latest=state;fresh=true;
+    byId('provider-title').textContent=state.provider_label||'Tushare 数据源';
+    byId('provider-label').textContent=state.provider_label||state.provider||'—';
+    byId('check-scope').textContent=state.check_scope||'所列接口的检查范围由后台配置决定，实时盘口另按实际数据验收。';
+    byId('token-status').textContent=state.configured?'Token 已配置':'等待填写 Token';
+    byId('token-status').className='ds-badge '+(state.configured?'ok':'warn');
+    byId('token-source').textContent=sourceLabel(state.token_source);
+    byId('api-origin').textContent=state.api_origin||'—';
+    byId('tushare-token').placeholder=state.configured?'需要更换时，粘贴新的 Token':'在此粘贴 Token';
+    var links=state.links||{},labels={token:'官方 Token 获取说明',permission:'官方权限说明',rt_k:'Tushare 实时接口文档（可选）'};
+    byId('settings-docs').innerHTML=Object.keys(labels).map(function(key){var url=officialLink(links[key]);return url?'<a href="'+esc(url)+'" target="_blank" rel="noopener noreferrer">'+esc(labels[key])+' ↗</a>':'';}).join('');
+    renderChecks(state);controls();
+  }
+  function load() {
+    if(busy)return Promise.resolve();busy=true;controls();
+    return LW.api.get('/api/paperlive/data-settings',{bypass:true,retry:0,staleFallback:false}).then(function(state){if(!state||state.ok===false)throw new Error((state&&state.error)||'配置状态暂不可读');render(state);setMessage(state.configured?'已读取本机配置。保存状态不代表实时行情权限已经通过验证。':'请填写 Token，保存后再验证所需接口权限。');})
+      .catch(function(error){fresh=false;byId('token-status').textContent='状态读取失败';byId('token-status').className='ds-badge warn';setMessage('无法读取当前配置：'+error.message,true);})
+      .finally(function(){busy=false;controls();});
+  }
+  function post(path,payload) {
+    return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},cache:'no-store',body:JSON.stringify(payload)}).then(function(response){return response.json().then(function(data){if(!response.ok)throw new Error(data.error||data.message||('请求失败（'+response.status+'）'));return data;});});
+  }
+  byId('settings-refresh').addEventListener('click',load);
+  byId('token-form').addEventListener('submit',function(event){
+    event.preventDefault();if(busy||!fresh)return;
+    var token=byId('tushare-token').value.trim();byId('tushare-token').value='';
+    if(!token){setMessage('请输入新的 Token；空内容不会覆盖已有配置。',true);return;}
+    busy=true;controls();setMessage('正在保存本机配置…');
+    post('/api/paperlive/data-settings',{token:token}).then(function(state){if(!state||state.ok===false)throw new Error((state&&state.error)||'Token 未能保存');render(state);setMessage('已保存到本机。请点击“验证接口权限”检查当前账号是否可用。');})
+      .catch(function(error){setMessage('保存失败：'+error.message,true);})
+      .finally(function(){busy=false;controls();});
+  });
+  byId('check-apis').addEventListener('click',function(){
+    if(busy||!fresh||!latest||!latest.configured)return;
+    busy=true;controls();setMessage('正在检查所需接口，请等待本次结果…');
+    post('/api/paperlive/data-settings/check',{}).then(function(result){
+      if(!result)throw new Error('未收到验证结果');
+      if(result.last_check!==undefined){render(Object.assign({},latest,result));}
+      else if(Array.isArray(result.checks)){render(Object.assign({},latest,{last_check:result}));}
+      else throw new Error(result.error||'未收到接口检查明细');
+      var check=latest.last_check;
+      setMessage(check&&check.ok===true?'本次接口检查已完成。盘中报价新鲜度仍以实际交易时段的检查为准。':'本次有接口尚未通过，请查看逐项结果。',!(check&&check.ok===true));
+    }).catch(function(error){setMessage('接口检查未完成：'+error.message,true);})
+      .finally(function(){busy=false;controls();});
+  });
+  load();
+})();
+</script>
+</body>
+</html>

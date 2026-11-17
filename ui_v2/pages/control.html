@@ -255,7 +255,7 @@
   }
   function hzGet(path, timeoutMs) {
     return hzFetch(path, timeoutMs || 8000).then(function (d) {
-      if (connState !== 'ok') setConn('ok', '已连接');
+      setConn('ok', '已连接');
       retryDelay = 1000;
       return d;
     }).catch(function (e) {
@@ -307,7 +307,9 @@
   function renderMsgs(messages, thinking) {
     var box = document.getElementById('hz-msgs');
     var visible = (messages || []).filter(function (m) {
-      return String(m.text || '').indexOf('【任务】你是「') !== 0;
+      var text = String(m.text || '').trim();
+      if (/^<system-reminder>\s*(?:The following workspace instructions|A skill is a reusable set of task-specific instructions)/.test(text)) return false;
+      return text.indexOf('【任务】你是「') !== 0;
     });
     if (!visible.length) {
       box.innerHTML = '<div class="hz-msg sys">会话为空 —— 发送消息开始对话（发「1」触发自主推进；牛散分类 = 基于量化全量数据的主观选股）</div>';
@@ -388,9 +390,11 @@
       }
       niuShown++;
       var active = curTarget && curTarget.kind === 'niu' && curTarget.persona === n.id ? ' active' : '';
+      var paperRole = n.paper_decision_role === 'analyst' ? '模拟盘计划分析已配置' : n.paper_decision_role === 'reviewer' ? '模拟盘逐项复核已配置' : '';
       return '<div class="hz-sess-item niu' + active + '" data-kind="niu" data-sid="' + esc(n.id) + '">' +
         '<div class="t">' + esc(n.name) + '<span class="tag">' + esc(n.tag) + '</span></div>' +
-        (n.preview ? '<div class="p">' + esc(n.preview) + '</div>' : '<div class="p">未开聊 —— 首次发言自动建档</div>') +
+        (paperRole ? '<div class="p" style="color:#c4b5fd">' + esc(paperRole) + ' · 报告见实时模拟盘</div>' : '') +
+        (n.preview ? '<div class="p">' + esc(n.preview) + '</div>' : '<div class="p">' + (paperRole ? '手动聊天尚未开始；自动分析由模拟盘按交易时段触发。' : '未开聊 —— 首次发言自动建档') + '</div>') +
         '</div>';
     }).join('');
     if (sessKw && !niuShown) html += '<div class="hz-msg sys" style="padding:4px 8px">无匹配</div>';

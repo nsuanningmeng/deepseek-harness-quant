@@ -1,0 +1,33 @@
+label_prefix: local.deepseek-quant
+restart_delay_seconds: 30
+bootstrap_log_directory: ~/Library/Logs/deepseek-quant
+path: /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+services:
+  web:
+    enabled: true
+    command: ['{python}', '-u', '-m', 'deck.deck_server']
+    pid_file: runtime/web/deck-server.pid
+    log_file: runtime/web/deck-server.log
+  ai:
+    enabled: true
+    command: ['{node}', '{root}/harness/node_modules/@deepseek-ai/dsh/lib/bin.js', 'web', '--host', '127.0.0.1', '--port', '3080']
+    environment:
+      DSH_HOME: '{root}/harness/home'
+      DSH_TELEMETRY_DISABLED: '1'
+    pid_file: runtime/ai/harness.pid
+    log_file: runtime/ai/harness.log
+  paperlive:
+    enabled: true
+    command: ['{python}', '-u', '-m', 'paperlive', '--config', '{root}/config/paperlive.yaml', 'run']
+    pid_file_from_paper_config: true
+    log_file_from_paper_config: true
+  research:
+    enabled: true
+    command: ['{python}', '-u', '-m', 'data.research_service', 'run', '--config', '{root}/config/research_service.yaml']
+    pid_file: runtime/research/service.pid
+    log_file: runtime/research/service.log
+  minute:
+    enabled: true
+    command: ['{python}', '-u', '-m', '{minute_module}', 'run']
+    pid_file_from_minute_config: true
+    log_file_from_minute_config: true

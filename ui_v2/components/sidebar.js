@@ -1,8 +1,9 @@
 /* ★2026-08-13 #289 深色侧边栏 → ★2026-08-15 StyleKit Linear Style
    Sidebar: 256px, bg #111114, nav labels #a1a1aa,
    active item: #5e6ad2 left border + rgba(94,106,210,.2)→#1c1c22 bg.
-   底部：数据日 + 择时（读 portal_dash，LW.api 冗余兜底） */
+   底部：数据日 + 择时（独立读取轻量 timing_dash，定期更新并保留连接错误） */
 (function () {
+  var footerTimers = {};
   var ITEMS = [
     { id: 'portal',   label: '门户',   ic: 'home',     url: '/' },
     { id: 'control',  label: '控制',   ic: 'cpu',      url: '/control' },
@@ -55,6 +56,23 @@
           '</div>' +
         '</div>';
       el.innerHTML = html;
+      // Optional module navigation comes from its configured API metadata.
+      LW.api.get('/api/paperlive/state').then(function (state) {
+        var nav = state && state.navigation;
+        if (!nav || !nav.label || !nav.path) return;
+        var target;
+        try { target = new URL(nav.path, window.location.origin); } catch (e) { return; }
+        if (target.origin !== window.location.origin || target.pathname.charAt(0) !== '/') return;
+        var host = el.querySelector('.sb-nav');
+        if (!host || host.querySelector('[data-module-navigation="paperlive"]')) return;
+        var link = document.createElement('a');
+        link.className = 'sb-item' + (target.pathname === window.location.pathname ? ' active' : '');
+        link.href = target.pathname + target.search;
+        link.dataset.moduleNavigation = 'paperlive';
+        link.innerHTML = IC.chart || '';
+        link.appendChild(document.createTextNode(String(nav.label)));
+        host.insertBefore(link, host.querySelector('.sb-more-toggle'));
+      }).catch(function () {});
       // ★2026-08-16 「更多」默认折叠：点击标签展开/收起（箭头旋转指示，动画流畅）
       var moreToggle = document.getElementById(elId + '-more-toggle');
       if (moreToggle) {
@@ -91,17 +109,25 @@
           badge.title = bm.hint || '内部测试构建，非公测发布版';
         }
       }).catch(function () {});
-      LW.api.get('/api/live/portal_dash').then(function (d) {
-        var tm = (d.timing && d.timing.timing) || {};
-        var dd = d.data_date || (d.brief && d.brief.date) || tm.date || '';
-        var f = document.getElementById(elId + '-foot');
-        if (!f) return;
-        var sc = tm.score != null ? tm.score : '…';
-        var lv = tm.level || '';
-        f.innerHTML =
-          '<span class="sb-mini">数据日 ' + dd + '</span>' +
-          '<span class="sb-mini">择时 ' + sc + (lv ? ' · ' + lv : '') + '</span>';
-      }).catch(function () {});
+      function footerLines(lines) {
+        var foot = document.getElementById(elId + '-foot');
+        if (!foot) return;
+        foot.textContent = '';
+        lines.forEach(function(text){var line=document.createElement('span');line.className='sb-mini';line.textContent=text;foot.appendChild(line);});
+      }
+      function refreshFooter() {
+        // The portal's cold snapshot can be probing. Read the small actual timing
+        // artifact directly, and refresh it independently instead of freezing an empty snapshot.
+        return LW.api.get('/api/live/timing_dash',{bypass:true,retry:0,staleFallback:false}).then(function(data){
+          var timing=data && data.timing;
+          if (!data || data.ok===false || !timing) { footerLines(['研究状态尚未就绪','择时数据待核验']);return; }
+          footerLines(['数据日 '+(timing.date || '尚未核验'),
+            timing.score == null ? '择时数据待核验' : '择时 '+timing.score+(timing.level?' · '+timing.level:'')]);
+        }).catch(function(){footerLines(['研究状态暂不可读','请检查本机连接']);});
+      }
+      if (footerTimers[elId]) clearInterval(footerTimers[elId]);
+      refreshFooter();
+      footerTimers[elId] = setInterval(refreshFooter,60000);
     }
   };
 })();

@@ -39,7 +39,7 @@
   <div class="v2-card anim-fade-in-up d0" id="buy-order-box" style="margin-top:14px;display:none">
     <div id="buy-order-head" style="display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none;padding:2px 0">
       <span id="buy-order-chev" style="display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;background:#1c1c22;border:1px solid #2a2a30;color:#a1a1aa;font-size:11px;transition:color .15s,transform .2s">▼</span>
-      <h2 style="margin:0;flex:1;font-size:16px"> 今日买入指令 <span class="tag" id="buy-order-tag">加载中…</span></h2>
+      <h2 style="margin:0;flex:1;font-size:16px"> 今日研究候选 <span class="tag" id="buy-order-tag">加载中…</span></h2>
       <span class="mini" id="buy-order-state" style="color:var(--muted)">已折叠 · 点击展开</span>
     </div>
     <div id="buy-order-collapse" style="display:grid;grid-template-rows:0fr;transition:grid-template-rows .28s var(--ease-hover)">
@@ -102,28 +102,34 @@
       LW.api.get('/api/live/tech'),
       LW.api.get('/api/live/timing_dash')
     ]).then(function (rs) {
-      var long = (rs[0] && rs[0].pitch) || [];
-      var short = (rs[1] && rs[1].entries) || [];
+      var long = ((rs[0] && rs[0].pitch) || []).filter(function(o){return o.auto_trade_allowed !== false && o.calibrated !== false;});
+      var allShort = (rs[1] && rs[1].entries) || [];
+      var short = allShort.filter(function(o){return o.auto_trade_allowed !== false && o.calibrated !== false;});
       var tm = (rs[2] && rs[2].timing) || {};
       var level = tm.level || '';
+      if (!level || tm.score == null) {
+        document.getElementById('buy-order-body').textContent='择时数据尚未初始化，暂不生成买入指令。';
+        var unavailableTag=document.getElementById('buy-order-tag');if(unavailableTag)unavailableTag.textContent='研究数据待初始化';
+        return;
+      }
       var isDefensive = String(level).indexOf('适合') < 0 && String(level).indexOf('上行') < 0;
       // 聚合（长线优先，去重）——与各 Tab 卡片同一批候选
       var seen = {}, cands = [];
       long.forEach(function (o) { if (!seen[o.code]) { seen[o.code] = 1; cands.push({ code: o.code, name: o.name, otype: o.otype_name || o.otype, score: o.score, isShort: false }); } });
       short.forEach(function (o) { if (!seen[o.code]) { seen[o.code] = 1; cands.push({ code: o.code, name: o.name, otype: o.otype_name || o.otype, score: o.score, isShort: true }); } });
       var tag = document.getElementById('buy-order-tag');
-      if (tag) tag.textContent = 'Pitch 长+' + (short.length ? '短' : '') + '候选 ' + cands.length + ' 只 · 与下方卡片同源 · T+1 次日开盘执行';
+      if (tag) tag.textContent = '研究观察 ' + cands.length + ' 只 · ' + (allShort.length-short.length) + ' 只未校准规则观察不产生买入指令';
       var body = document.getElementById('buy-order-body');
       if (isDefensive || !cands.length) {
         box.style.display = '';
         body.innerHTML = '<div class="mini" style="line-height:1.9">' +
           (isDefensive ? '<b style="color:var(--gold)">当前择时 ' + R._f(level) + '（' + R._f(tm.score, '—') + ' 分）→ 防守档，不生成买入指令</b> —— 仓位由择时总闸控制，Pitch 卡片仅供观察。'
-            : '暂无 Pitch 候选（收盘后 17:35/18:30 自动生成）') + '</div>';
+            : '本轮没有符合条件的研究候选') + '</div>';
         return;
       }
       function rowHtml(x) {
         var done = LW.decide._done[x.code];
-        var st = done === 'buy' ? '<span class="st-done st-buy">已买入</span>' :
+        var st = done === 'buy' ? '<span class="st-done st-buy">已标记买入</span>' :
                 done === 'drop' ? '<span class="st-done st-drop">已放弃</span>' :
                 '<span class="mini" style="color:#ffd76a;font-weight:700;text-shadow:0 0 10px rgba(242,201,76,.35)">待审批</span>';
         var scoreTxt = x.score != null ? (+x.score).toFixed(1) : '—';
@@ -148,7 +154,7 @@
       body.innerHTML =
         '<div class="mini" style="margin-bottom:8px;line-height:1.9;color:#a1a1aa">' +
           '择时档位 <b style="color:' + (isDefensive ? 'var(--gold)' : 'var(--green)') + '">' + R._f(level) + '（' + R._f(tm.score, '—') + ' 分）</b>' +
-          ' · 买入/放弃与下方卡片联动 · 一字涨停自动跳过 · 以开盘实际价成交</div>' +
+          ' · 仅供研究复核，尚未形成实际账户的获批委托；研究标记不代表成交。</div>' +
         section('📈 Pitch 长线（价值/质量/重估）', longC, 'var(--navy)') +
         section('⚡ Pitch 短线（情绪/事件）', shortC, 'var(--gold)') +
         (!longC.length && !shortC.length ? '<div class="mini">暂无候选</div>' : '');
@@ -163,17 +169,17 @@
   function loadHoldingsStrip() {
     var box = document.getElementById('holdings-strip');
     if (!box) return;
-    LW.api.get('/api/live/holdings').then(function (d) {
+    LW.api.get('/api/live/holdings',{bypass:true,staleFallback:false}).then(function (d) {
       var pf = d.portfolio || {};
       var held = (pf._held && pf._held.length) ? pf._held
                : (pf.positions || []).filter(function (p) { return p.status === 'holding'; });
-      var maxP = pf.max_positions || 5;
+      var maxP = pf.max_positions != null ? pf.max_positions : '—';
       var over = pf._over && pf._over.length ? pf._over.length : 0;
       var tag = document.getElementById('holdings-strip-tag');
-      if (tag) tag.textContent = held.length + '/' + maxP + ' 只' + (over ? ' · 超限 ' + over + ' 只待处理' : '') + ' · 审批前先看剩余名额（持股≤5 纪律）';
+      if (tag) tag.textContent = '历史研究审批持仓 '+(d.portfolio_recorded === false?'—':held.length) + '/' + maxP + ' 只' + (over ? ' · 超限 ' + over + ' 只待处理' : '') + ' · 实时AI账户另见实时模拟盘';
       var body = document.getElementById('holdings-strip-body');
       if (!held.length) {
-        body.innerHTML = '<div class="mini" style="opacity:.6">当前空仓 —— 可审批买入（≤' + maxP + ' 只）</div>';
+        body.textContent = d.portfolio_recorded === false ? '尚无历史审批组合记录；研究候选不等于实际持仓或委托。' : '历史审批组合当前无持仓。';
       } else {
         var chips = held.map(function (p) {
           var ret = p.ret != null ? (p.ret >= 0 ? '+' : '') + (p.ret * 100).toFixed(1) + '%' : '—';
@@ -194,17 +200,15 @@
   // ★2026-08-14 数据日状态条：拉 portal_dash 的 data_semantic 展示"数据流通到哪天 + 何时更新"
   //   （盘中 = 上一交易日数据属正常；用户不再误判"昨天 pitch = 卡住"）
   function loadDataDayBar() {
-    LW.api.get('/api/live/portal_dash').then(function (d) {
+    LW.api.get('/api/live/portal_dash',{bypass:true,staleFallback:false}).then(function (d) {
       var bar = document.getElementById('data-day-bar');
       if (!bar) return;
-      var sem = d.data_semantic || '';
+      var sem = d.loading ? d.reason : d.research_data && !d.research_data.ready ? d.research_data.message : d.data_semantic || d.reason || '';
       var dd = d.data_date || (d.brief && d.brief.date) || '';
       var color = sem.indexOf('已更新') >= 0 ? 'var(--green)' : (sem.indexOf('盘') >= 0 ? 'var(--navy2)' : 'var(--gold)');
-      var hot = sem.indexOf('已更新') >= 0 ? '数据已更新到最新' : (sem.indexOf('盘') >= 0 ? '盘中实时行情已就绪' : '等待收盘后更新');
       bar.style.display = 'block';
-      bar.innerHTML = '<b style="color:var(--navy)">数据流通状态：</b>' +
-        '<span style="color:' + color + ';font-weight:600">' + (sem || ('最新完整交易日 ' + dd)) + '</span>' +
-        '<span style="opacity:.75;margin-left:8px">' + hot + ' · Pitch 卡片日期为入池所用数据日，盘中显示上一交易日为正常机制</span>';
+      bar.style.color = color;
+      bar.textContent = '研究数据状态：'+(d.stale?'上次快照正在刷新 · ':'')+(sem || ('最新完整交易日 ' + dd))+' · Pitch为研究结果，实时行情和账户状态另见实时模拟盘。';
     }).catch(function () { /* 降级：隐藏状态条 */ });
   }
   loadDataDayBar();
@@ -215,14 +219,14 @@
     var ot = String(otype || '');
     var done = LW.decide._done[code];
     if (done === 'buy') {
-      return '<span class="st-done st-buy">已买入</span>' +
+      return '<span class="st-done st-buy">已标记买入</span>' +
         '<button class="v2-btn neg v2-btn-undo" data-code="' + code + '" data-name="' + nm + '" data-otype="' + ot + '">撤回</button>';
     }
     if (done === 'drop') {
       return '<span class="st-done st-drop">已放弃</span>' +
         '<button class="v2-btn neg v2-btn-undo" data-code="' + code + '" data-name="' + nm + '" data-otype="' + ot + '">撤回</button>';
     }
-    return '<button class="v2-btn v2-btn-buy" data-code="' + code + '" data-name="' + nm + '" data-otype="' + ot + '">买入</button>' +
+    return '<button class="v2-btn v2-btn-buy" data-code="' + code + '" data-name="' + nm + '" data-otype="' + ot + '">标记买入</button>' +
       '<button class="v2-btn neg v2-btn-drop" data-code="' + code + '" data-name="' + nm + '" data-otype="' + ot + '">放弃</button>';
   }
 
@@ -317,8 +321,8 @@
         }).join('') + '</table>';
     }
     var meta = [
-      o.winrate_est != null ? '<span>预估胜率 <b>' + pvPct(o.winrate_est, 1) + '</b></span>' : '',
-      o.upside_est != null ? '<span>上行空间 <b>' + o.upside_est + '%</b></span>' : ''
+      o.winrate_est != null ? '<span>历史样本胜率 <b>' + pvPct(o.winrate_est, 1) + '</b></span>' : '',
+      o.upside_est != null ? '<span>规则上行参考 <b>' + o.upside_est + '%</b></span>' : ''
     ].join('');
     // ★#327 分 Regime 牛/基/熊情景赔率（按买入时点市场状态分档，1y 口径样本最多）
     var rgHtml = '';
@@ -334,9 +338,11 @@
             ' 胜率 ' + pvPct(v.winrate) + ' · 均 <b style="color:' + R.color(v.avg_ret) + '">' + pvPct(v.avg_ret) + '</b> · n=' + v.n + '</span>';
         }).join('') + '</div>';
     }
-    var q2 = '<div class="pv-q"><div class="pv-q-t"><span class="pv-q-n">②</span>情景赔率（持有期回测）</div>' +
+    var q2 = '<div class="pv-q"><div class="pv-q-t"><span class="pv-q-n">②</span>历史持有窗口统计</div>' +
       (meta ? '<div class="pv-meta" style="margin:0 0 4px">' + meta + '</div>' : '') +
+      (meta ? '<div class="mini" style="opacity:.65">历史持有窗口与样本范围以来源说明为准，不是个股未来成功概率。</div>' : '')+
       (ev || '<div class="pv-mech" style="opacity:.6">暂无持有期回测</div>') +
+      '<div class="mini" style="opacity:.65">按历史完整持有窗口计算；未逐笔核验停牌、实际涨跌停及手续费，不等同实际成交结果。</div>'+
       rgHtml + '</div>';
 
     // ★#316 IC Memo 第三问：③ 致命风险与对冲（红旗风险清单 + 逻辑止损对冲）
@@ -353,11 +359,12 @@
         '<span class="pv-score" style="color:' + ((o.score || 0) >= 100 ? 'var(--red)' : 'var(--navy)') + '">' + (o.score != null ? (+o.score).toFixed(1) : '—') + '</span></div>' +
       '<div class="pv-badges">' + badges + '</div>' +
       origin + q1 + q2 + q3 +
-      '<div style="margin:6px 0 2px;padding:5px 10px;background:rgba(94,106,210,.14);border:1px solid rgba(94,106,210,.25);border-radius:8px;font-size:11px;color:#5e6ad2"><b>⏰ 买入时点</b> 次日开盘（T+1）· 收盘出信号 → 开盘执行</div>' +
+      '<div style="margin:6px 0 2px;padding:5px 10px;background:rgba(94,106,210,.14);border:1px solid rgba(94,106,210,.25);border-radius:8px;font-size:11px;color:#5e6ad2"><b>研究执行假设</b> 次日开盘（T+1）；不表示当前已获批买入或成交。</div>' +
       '<div class="pv-act">' + actionHtml(o.code, o.name, o.otype_name || o.otype) + '</div>' +
       '</div>';
   }
   function techCard(o) {
+    var observation=o.calibrated === false || o.auto_trade_allowed === false;
     var conf = o.confidence ? '<span>置信 <b>' + R._f(o.confidence) + '</b></span>' : '';
     // ★#322 短线增强：express_strong 强因子直通标记（gap ICIR120 等）
     var express = o.express_strong ? '<span class="pv-badge pv-strong">强因子直通 ' + R._f(o.express_strong.factor) + (o.express_strong.icir120 != null ? ' ' + Number(o.express_strong.icir120).toFixed(2) : '') + '</span>' : '';
@@ -371,6 +378,7 @@
       o.is_new ? '<span class="pv-badge pv-strong">NEW</span>' : '',
       o.tech_label ? '<span class="pv-badge">' + R._f(o.tech_label) + '</span>' : '',
       express,
+      observation ? '<span class="pv-badge" style="color:var(--gold)">规则观察未校准，不可自动买入</span>' : '',
       riskBadge(o.risk_level)
     ].join('');
     // ★#334 怎么来的引导区块（trigger + evidence 完整，对齐长线 pitchCard）
@@ -389,13 +397,13 @@
     var sbDims = Object.keys(sb).filter(function (k) { return k !== 'weights' && k !== 'formula'; });
     var sbHtml = sbDims.map(function (k) {
       var v = sb[k];
-      if (v == null) return '';
+      if (v == null) return '<div class="dim-row"><b>' + R._f(k) + '</b><span style="float:right;opacity:.6">尚无实际数据</span></div>';
       var cc = R.techDimColor(k);
       var s = Math.max(4, Math.min(100, +v * 100));
       return '<div class="dim-row"><div style="display:flex;justify-content:space-between;font-size:12px"><b>' + k + '</b><span style="color:' + cc + ';font-weight:600">' + Math.round(+v * 100) + '</span></div>' +
         '<div class="dim-bar"><div class="dim-fill" style="width:' + s + '%;background:' + cc + '"></div></div></div>';
     }).join('');
-    var q2 = '<div class="pv-q"><div class="pv-q-t"><span class="pv-q-n">②</span>情景赔率（四维打分）</div>' +
+    var q2 = '<div class="pv-q"><div class="pv-q-t"><span class="pv-q-n">②</span>' + (observation?'未校准规则分项':'情景赔率（四维打分）') + '</div>' +
       (sbHtml || '<div class="pv-mech" style="opacity:.6">无打分分解</div>') +
       (sb.formula ? '<div class="pv-scenario-note">' + R._f(sb.formula) + '</div>' : '') + '</div>';
 
@@ -414,15 +422,14 @@
       '<div class="pv-badges">' + badges + '</div>' +
       (conf ? '<div class="pv-meta">' + conf + '</div>' : '') +
       origin + q1 + q2 + q3 +
-      '<div style="margin:6px 0 2px;padding:5px 10px;background:rgba(94,106,210,.14);border:1px solid rgba(94,106,210,.25);border-radius:8px;font-size:11px;color:#5e6ad2"><b>⏰ 买入时点</b> 次日开盘（T+1）· 收盘出信号 → 开盘执行</div>' +
-      '<div class="pv-act">' + actionHtml(o.code, o.name, o.otype_name || o.otype) + '</div>' +
+      (observation?'<div class="mini" style="color:var(--gold);line-height:1.8;margin-top:8px">仅供研究观察，尚未校准；止损和目标为规则草案，不自动执行。</div>':'<div style="margin:6px 0 2px;padding:5px 10px;background:rgba(94,106,210,.14);border:1px solid rgba(94,106,210,.25);border-radius:8px;font-size:11px;color:#5e6ad2"><b>买入时点</b> 次日开盘（T+1）· 收盘出信号 → 开盘执行</div><div class="pv-act">' + actionHtml(o.code, o.name, o.otype_name || o.otype) + '</div>') +
       '</div>';
   }
 
   /* ── Tab 0：择时（★#311 复杂版恢复：四维进度条 + 温度/宽度/拥挤度 + 类型适配 + 日历 + 温度构成） ── */
   // ★#348 维度/风格颜色从 enums 动态下发（R.dimColor / R.styleColor），不写死 DIM_COLORS/STYLE_COLORS
   function renderRotation(rc) {
-    if (!rc || !rc.current_style) return '';
+    if (!rc || !rc.current_style) return '<div class="mini" style="opacity:.7;line-height:1.8">可选风格轮动研究：'+R._f(rc&&rc.reason||'暂无已初始化的风格状态，未生成加减权建议')+'</div>';
     var cur = rc.current_style;
     var cc = R.styleColor(cur);
     var hist = rc.style_history || [];
@@ -431,9 +438,9 @@
     }).join('');
     var dist = rc.style_dist || {};
     var distHtml = Object.keys(dist).map(function (k) {
-      return '<span class="rot-legend"><span class="rot-dot" style="background:' + R.styleColor(k) + '"></span>' + R._f(k) + ' ' + dist[k] + ' 月</span>';
+      return '<span class="rot-legend"><span class="rot-dot" style="background:' + R.styleColor(k) + '"></span>' + R._f(k) + ' ' + dist[k] + ' 次观测</span>';
     }).join('');
-    var w = rc.weights[cur] || {};
+    var w = (rc.weights || {})[cur] || {};
     var boostHtml = (w.boost || w.trim) ? '<div class="mini" style="margin-top:7px">当前' + R._f(cur) + '期：<b style="color:var(--green)">加权</b> ' + R._f((w.boost || []).join(' / ')) +
       ' · <b style="color:var(--muted)">降权</b> ' + R._f((w.trim || []).join(' / ')) + '</div>' : '';
     var up = (rc.cal_upcoming || []).map(function (u) {
@@ -441,14 +448,14 @@
     }).join('');
     var cm = rc.cal_month || {};
     var calTxt = (cm.bonus || cm.bonus === 0) ? 'CAL 本月 ' + (cm.bonus > 0 ? '+' + cm.bonus + ' 分' : (cm.bonus < 0 ? cm.bonus + ' 分' : '中性')) : '';
-    return '<div class="v2-card" style="margin-top:14px"><h2> 择时轮动日历 <span class="tag">F3 风格状态机 · 月度轮动</span></h2>' +
+    return '<div class="v2-card" style="margin-top:14px"><h2> 市值风格诊断 <span class="tag">实际历史观察</span></h2>' +
       '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">' +
         '<span class="rot-badge" style="background:' + cc + '">' + R._f(cur) + ' 期</span>' +
-        '<span class="mini">近 ' + hist.length + ' 月风格轮动' + (calTxt ? ' · ' + calTxt : '') + '</span>' +
+        '<span class="mini">' + hist.length + ' 个实际观测点' + (calTxt ? ' · ' + calTxt : '') + '</span>' +
       '</div>' +
       '<div class="rot-strip">' + bars + '</div>' +
       '<div class="rot-legend-row">' + distHtml + '</div>' +
-      boostHtml +
+      (rc.weights_enabled===false || rc.calibrated===false ? '<div class="mini" style="color:var(--gold);margin-top:8px">未校准，不产生加减权或自动交易。</div>' : boostHtml) +
       (up ? '<div class="mini" style="margin-top:9px;border-top:1px dashed #2a2a30;padding-top:7px">未来日历窗口</div>' + up : '') +
       '</div>';
   }
@@ -493,12 +500,7 @@
       var calUp = '<div class="mini" style="margin-top:6px">CAL 本月 <b>' + (cm.bonus ? ((cm.bonus > 0 ? '+' : '') + cm.bonus + ' 分') : '中性') + '</b>' +
         (d.cal_upcoming || []).map(function (u) { return ' · ' + R._f(u.label) + '（' + u.days_to + ' 天后 ' + (u.bonus >= 0 ? '+' : '') + u.bonus + '）'; }).join('') + '</div>';
 
-      // 温度构成
-      var tc = d.temp_components || {};
-      var tcRows = Object.keys(tc).map(function (k) {
-        var v = +tc[k];
-        return '<tr><td>' + k + '</td><td class="td-num" style="color:' + (v >= 0 ? 'var(--red)' : 'var(--green)') + '">' + (v >= 0 ? '+' : '') + v.toFixed(1) + '</td></tr>';
-      }).join('');
+      var sentiment=d.sentiment || {}, breadth=d.breadth || {};
 
       // KPI 4 卡（评分/温度/宽度/拥挤度，带 spark + delta）
       var sh = d.score_hist || [], th = d.temp_hist || [], wh = d.width_hist || [], ch = d.crowd_hist || [];
@@ -513,9 +515,8 @@
         kpi('择时评分', tm.score != null ? (+tm.score).toFixed(1) + ' 分' : '—',
             d.score_series && d.score_series.length >= 2 ? '跨日 ' + d.score_series.map(function (s) { return s.toFixed(1); }).join(' ') : R._f(tm.level), sh, '#5e6ad2',
             tm.score != null ? (+tm.score).toFixed(1) + ' 分' : null) +
-        kpi('市场温度', cur(th) != null ? cur(th) + '/100' : '—', R._f(d.temp_zone) + '（越低越恐慌=买入区）', th, '#8b5cf6', null) +
-        kpi('行业宽度', cur(wh) != null ? (cur(wh) * 100).toFixed(0) + '%' : '—', cur(wh) != null && cur(wh) < 0.2 ? '恐慌底部' : '正常', wh, '#2d9cdb',
-            cur(wh) != null ? (cur(wh) * 100).toFixed(0) + '%' : null) +
+        kpi('情绪评分', sentiment.score != null ? Number(sentiment.score).toFixed(1) + '/100' : '—', R._f(sentiment.note,'实际情绪评分尚未返回'), [], '#8b5cf6', null) +
+        kpi('市场宽度评分', breadth.score != null ? Number(breadth.score).toFixed(1)+'/100' : '—', breadth.up_fraction != null ? '实际上涨占比 '+(breadth.up_fraction*100).toFixed(1)+'%' : '当前市场宽度尚未核验', [], '#2d9cdb',null) +
         kpi('市场拥挤度', cur(ch) != null ? (cur(ch) * 100).toFixed(1) + '%' : '—', R._f(cd.zone) + ' · 拥挤股 ' + (cd.n_crowded != null ? cd.n_crowded : '—') + ' 只', ch, '#f2c94c',
             cur(ch) != null ? (cur(ch) * 100).toFixed(1) + '%' : null);
 
@@ -532,8 +533,7 @@
         '</div>' +
         '<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start;margin-top:14px">' +
           '<div class="v2-card" style="margin-top:0"><h2> 日历窗口 <span class="tag">H16 节日 + H17 政策</span></h2>' + calHtml + calUp + '</div>' +
-          '<div class="v2-card" style="margin-top:0"><h2> 温度构成 <span class="tag">五指标加权 · ' + R._f(d.temp_zone) + '</span></h2><table>' +
-            (tcRows ? '<thead><tr><th>指标</th><th style="text-align:right">贡献</th></tr></thead><tbody>' + tcRows + '</tbody>' : '<tbody><tr><td class="mini">无温度构成数据</td></tr></tbody>') + '</table></div>' +
+          '<div class="v2-card" style="margin-top:0"><h2> 情绪评分来源 <span class="tag">当前实际算法</span></h2><div class="mini">'+R._f(sentiment.note,'实际评分尚未返回')+'</div><div class="mini" style="opacity:.65;margin-top:8px">'+R._f((d.temperature || {}).reason,'情绪评分与独立温度模型不是同一指标。')+'</div></div>' +
         '</div>' +
         '<div class="mini" style="margin-top:14px;text-align:center;opacity:.75">择时公式与评分原因统一见 <a href="/help#timing-formula" style="color:var(--navy2)">说明页</a></div>';
       // ★#405 择时 KPI 数字 count-up（评分/宽度/拥挤度滚动，温度分数式静态）
@@ -602,13 +602,15 @@
       // ★2026-08-14 明日开盘买入清单（低频 T+1：收盘出 pitch → 次日开盘执行）
       var buyList = p.slice(0, 30).map(function (o) { return '<span style="display:inline-block;background:rgba(94,106,210,.14);border:1px solid rgba(94,106,210,.25);border-radius:6px;padding:1px 7px;margin:2px;font-size:11px;color:#5e6ad2">' + R._f(o.code) + ' ' + R._f(o.name || '').slice(0, 4) + '</span>'; }).join('');
       box.innerHTML = '<div class="v2-card" style="margin-top:0"><h2> Pitch 长线 <span class="tag">' + p.length + ' 只' + (typeTxt ? ' · ' + typeTxt : '') + (d.date ? ' · 数据日 ' + d.date : '') + ' · 带止损/胜率/回测证据</span></h2>' +
-        '<div class="mini" style="margin-bottom:6px;color:#5e6ad2"><b>⏰ 明日开盘买入清单（T+1）</b></div>' + (buyList || '<div class="mini">暂无</div>') +
+        '<div class="mini" style="margin-bottom:6px;color:#5e6ad2"><b>研究候选／观察清单</b> · 尚未形成实际账户委托，执行还需通过当时的行情与风控。</div>' + (buyList || '<div class="mini">暂无</div>') +
         '<div class="pv-grid" style="margin-top:8px">' + (cards || '<div class="mini">暂无</div>') + '</div></div>';
   }
 
   /* ── Tab 3：Pitch 短线（tech）── */
   function loadPitchShort(box) {
     LW.api.get('/api/live/tech').then(function (d) {
+      if (d.ok === false) { box.textContent = d.reason || d.error || d.err || '短线规则观察尚未初始化'; return; }
+      var observation=d.calibrated === false || d.auto_trade_allowed === false;
       var es = d.entries || [];
       var cards = es.map(techCard).join('');
       // ★#348 类型分布动态（不写死"情绪/事件"）
@@ -632,8 +634,8 @@
               (b.note ? ' <span style="color:#f2c94c;opacity:.8">(' + R._f(b.note) + ')</span>' : '') + '</div>';
           }).join('') + '</div>'
         : '';
-      box.innerHTML = '<div class="v2-card" style="margin-top:0"><h2> Pitch 短线 <span class="tag">' + es.length + ' 只' + (typeTxt ? ' · ' + typeTxt : '') + ' · 带止损/置信度</span></h2>' +
-        '<div class="mini" style="margin-bottom:6px;color:#5e6ad2"><b>⏰ 明日开盘买入清单（T+1）</b></div>' + (buyList || '<div class="mini">暂无</div>') +
+      box.innerHTML = '<div class="v2-card" style="margin-top:0"><h2>' + (observation?'短线规则观察':'Pitch 短线') + ' <span class="tag">' + es.length + ' 只' + (typeTxt ? ' · ' + typeTxt : '') + '</span></h2>' +
+        '<div class="mini" style="margin-bottom:6px;color:var(--gold)"><b>' + (observation?'规则观察未校准，不可自动买入；止损为草案':'短线研究候选／观察清单，尚未形成实际委托') + '</b></div>' + (buyList || '<div class="mini">暂无</div>') +
         '<div class="pv-grid" style="margin-top:8px">' + (cards || '<div class="mini">暂无</div>') + '</div>' +
         techEvidenceHtml + '</div>';
     }).catch(function (e) { box.innerHTML = ' ' + e; });
